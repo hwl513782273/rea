@@ -166,7 +166,11 @@ export class BinarySession
       options,
       stagedSnapshotMatches: (target, profile) =>
         this.matchesSnapshot(target, profile),
-    });
+    }).then((resolved) =>
+      isAborted(options.signal)
+        ? err(new AnalysisCancelledError("open_binary"))
+        : resolved,
+    );
   }
 
   /**

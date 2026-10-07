@@ -16,14 +16,20 @@ import {
   readAnalysisSnapshot,
   writeAnalysisSnapshot,
 } from "../../src/application/binary/AnalysisSnapshotFiles.js";
-import { createEvidence } from "../../src/domain/evidence.js";
+import { createEvidence, type Evidence } from "../../src/domain/evidence.js";
 import { createEvidenceBundle } from "../../src/domain/evidenceBundle.js";
 import {
   REA_WORKFLOW_PROVIDER,
   workflowAnalysisProfile,
 } from "../../src/application/InvestigationProviders.js";
-import { createAnalysisSnapshotWorkflowEntry } from "../../src/domain/analysisSnapshot.js";
-import { createTestBinarySession } from "../fixtures/binarySession.js";
+import {
+  createAnalysisSnapshotWorkflowEntry,
+  type AnalysisSnapshot,
+} from "../../src/domain/analysisSnapshot.js";
+import {
+  createDeferred,
+  createTestBinarySession,
+} from "../fixtures/binarySession.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 
 const IDENTITY = {
@@ -39,8 +45,11 @@ const operations = [
   "list_strings",
 ] as const;
 
-const makeProvider = (starts: string[], calls: string[]): AnalysisProvider => {
-  const profile = createAnalysisProfile(IDENTITY, { fixture: true });
+const makeProvider = (
+  starts: string[],
+  calls: string[],
+  profile = createAnalysisProfile(IDENTITY, { fixture: true }),
+): AnalysisProvider => {
   const capabilities: CapabilityDescriptor[] = operations.map((operation) => ({
     operation,
     provider: IDENTITY,
@@ -89,6 +98,105 @@ const makeProvider = (starts: string[], calls: string[]): AnalysisProvider => {
   };
 };
 
+const abortAfterMicrotasks = (
+  controller: AbortController,
+  remaining: number,
+): void => {
+  if (remaining === 0) {
+    controller.abort();
+    return;
+  }
+  queueMicrotask(() => abortAfterMicrotasks(controller, remaining - 1));
+};
+
+const withAlternateWorkflowProfile = (
+  snapshot: AnalysisSnapshot,
+  path: string,
+  current: Evidence,
+): AnalysisSnapshot => {
+  const alternateProfile = createAnalysisProfile(REA_WORKFLOW_PROVIDER, {
+    workflow: "binary_overview",
+    fixture: "alternate-profile",
+  });
+  const subject = {
+    path,
+    sha256: snapshot.target.sha256,
+    format: snapshot.target.format,
+    ...(snapshot.target.architecture === null
+      ? {}
+      : { architecture: snapshot.target.architecture }),
+  };
+  const alternateEvidence = createEvidence(subject, REA_WORKFLOW_PROVIDER, {
+    operation: current.operation,
+    parameters: current.parameters,
+    result: current.normalized_result,
+    rawResult: current.raw_result,
+    analysisProfile: alternateProfile,
+    confidence: "derived",
+    limitations: current.limitations,
+    locations: current.locations,
+  });
+  const alternateEntry = createAnalysisSnapshotWorkflowEntry({
+    target: snapshot.target,
+    binding: snapshot.binding,
+    operation: current.operation,
+    parameters: current.parameters,
+    execution: {
+      result: current.normalized_result,
+      rawResult: current.raw_result,
+      provider: REA_WORKFLOW_PROVIDER,
+      analysisProfile: alternateProfile,
+      limitations: current.limitations,
+      locations: current.locations,
+      subject,
+    },
+  });
+  return {
+    ...snapshot,
+    workflow_entries: [alternateEntry],
+    evidence_bundle: createEvidenceBundle([
+      ...snapshot.evidence_bundle.records,
+      alternateEvidence,
+    ]),
+  };
+};
+
+const withEarlierHistoricalEvidence = (
+  snapshot: AnalysisSnapshot,
+  path: string,
+  current: Evidence,
+): AnalysisSnapshot => {
+  const older = Array.from({ length: 64 }, (_, index) =>
+    createEvidence(
+      {
+        path,
+        sha256: snapshot.target.sha256,
+        format: "analysis-database",
+      },
+      REA_WORKFLOW_PROVIDER,
+      {
+        operation: "binary_overview",
+        parameters: {},
+        result: `historical-${index}`,
+        analysisProfile: workflowAnalysisProfile(
+          snapshot.binding.analysis_profile,
+        ),
+        confidence: "derived",
+        limitations: ["Derived by an REA composed workflow."],
+      },
+    ),
+  ).find((record) => record.evidence_id < current.evidence_id);
+  if (older === undefined)
+    throw new Error("fixture could not construct earlier historical Evidence");
+  return {
+    ...snapshot,
+    evidence_bundle: createEvidenceBundle([
+      ...snapshot.evidence_bundle.records,
+      older,
+    ]),
+  };
+};
+
 describe("direct analysis composed snapshot replay", () => {
   it("replays the identical binary overview without provider startup or calls", async () => {
     const directory = await createTestTempDirectory("rea-workflow-snapshot-");
@@ -97,7 +205,8 @@ describe("direct analysis composed snapshot replay", () => {
     await writeFile(path, "fixture");
     const starts: string[] = [];
     const calls: string[] = [];
-    const provider = makeProvider(starts, calls);
+    const profile = createAnalysisProfile(IDENTITY, { fixture: true });
+    const provider = makeProvider(starts, calls, profile);
     const dependencies: DirectAnalysisDependencies = {
       createBinarySession: () => createTestBinarySession(provider),
       createManagedBinarySession: () => createTestBinarySession(provider),
@@ -121,39 +230,14 @@ describe("direct analysis composed snapshot replay", () => {
     );
     if (current === undefined)
       throw new Error("composed Evidence was not saved");
-    const older = Array.from({ length: 64 }, (_, index) =>
-      createEvidence(
-        {
-          path,
-          sha256: loaded.value.target.sha256,
-          format: "analysis-database",
-        },
-        REA_WORKFLOW_PROVIDER,
-        {
-          operation: "binary_overview",
-          parameters: {},
-          result: `historical-${index}`,
-          analysisProfile: workflowAnalysisProfile(
-            loaded.value.binding.analysis_profile,
-          ),
-          confidence: "derived",
-          limitations: ["Derived by an REA composed workflow."],
-        },
-      ),
-    ).find((record) => record.evidence_id < current.evidence_id);
-    if (older === undefined)
-      throw new Error(
-        "fixture could not construct earlier historical Evidence",
-      );
-    const withHistory = {
-      ...loaded.value,
-      evidence_bundle: createEvidenceBundle([
-        ...loaded.value.evidence_bundle.records,
-        older,
-      ]),
-    };
     expect(
-      (await writeAnalysisSnapshot(withHistory, snapshotPath, true)).ok,
+      (
+        await writeAnalysisSnapshot(
+          withEarlierHistoricalEvidence(loaded.value, path, current),
+          snapshotPath,
+          true,
+        )
+      ).ok,
     ).toBe(true);
 
     const second = await runDirectAnalysis(
@@ -166,66 +250,38 @@ describe("direct analysis composed snapshot replay", () => {
     expect(second).toEqual(first);
     expect(calls).toEqual(["health", ...operations]);
     expect(starts).toHaveLength(1);
+  });
 
-    const alternateProfile = createAnalysisProfile(REA_WORKFLOW_PROVIDER, {
-      workflow: "binary_overview",
-      fixture: "alternate-profile",
-    });
-    const alternateEvidence = createEvidence(
-      {
-        path,
-        sha256: loaded.value.target.sha256,
-        format: loaded.value.target.format,
-        ...(loaded.value.target.architecture === null
-          ? {}
-          : { architecture: loaded.value.target.architecture }),
-      },
-      REA_WORKFLOW_PROVIDER,
-      {
-        operation: current.operation,
-        parameters: current.parameters,
-        result: current.normalized_result,
-        rawResult: current.raw_result,
-        analysisProfile: alternateProfile,
-        confidence: "derived",
-        limitations: current.limitations,
-        locations: current.locations,
-      },
-    );
-    const alternateEntry = createAnalysisSnapshotWorkflowEntry({
-      target: loaded.value.target,
-      binding: loaded.value.binding,
-      operation: current.operation,
-      parameters: current.parameters,
-      execution: {
-        result: current.normalized_result,
-        rawResult: current.raw_result,
-        provider: REA_WORKFLOW_PROVIDER,
-        analysisProfile: alternateProfile,
-        limitations: current.limitations,
-        locations: current.locations,
-        subject: {
-          path,
-          sha256: loaded.value.target.sha256,
-          format: loaded.value.target.format,
-          ...(loaded.value.target.architecture === null
-            ? {}
-            : { architecture: loaded.value.target.architecture }),
-        },
-      },
-    });
-    const alternateProfileSnapshot = {
-      ...loaded.value,
-      workflow_entries: [alternateEntry],
-      evidence_bundle: createEvidenceBundle([
-        ...loaded.value.evidence_bundle.records,
-        alternateEvidence,
-      ]),
+  it("does not replay a valid entry from another workflow profile", async () => {
+    const directory = await createTestTempDirectory("rea-workflow-profile-");
+    const path = join(directory, "fixture.hop");
+    const snapshotPath = join(directory, "snapshot.json");
+    await writeFile(path, "fixture");
+    const starts: string[] = [];
+    const calls: string[] = [];
+    const provider = makeProvider(starts, calls);
+    const dependencies: DirectAnalysisDependencies = {
+      createBinarySession: () => createTestBinarySession(provider),
+      createManagedBinarySession: () => createTestBinarySession(provider),
     };
+    await runDirectAnalysis(
+      dependencies,
+      path,
+      "binary_overview",
+      {},
+      { snapshotPath },
+    );
+    const loaded = await readAnalysisSnapshot(snapshotPath);
+    if (!loaded.ok) throw loaded.error;
+    const current = loaded.value.evidence_bundle.records.find(
+      (record) => record.operation === "binary_overview",
+    );
+    if (current === undefined)
+      throw new Error("composed Evidence was not saved");
     expect(
       (
         await writeAnalysisSnapshot(
-          alternateProfileSnapshot,
+          withAlternateWorkflowProfile(loaded.value, path, current),
           snapshotPath,
           true,
         )
@@ -241,5 +297,60 @@ describe("direct analysis composed snapshot replay", () => {
     );
     expect(calls).toEqual(["health", ...operations, "health", ...operations]);
     expect(starts).toHaveLength(2);
+  });
+
+  it("does not return a cached result when cancelled during route resolution", async () => {
+    const directory = await createTestTempDirectory("rea-workflow-cancel-");
+    const path = join(directory, "fixture.hop");
+    const snapshotPath = join(directory, "snapshot.json");
+    await writeFile(path, "fixture");
+    const starts: string[] = [];
+    const calls: string[] = [];
+    const profile = createAnalysisProfile(IDENTITY, { fixture: true });
+    const provider = makeProvider(starts, calls, profile);
+    const initialDependencies: DirectAnalysisDependencies = {
+      createBinarySession: () => createTestBinarySession(provider),
+      createManagedBinarySession: () => createTestBinarySession(provider),
+    };
+    await runDirectAnalysis(
+      initialDependencies,
+      path,
+      "binary_overview",
+      {},
+      { snapshotPath },
+    );
+
+    const profileResolution = createDeferred<{
+      readonly profile: typeof profile;
+      readonly compatibility: {};
+    }>();
+    const profileResolutionStarted = createDeferred<void>();
+    provider.resolveAnalysisProfile = async () => {
+      profileResolutionStarted.resolve();
+      return ok(await profileResolution.promise);
+    };
+    const controller = new AbortController();
+    const dependencies: DirectAnalysisDependencies = {
+      createBinarySession: () => createTestBinarySession(provider),
+      createManagedBinarySession: () => createTestBinarySession(provider),
+    };
+    const pending = runDirectAnalysis(
+      dependencies,
+      path,
+      "binary_overview",
+      {},
+      { snapshotPath, signal: controller.signal },
+    );
+    await profileResolutionStarted.promise;
+    profileResolution.resolve({ profile, compatibility: {} });
+    abortAfterMicrotasks(controller, 4);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      error: "Analysis failed",
+      code: "cancelled",
+    });
+    expect(calls).toEqual(["health", ...operations]);
+    expect(starts).toHaveLength(1);
   });
 });
