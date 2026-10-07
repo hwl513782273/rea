@@ -7,8 +7,8 @@ import { expect } from "vitest";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { itWithCaptureCapability } from "./processCaptureCapability.js";
 
-import { captureProcessScenario } from "../../../src/application/ProcessHarness.js";
-import { parseProcessScenario } from "../../../src/domain/processCapture.js";
+import { captureProcessScenario } from "../../../src/process/capture/ProcessHarness.js";
+import { parseProcessScenario } from "../../../src/domain/process/processCapture.js";
 
 const processFixture = fileURLToPath(
   new URL("../../fixtures/processFidelity.mjs", import.meta.url),

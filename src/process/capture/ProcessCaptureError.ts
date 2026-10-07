@@ -1,4 +1,4 @@
-import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 
 interface ProcessCaptureErrorOptions extends ErrorOptions {
   readonly userMessage?: string;
@@ -7,7 +7,7 @@ interface ProcessCaptureErrorOptions extends ErrorOptions {
   readonly cleanupResources?: readonly string[];
 }
 
-/** Typed application failure produced by controlled process capture. */
+/** Typed failure produced by controlled process capture. */
 export class ProcessCaptureError extends AnalysisError {
   readonly _tag = "ProcessCaptureError";
 
