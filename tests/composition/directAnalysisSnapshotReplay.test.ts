@@ -26,10 +26,9 @@ import {
   createAnalysisSnapshotWorkflowEntry,
   type AnalysisSnapshot,
 } from "../../src/domain/analysisSnapshot.js";
-import {
-  createDeferred,
-  createTestBinarySession,
-} from "../fixtures/binarySession.js";
+import { createTestBinarySession } from "../fixtures/binarySession.js";
+import { BinarySession } from "../../src/application/binary/BinarySession.js";
+import { SessionProviderRouter } from "../../src/application/binary/SessionProviderRouter.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 
 const IDENTITY = {
@@ -96,17 +95,6 @@ const makeProvider = (
       };
     },
   };
-};
-
-const abortAfterMicrotasks = (
-  controller: AbortController,
-  remaining: number,
-): void => {
-  if (remaining === 0) {
-    controller.abort();
-    return;
-  }
-  queueMicrotask(() => abortAfterMicrotasks(controller, remaining - 1));
 };
 
 const withAlternateWorkflowProfile = (
@@ -205,8 +193,7 @@ describe("direct analysis composed snapshot replay", () => {
     await writeFile(path, "fixture");
     const starts: string[] = [];
     const calls: string[] = [];
-    const profile = createAnalysisProfile(IDENTITY, { fixture: true });
-    const provider = makeProvider(starts, calls, profile);
+    const provider = makeProvider(starts, calls);
     const dependencies: DirectAnalysisDependencies = {
       createBinarySession: () => createTestBinarySession(provider),
       createManagedBinarySession: () => createTestBinarySession(provider),
@@ -320,31 +307,26 @@ describe("direct analysis composed snapshot replay", () => {
       { snapshotPath },
     );
 
-    const profileResolution = createDeferred<{
-      readonly profile: typeof profile;
-      readonly compatibility: {};
-    }>();
-    const profileResolutionStarted = createDeferred<void>();
-    provider.resolveAnalysisProfile = async () => {
-      profileResolutionStarted.resolve();
-      return ok(await profileResolution.promise);
-    };
     const controller = new AbortController();
-    const dependencies: DirectAnalysisDependencies = {
-      createBinarySession: () => createTestBinarySession(provider),
-      createManagedBinarySession: () => createTestBinarySession(provider),
+    const router = SessionProviderRouter.single(provider);
+    const resolve = router.resolve.bind(router);
+    router.resolve = async (...arguments_) => {
+      const resolved = await resolve(...arguments_);
+      controller.abort();
+      return resolved;
     };
-    const pending = runDirectAnalysis(
+    const session = new BinarySession(router);
+    const dependencies: DirectAnalysisDependencies = {
+      createBinarySession: () => session,
+      createManagedBinarySession: () => session,
+    };
+    const result = await runDirectAnalysis(
       dependencies,
       path,
       "binary_overview",
       {},
       { snapshotPath, signal: controller.signal },
     );
-    await profileResolutionStarted.promise;
-    profileResolution.resolve({ profile, compatibility: {} });
-    abortAfterMicrotasks(controller, 4);
-    const result = await pending;
 
     expect(result).toMatchObject({
       error: "Analysis failed",
