@@ -46,6 +46,17 @@ interface ResolveSessionOpenInput {
   ) => boolean;
 }
 
+interface ResolveSessionTargetInput {
+  readonly router: SessionProviderRouter;
+  readonly current: CurrentOpenBinding | undefined;
+  readonly target: BinaryTarget;
+  readonly options: BinarySessionOpenOptions;
+  readonly stagedSnapshotMatches: (
+    target: BinaryTarget,
+    profile: AnalysisProfileCommitment | null,
+  ) => boolean;
+}
+
 /** Parse a target, resolve its provider route, and validate snapshot binding. */
 export const resolveSessionOpen = async (
   input: ResolveSessionOpenInput,
@@ -59,7 +70,14 @@ export const resolveSessionOpen = async (
     options.formatHint,
   );
   if (!parsed.ok) return parsed;
-  const target = parsed.value;
+  return resolveSessionTarget({ ...input, target: parsed.value });
+};
+
+/** Resolve a known target's provider route and validate snapshot binding. */
+export const resolveSessionTarget = async (
+  input: ResolveSessionTargetInput,
+): Promise<Result<ResolvedSessionOpen, AnalysisError>> => {
+  const { router, current, target, options, stagedSnapshotMatches } = input;
   const sameTarget =
     current?.target.path === target.path &&
     snapshotMatchesTarget(snapshotTarget(current.target), target);

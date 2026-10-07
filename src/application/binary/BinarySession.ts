@@ -30,7 +30,9 @@ import { BinarySessionRecords } from "./BinarySessionRecords.js";
 import { binarySessionStatus } from "./BinarySessionStatus.js";
 import {
   resolveSessionOpen,
+  resolveSessionTarget,
   type BinarySessionOpenOptions,
+  type ResolvedSessionOpen,
 } from "./BinarySessionOpen.js";
 import {
   bindExecutionTarget,
@@ -148,6 +150,23 @@ export class BinarySession
   onAvailabilityChanged(listener: () => void | Promise<void>): () => void {
     this.#availabilityListeners.add(listener);
     return () => this.#availabilityListeners.delete(listener);
+  }
+
+  /** Resolve a target and provider profile without creating a provider client. */
+  previewTarget(
+    target: BinaryTarget,
+    options: BinarySessionOpenOptions = {},
+  ): Promise<Result<ResolvedSessionOpen, AnalysisError>> {
+    if (isAborted(options.signal))
+      return Promise.resolve(err(new AnalysisCancelledError("open_binary")));
+    return resolveSessionTarget({
+      router: this.#providerRouter,
+      current: this.#active,
+      target,
+      options,
+      stagedSnapshotMatches: (target, profile) =>
+        this.matchesSnapshot(target, profile),
+    });
   }
 
   /**
