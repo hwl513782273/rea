@@ -3,7 +3,7 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { AnalysisOperationPort } from "../../../src/application/AnalysisProvider.js";
-import { NATIVE_TOOL_CONTRACTS } from "../../../src/contracts/nativeToolContracts.js";
+import { NATIVE_TOOL_CONTRACTS } from "../../../src/contracts/native/nativeToolContracts.js";
 import type { JsonValue } from "../../../src/domain/jsonValue.js";
 import { ok } from "../../../src/domain/result.js";
 import { createAnalysisExecution } from "../../../src/application/AnalysisProvider.js";
