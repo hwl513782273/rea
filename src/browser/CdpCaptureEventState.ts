@@ -12,6 +12,7 @@ export interface CdpCaptureEventsState {
   readonly executionContextFrames: Map<string, string>;
   readonly network: Map<string, NetworkState>;
   readonly networkRequestTimestamps: Map<string, number>;
+  readonly malformedRedirectRequestIds: Set<string>;
   readonly allowedWebSockets: Set<string>;
   console: WebPageInspection["console"]["events"];
   websockets: WebPageInspection["network"]["websocket_events"];

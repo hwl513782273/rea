@@ -120,6 +120,7 @@ export const handleRequestWillBeSent = (
     state.completeness.exclude("network_requests", "invalid_protocol_value");
     return;
   }
+  if (state.malformedRedirectRequestIds.has(requestId)) return;
   if (request === undefined) {
     state.completeness.exclude("network_requests", "invalid_protocol_value");
     state.network.delete(requestId);
@@ -145,7 +146,10 @@ export const handleRequestWillBeSent = (
     state.completeness.exclude("network_requests", "invalid_protocol_value");
     // Preserve evidence already attributed to this CDP request ID. Without a
     // valid redirect envelope, the continuation cannot safely replace it.
-    if (previous !== undefined) return;
+    if (previous !== undefined) {
+      state.malformedRedirectRequestIds.add(requestId);
+      return;
+    }
   }
   const redirects = [...(previous?.redirects ?? [])];
   if (redirectResponse !== undefined) {
@@ -250,6 +254,7 @@ export const handleResponseReceived = (
     state.completeness.exclude("network_requests", "invalid_protocol_value");
     return;
   }
+  if (state.malformedRedirectRequestIds.has(requestId)) return;
   const current = state.network.get(requestId);
   const response = recordValue(params.response);
   if (current === undefined) return;
@@ -286,6 +291,7 @@ export const handleLoadingFinished = (
 ): void => {
   const requestId = cdpStringValue(params.requestId);
   if (requestId === undefined) return;
+  if (state.malformedRedirectRequestIds.has(requestId)) return;
   const current = state.network.get(requestId);
   if (current === undefined) return;
   state.network.set(requestId, {

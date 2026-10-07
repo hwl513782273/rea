@@ -15,6 +15,7 @@ const inspectNetwork = async (options: FakeOptions) => {
       allowed_origins: [browser.allowedOrigin],
       target_id: "allowed-page",
       observation_ms: 0,
+      include_json_body_shapes: true,
     }),
   );
   if (!result.ok) throw result.error;
@@ -64,8 +65,29 @@ describeBrowser("CdpBrowserProvider: redirect errors", () => {
       expect(inspection.network.requests).toHaveLength(1);
       expect(inspection.network.requests[0]).toMatchObject({
         request_id: "request-1",
-        url: `${browser.allowedOrigin}/api?token=network-secret`,
-        redirects: [],
+        url: `${browser.allowedOrigin}/malformed-redirect-prior`,
+        status: 201,
+        mime_type: "application/json",
+        encoded_data_length: null,
+        redirects: [
+          {
+            url: `${browser.allowedOrigin}/api?token=network-secret`,
+            response_url: `${browser.allowedOrigin}/api?token=network-secret`,
+            request_timestamp: 7,
+            redirect_event_timestamp: 8,
+          },
+        ],
+      });
+      expect(
+        inspection.network.requests[0]?.body_shapes.request,
+      ).not.toBeNull();
+      expect(inspection.network.requests[0]?.body_shapes.response).toBeNull();
+      expect(inspection.metadata.responses).toHaveLength(1);
+      expect(inspection.metadata.responses[0]).toMatchObject({
+        url: `${browser.allowedOrigin}/malformed-redirect-prior`,
+        mime_type: "application/json",
+        content_length: 123,
+        content_encoding: "gzip",
       });
       expect(inspection.completeness.unavailable_sections).toContain(
         "network_requests",
@@ -80,4 +102,35 @@ describeBrowser("CdpBrowserProvider: redirect errors", () => {
       );
     },
   );
+
+  it("keeps authorized prior evidence when the later response URL is disallowed", async () => {
+    const { browser, inspection } = await inspectNetwork({
+      malformedRedirectResponse: true,
+      redirectResponseEnvelope: null,
+      responseAfterMalformedUrl:
+        "https://private.example.test/late?token=unauthorized-secret",
+    });
+
+    expect(inspection.network.requests).toHaveLength(1);
+    expect(inspection.network.requests[0]).toMatchObject({
+      url: `${browser.allowedOrigin}/malformed-redirect-prior`,
+      status: 201,
+      mime_type: "application/json",
+      encoded_data_length: null,
+      body_shapes: { response: null },
+    });
+    expect(inspection.metadata.responses).toHaveLength(1);
+    expect(inspection.metadata.responses[0]?.url).toBe(
+      `${browser.allowedOrigin}/malformed-redirect-prior`,
+    );
+    expect(inspection.completeness.excluded).toContainEqual({
+      section: "network_requests",
+      reason: "invalid_protocol_value",
+      count: expect.any(Number),
+    });
+    const output = JSON.stringify(inspection);
+    expect(output).not.toContain("private.example.test");
+    expect(output).not.toContain("unauthorized-secret");
+    expect(output).not.toContain("header-secret");
+  });
 });

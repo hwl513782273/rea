@@ -341,6 +341,49 @@ const emitReturnFromDisallowedRedirect = (
   return finalUrl;
 };
 
+const emitMalformedRedirectPriorResponse = (
+  socket: WebSocket,
+  command: FakeCdpCommand,
+  port: number,
+  initialUrl: string,
+): void => {
+  const priorUrl = `http://127.0.0.1:${String(port)}/malformed-redirect-prior`;
+  event(socket, "Network.requestWillBeSent", command.sessionId, {
+    requestId: "request-1",
+    type: "Fetch",
+    request: {
+      url: priorUrl,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      postData: JSON.stringify({
+        operation: "preserve-prior",
+        token: "prior-body",
+      }),
+    },
+    redirectResponse: {
+      url: initialUrl,
+      status: 307,
+      mimeType: "text/plain",
+      encodedDataLength: 23,
+    },
+    timestamp: 8,
+  });
+  event(socket, "Network.responseReceived", command.sessionId, {
+    requestId: "request-1",
+    response: {
+      url: priorUrl,
+      status: 201,
+      mimeType: "application/json",
+      headers: {
+        "Content-Length": "123",
+        "Content-Encoding": "gzip",
+        "Content-Security-Policy": "default-src 'self'",
+        "X-Model-Context": "prior-context-hint",
+      },
+    },
+  });
+};
+
 const emitMalformedRedirect = (
   socket: WebSocket,
   command: FakeCdpCommand,
@@ -361,7 +404,7 @@ const emitMalformedRedirect = (
     type: "Fetch",
     request: { url: finalUrl, method: "GET" },
     redirectResponse,
-    timestamp: 8,
+    timestamp: 9,
   });
   return finalUrl;
 };
@@ -415,6 +458,8 @@ const emitNetworkEvents = (
       },
     },
   });
+  if (options.malformedRedirectResponse === true)
+    emitMalformedRedirectPriorResponse(socket, command, port, url);
   const responseUrl =
     options.redirectFromDisallowedOrigin === true
       ? emitReturnFromDisallowedRedirect(socket, command, port)
@@ -443,9 +488,10 @@ const emitNetworkEvents = (
     requestId: "request-1",
     response: {
       url:
-        options.redirectToDisallowedOrigin === true
+        options.responseAfterMalformedUrl ??
+        (options.redirectToDisallowedOrigin === true
           ? "https://private.example.test/redirected"
-          : responseUrl,
+          : responseUrl),
       status: 200,
       mimeType: "application/json",
       headers: {
