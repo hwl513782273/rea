@@ -7,6 +7,7 @@ import { runDirectAnalysis } from "../../src/application/DirectAnalysis.js";
 import type {
   AnalysisProvider,
   CapabilityDescriptor,
+  ProviderIdentity,
 } from "../../src/application/AnalysisProvider.js";
 import type { DirectAnalysisDependencies } from "../../src/application/DirectAnalysisDependencies.js";
 import { createAnalysisProfile } from "../../src/domain/analysisProfile.js";
@@ -44,30 +45,66 @@ const operations = [
   "list_strings",
 ] as const;
 
+const workflowProviderOperations = [
+  ...operations,
+  "analyze_function",
+  "list_names",
+  "search_strings",
+  "search_procedures",
+  "xrefs",
+  "resolve_containing_procedure",
+] as const;
+
+const functionDossier = {
+  procedure: {
+    address: "0x1000",
+    name: "fixture",
+    signature: null,
+    locals: [],
+  },
+  pseudocode: "return 0;",
+  assembly: ["ret"],
+  comments: [],
+  callers: [],
+  callees: [],
+  incoming_references: [],
+  outgoing_references: [],
+  referenced_strings: [],
+  referenced_names: [],
+  basic_blocks: [],
+  native_api: null,
+  native_value_flow: null,
+  limitations: [],
+};
+
 const makeProvider = (
   starts: string[],
   calls: string[],
   profile = createAnalysisProfile(IDENTITY, { fixture: true }),
+  identity: ProviderIdentity = profile.provider,
+  supportedOperations: readonly CapabilityDescriptor["operation"][] = operations,
 ): AnalysisProvider => {
-  const capabilities: CapabilityDescriptor[] = operations.map((operation) => ({
-    operation,
-    provider: IDENTITY,
-    available: true,
-    reason: null,
-    cachePolicy: "snapshot",
-    effects: {
-      mutatesArtifact: false,
-      launchesProcess: true,
-      mayShowUi: false,
-      mayAccessNetwork: false,
-      mayWriteFilesystem: false,
-      changesPermissions: false,
-      requiresRoot: false,
-    },
-    limitations: [],
-  }));
+  const capabilities: CapabilityDescriptor[] = supportedOperations.map(
+    (operation) => ({
+      operation,
+      provider: identity,
+      available: true,
+      reason: null,
+      cachePolicy: "snapshot",
+      effects: {
+        mutatesArtifact: false,
+        launchesProcess: true,
+        mayShowUi: false,
+        mayAccessNetwork: false,
+        mayWriteFilesystem: false,
+        changesPermissions: false,
+        requiresRoot: false,
+      },
+      limitations: [],
+    }),
+  );
   return {
-    identity: () => IDENTITY,
+    identity: () => identity,
     capabilities: () => capabilities,
     resolveAnalysisProfile: async () => ok({ profile, compatibility: {} }),
     createClient: () => {
@@ -75,17 +112,22 @@ const makeProvider = (
       return {
         execute: async (operation) => {
           calls.push(operation);
-          const result =
-            {
-              list_segments: [
-                { name: "__TEXT", start: "0x1000", end: "0x2000" },
-              ],
-              list_documents: ["fixture"],
-              list_procedures: ["0x1000"],
-              list_strings: { "0x1000": "fixture" },
-            }[operation as (typeof operations)[number]] ?? null;
+          const results: Readonly<Record<string, unknown>> = {
+            list_segments: [{ name: "__TEXT", start: "0x1000", end: "0x2000" }],
+            list_documents: ["fixture"],
+            list_procedures: ["0x1000"],
+            list_strings: { "0x1000": "fixture" },
+            analyze_function: functionDossier,
+            list_names: [{ address: "0x1000", name: "fixture" }],
+            search_strings: [{ address: "0x1000", value: "fixture" }],
+            search_procedures: [{ address: "0x1000", value: "fixture" }],
+            xrefs: [],
+            resolve_containing_procedure: null,
+            procedure_pseudo_code: "return 0;",
+          };
+          const result = results[operation] ?? null;
           return ok(
-            createAnalysisExecution(result, IDENTITY, {
+            createAnalysisExecution(result, profile.provider, {
               analysisProfile: profile,
               rawResult: result,
             }),
@@ -186,6 +228,73 @@ const withEarlierHistoricalEvidence = (
 };
 
 describe("direct analysis composed snapshot replay", () => {
+  for (const scenario of [
+    {
+      tool: "inspect_native_api",
+      arguments: { procedure: "0x1000" },
+    },
+    {
+      tool: "inspect_native_dispatch_metadata",
+      arguments: {},
+    },
+    {
+      tool: "trace_feature",
+      arguments: { query: "fixture" },
+    },
+    {
+      tool: "trace_native_values",
+      arguments: { procedure: "0x1000" },
+    },
+  ] as const) {
+    it(`persists and replays ${scenario.tool} without provider startup`, async () => {
+      const directory = await createTestTempDirectory("rea-workflow-command-");
+      const path = join(directory, "fixture.hop");
+      const snapshotPath = join(directory, "snapshot.json");
+      await writeFile(path, "fixture");
+      const starts: string[] = [];
+      const calls: string[] = [];
+      const provider = makeProvider(
+        starts,
+        calls,
+        createAnalysisProfile(IDENTITY, { fixture: true }),
+        IDENTITY,
+        workflowProviderOperations,
+      );
+      const dependencies: DirectAnalysisDependencies = {
+        createBinarySession: () => createTestBinarySession(provider),
+        createManagedBinarySession: () => createTestBinarySession(provider),
+      };
+      const first = await runDirectAnalysis(
+        dependencies,
+        path,
+        scenario.tool,
+        scenario.arguments,
+        { snapshotPath },
+      );
+      const callsAfterFirst = [...calls];
+      const startsAfterFirst = [...starts];
+      const loaded = await readAnalysisSnapshot(snapshotPath);
+      if (!loaded.ok) throw loaded.error;
+      expect(
+        loaded.value.workflow_entries?.map(({ operation }) => operation),
+      ).toContain(scenario.tool);
+
+      const second = await runDirectAnalysis(
+        dependencies,
+        path,
+        scenario.tool,
+        scenario.arguments,
+        { snapshotPath },
+      );
+
+      expect(second).toEqual(first);
+      expect(calls).toEqual(callsAfterFirst);
+      expect(starts).toEqual(startsAfterFirst);
+    });
+  }
+});
+
+describe("binary overview snapshot replay", () => {
   it("replays the identical binary overview without provider startup or calls", async () => {
     const directory = await createTestTempDirectory("rea-workflow-snapshot-");
     const path = join(directory, "fixture.hop");
@@ -238,7 +347,123 @@ describe("direct analysis composed snapshot replay", () => {
     expect(calls).toEqual(["health", ...operations]);
     expect(starts).toHaveLength(1);
   });
+});
 
+describe("snapshot replay provider identity", () => {
+  it("uses the resolved provider version when capability metadata omits it", async () => {
+    const directory = await createTestTempDirectory("rea-profile-version-");
+    const path = join(directory, "fixture.hop");
+    const snapshotPath = join(directory, "snapshot.json");
+    await writeFile(path, "fixture");
+    const starts: string[] = [];
+    const calls: string[] = [];
+    const unresolvedIdentity = { ...IDENTITY, version: null };
+    const resolvedProfile = createAnalysisProfile(
+      { ...IDENTITY, version: "launcher-sha256:fixture" },
+      { fixture: true },
+    );
+    const provider = makeProvider(
+      starts,
+      calls,
+      resolvedProfile,
+      unresolvedIdentity,
+      ["search_strings"],
+    );
+    const dependencies: DirectAnalysisDependencies = {
+      createBinarySession: () => createTestBinarySession(provider),
+      createManagedBinarySession: () => createTestBinarySession(provider),
+    };
+    const first = await runDirectAnalysis(
+      dependencies,
+      path,
+      "search_strings",
+      { pattern: "fixture", document: "fixture" },
+      { snapshotPath },
+    );
+    const callsAfterFirst = [...calls];
+    const startsAfterFirst = [...starts];
+    const firstSnapshot = await readAnalysisSnapshot(snapshotPath);
+    if (!firstSnapshot.ok) throw firstSnapshot.error;
+    expect(firstSnapshot.value.entries[0]?.execution.provider.version).toBe(
+      "launcher-sha256:fixture",
+    );
+
+    const second = await runDirectAnalysis(
+      dependencies,
+      path,
+      "search_strings",
+      { pattern: "fixture", document: "fixture" },
+      { snapshotPath },
+    );
+    expect(calls).toEqual(callsAfterFirst);
+    expect(starts).toEqual(startsAfterFirst);
+    expect(second).toEqual(first);
+
+    const changedProfileProvider = makeProvider(
+      starts,
+      calls,
+      createAnalysisProfile(
+        { ...IDENTITY, version: "launcher-sha256:changed" },
+        { fixture: true },
+      ),
+      unresolvedIdentity,
+      ["search_strings"],
+    );
+    const changedProfileResult = await runDirectAnalysis(
+      {
+        createBinarySession: () =>
+          createTestBinarySession(changedProfileProvider),
+        createManagedBinarySession: () =>
+          createTestBinarySession(changedProfileProvider),
+      },
+      path,
+      "search_strings",
+      { pattern: "fixture", document: "fixture" },
+      { snapshotPath },
+    );
+    expect(changedProfileResult).not.toEqual(first);
+    expect(changedProfileResult).toMatchObject({
+      code: "evidence_integrity_mismatch",
+    });
+    expect(starts).toEqual(startsAfterFirst);
+    expect(calls).toEqual(callsAfterFirst);
+
+    const changedProviderIdentity = {
+      id: "other-provider",
+      name: "Other Provider",
+      version: null,
+    };
+    const changedProvider = makeProvider(
+      starts,
+      calls,
+      createAnalysisProfile(
+        { ...changedProviderIdentity, version: "other-version" },
+        { fixture: true },
+      ),
+      changedProviderIdentity,
+      ["search_strings"],
+    );
+    const changedProviderResult = await runDirectAnalysis(
+      {
+        createBinarySession: () => createTestBinarySession(changedProvider),
+        createManagedBinarySession: () =>
+          createTestBinarySession(changedProvider),
+      },
+      path,
+      "search_strings",
+      { pattern: "fixture", document: "fixture" },
+      { snapshotPath },
+    );
+    expect(changedProviderResult).not.toEqual(first);
+    expect(changedProviderResult).toMatchObject({
+      code: "evidence_integrity_mismatch",
+    });
+    expect(starts).toEqual(startsAfterFirst);
+    expect(calls).toEqual(callsAfterFirst);
+  });
+});
+
+describe("workflow snapshot profile and cancellation binding", () => {
   it("does not replay a valid entry from another workflow profile", async () => {
     const directory = await createTestTempDirectory("rea-workflow-profile-");
     const path = join(directory, "fixture.hop");

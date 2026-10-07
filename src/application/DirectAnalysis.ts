@@ -36,7 +36,10 @@ import {
 } from "../domain/analysisProfile.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { AnalysisSnapshot } from "../domain/analysisSnapshot.js";
-import type { AnalysisExecution } from "./AnalysisProvider.js";
+import type {
+  AnalysisExecution,
+  ProviderIdentity,
+} from "./AnalysisProvider.js";
 import {
   REA_WORKFLOW_PROVIDER,
   workflowAnalysisProfile,
@@ -226,7 +229,7 @@ const runAnalysis = async (
           parameters: arguments_,
           provider: isWorkflowEvidenceTool(tool)
             ? REA_WORKFLOW_PROVIDER
-            : (route.capabilities?.get(tool)?.provider ?? route.identity),
+            : providerIdentityForRoute(route, tool),
           evidenceProfile,
         });
         if (cached !== undefined) return cached;
@@ -254,10 +257,12 @@ const runAnalysis = async (
     });
     if (evidence !== undefined) session.recordEvidence(evidence);
     if (
-      tool === "binary_overview" &&
+      isWorkflowEvidenceTool(tool) &&
+      tool !== "trace_native_ui_action" &&
       snapshotPath !== undefined &&
       evidence !== undefined &&
-      "analysis_profile" in evidence
+      "analysis_profile" in evidence &&
+      session.allowsSnapshotReplay(tool)
     ) {
       const recorded = session.recordWorkflowSnapshot({
         operation: tool,
@@ -456,8 +461,20 @@ const analysisProfileForRoute = (
   const profile = route.profile;
   if (profile === null || profile === undefined) return undefined;
   if (isWorkflowEvidenceTool(tool)) return workflowAnalysisProfile(profile);
-  const provider = route.capabilities?.get(tool)?.provider ?? route.identity;
+  const provider = providerIdentityForRoute(route, tool);
   return provider.id === profile.provider.id ? profile : undefined;
+};
+
+/** Mirror BinarySession.providerIdentity for a route not opened yet. */
+const providerIdentityForRoute = (
+  route: SessionProviderRoute,
+  operation: string,
+): ProviderIdentity => {
+  const selected =
+    route.capabilities?.get(operation)?.provider ?? route.identity;
+  return route.profile?.provider.id === selected.id
+    ? route.profile.provider
+    : selected;
 };
 
 const analysisProfileForEvidence = (
