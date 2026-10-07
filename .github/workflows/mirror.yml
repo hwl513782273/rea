@@ -1,0 +1,75 @@
+name: Mirror Releases
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "原仓库 owner/repo"
+        required: true
+      tags:
+        description: "要搬运的版本 tag，逗号分隔；留空表示全部"
+        required: false
+        default: ""
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 搬运 Releases 和安装包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE: ${{ inputs.source }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          SRC_OWNER="${SOURCE%%/*}"
+          SRC_REPO="${SOURCE#*/}"
+          TARGET="$GITHUB_REPOSITORY"
+          echo "源: $SRC_OWNER/$SRC_REPO"
+          echo "目标: $TARGET"
+          TAGS_JSON=$(echo "$TAGS" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0))')
+          if [ "$(echo "$TAGS_JSON" | jq length)" -eq 0 ]; then
+            echo "版本: 全部"
+          else
+            echo "版本: $TAGS_JSON"
+          fi
+
+          page=1
+          while : ; do
+            releases=$(gh api "repos/$SRC_OWNER/$SRC_REPO/releases?per_page=100&page=$page")
+            count=$(echo "$releases" | jq length)
+            [ "$count" -eq 0 ] && break
+
+            echo "$releases" | jq -c --argjson tags "$TAGS_JSON" \
+              '.[] | select(.draft == false) | select(($tags | length == 0) or ([.tag_name] | inside($tags)))' | while read -r rel; do
+              tag=$(echo "$rel" | jq -r .tag_name)
+              name=$(echo "$rel" | jq -r '.name // .tag_name')
+              body=$(echo "$rel" | jq -r '.body // ""')
+              pre=$(echo "$rel" | jq -r .prerelease)
+              echo "── $tag"
+              extra=""
+              [ "$pre" = "true" ] && extra="--prerelease"
+              if gh release view "$tag" --repo "$TARGET" >/dev/null 2>&1; then
+                echo "  目标已有 $tag，复用"
+              else
+                printf '%s' "$body" | gh release create "$tag" --repo "$TARGET" --title "$name" --notes-file - $extra
+              fi
+              echo "$rel" | jq -r '.assets[].id' | while read -r aid; do
+                aname=$(echo "$rel" | jq -r ".assets[] | select(.id == $aid) | .name")
+                if gh release view "$tag" --repo "$TARGET" --json assets -q '.assets[].name' | grep -qxF "$aname"; then
+                  echo "  附件 $aname 已存在，跳过"
+                else
+                  echo "  ↓ 下载 $aname"
+                  gh api -H "Accept: application/octet-stream" \
+                    "repos/$SRC_OWNER/$SRC_REPO/releases/assets/$aid" > "/tmp/$aname"
+                  echo "  ↑ 上传 $aname"
+                  gh release upload "$tag" "/tmp/$aname" --repo "$TARGET" --clobber
+                  rm -f "/tmp/$aname"
+                fi
+              done
+            done
+
+            [ "$count" -lt 100 ] && break
+            page=$((page+1))
+          done
+          echo "完成：全部 Releases 已搬运"
