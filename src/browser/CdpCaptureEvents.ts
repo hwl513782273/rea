@@ -18,6 +18,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   readonly scripts = new Map<string, CapturedScript>();
   readonly executionContextFrames = new Map<string, string>();
   readonly network = new Map<string, NetworkState>();
+  readonly networkRequestTimestamps = new Map<string, number>();
   readonly allowedWebSockets = new Set<string>();
   console: WebPageInspection["console"]["events"] = [];
   websockets: WebPageInspection["network"]["websocket_events"] = [];
@@ -51,6 +52,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     this.scripts.clear();
     this.executionContextFrames.clear();
     this.network.clear();
+    this.networkRequestTimestamps.clear();
     this.allowedWebSockets.clear();
     this.console.length = 0;
     this.websockets.length = 0;

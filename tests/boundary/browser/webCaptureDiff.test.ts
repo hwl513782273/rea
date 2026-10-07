@@ -48,7 +48,22 @@ describe("web capture diff", () => {
     const after = structuredClone(captured.value);
     after.scripts.items = [];
     const request = after.network.requests[0];
-    if (request !== undefined) request.status = 204;
+    if (request !== undefined) {
+      request.status = 204;
+      request.redirects = [
+        {
+          url: `${browser.allowedOrigin}/prior`,
+          response_url: `${browser.allowedOrigin}/prior`,
+          method: "GET",
+          resource_type: "Fetch",
+          status: 302,
+          mime_type: "text/plain",
+          encoded_data_length: 12,
+          request_timestamp: 1,
+          redirect_event_timestamp: 2,
+        },
+      ];
+    }
 
     const result = compareWebCaptures(
       compareWebCapturesInputSchema.parse({

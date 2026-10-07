@@ -249,6 +249,7 @@ const networkMap = (
       status: request.status,
       mime_type: request.mime_type,
       encoded_data_length: request.encoded_data_length,
+      redirects: request.redirects ?? [],
       initiator: request.initiator,
       body_shapes: request.body_shapes,
     });
