@@ -6,7 +6,7 @@ import { toolContractMetadata } from "../toolEffects.js";
 import { requireOutputSchema } from "../toolOutputSchemaPrimitives.js";
 
 /** Exact caller boundary for execution-free PE/CLI triage and identity. */
-const managedTargetInputSchema = z.object({
+const managedTargetInputSchema = z.strictObject({
   path: z
     .string()
     .min(1)

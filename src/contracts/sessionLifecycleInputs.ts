@@ -3,7 +3,7 @@ import { z } from "zod";
 import { analysisProviderSelectorSchema } from "./providerSelection.js";
 
 /** Input contract for opening a target with an optional staged snapshot. */
-export const openBinaryInputSchema = z.object({
+export const openBinaryInputSchema = z.strictObject({
   path: z.string().min(1),
   format: executableFormatHintSchema
     .optional()
@@ -15,7 +15,7 @@ export const openBinaryInputSchema = z.object({
 });
 
 /** Input contract for closing a target after an optional atomic snapshot. */
-export const closeBinaryInputSchema = z.object({
+export const closeBinaryInputSchema = z.strictObject({
   snapshot_path: z.string().min(1).optional(),
   overwrite: z.boolean().default(false),
 });
