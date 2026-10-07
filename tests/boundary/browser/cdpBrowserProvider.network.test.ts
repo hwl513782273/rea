@@ -96,5 +96,46 @@ describeBrowser("CdpBrowserProvider: network 1", () => {
     expect(output).not.toContain("private.example.test");
     expect(output).not.toContain("redirect-header-secret");
     expect(output).not.toContain("redirect-body-secret");
+    expect(result.value.completeness.policy_filtered_sections).toContain(
+      "network_requests",
+    );
+    expect(result.value.completeness.status).toBe("policy_filtered");
+    expect(result.value.completeness.unavailable_sections).not.toContain(
+      "network_requests",
+    );
+    expect(result.value.completeness.excluded).not.toContainEqual({
+      section: "network_requests",
+      reason: "invalid_protocol_value",
+      count: expect.any(Number),
+    });
+  });
+
+  it("marks a malformed redirect response as unavailable protocol evidence", async () => {
+    const browser = await startFakeCdpBrowser({
+      malformedRedirectResponse: true,
+    });
+    trackBrowser(browser);
+    const result = await new CdpBrowserProvider().inspectPage(
+      inspectWebPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        allowed_origins: [browser.allowedOrigin],
+        target_id: "allowed-page",
+        observation_ms: 0,
+      }),
+    );
+
+    if (!result.ok) throw result.error;
+    expect(result.value.network.requests).toEqual([]);
+    expect(result.value.completeness.unavailable_sections).toContain(
+      "network_requests",
+    );
+    expect(result.value.completeness.policy_filtered_sections).not.toContain(
+      "network_requests",
+    );
+    expect(result.value.completeness.excluded).toContainEqual({
+      section: "network_requests",
+      reason: "invalid_protocol_value",
+      count: expect.any(Number),
+    });
   });
 });

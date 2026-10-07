@@ -77,6 +77,7 @@ export interface FakeOptions {
   readonly redirectToDisallowedOrigin?: boolean;
   readonly redirectFromDisallowedOrigin?: boolean;
   readonly redirectWithinOrigin?: boolean;
+  readonly malformedRedirectResponse?: boolean;
   readonly unrelatedWorker?: boolean;
   readonly binaryWebSocketEvent?: boolean;
   readonly invalidBinaryWebSocketEvent?: boolean;

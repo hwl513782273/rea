@@ -140,26 +140,31 @@ export const handleRequestWillBeSent = (
   const redirectResponse = recordValue(params.redirectResponse);
   const redirects = [...(previous?.redirects ?? [])];
   if (redirectResponse !== undefined) {
+    const rawResponseUrl = cdpStringValue(redirectResponse.url);
+    const responseUrl =
+      rawResponseUrl === undefined || rawResponseUrl === ""
+        ? undefined
+        : allowedSanitizedUrl(rawResponseUrl, state.allowedOrigins);
+    const responseUrlReason =
+      rawResponseUrl === undefined || rawResponseUrl === ""
+        ? "invalid_protocol_value"
+        : exclusionReasonForUrl(rawResponseUrl);
     if (previous === undefined) {
-      // The capture began after the redirect's original request. Keep the new
-      // request, but make the missing part of the chain visible in coverage.
-      state.completeness.exclude("network_requests", "invalid_protocol_value");
+      if (responseUrl === undefined)
+        state.completeness.exclude("network_requests", responseUrlReason);
+      else
+        // CDP may deliver the continuation after its predecessor was excluded
+        // by origin policy or before capture began. Keep the final request but
+        // report missing prior coverage without calling it malformed protocol.
+        state.completeness.attachLimited("network_requests");
+    } else if (responseUrl === undefined) {
+      // redirectResponse belongs to the same request ID and can contain an
+      // excluded origin. Drop the entire chain before retaining any details.
+      state.completeness.exclude("network_requests", responseUrlReason);
+      state.network.delete(requestId);
+      state.networkRequestTimestamps.delete(requestId);
+      return;
     } else {
-      const responseUrl = allowedSanitizedUrl(
-        redirectResponse.url,
-        state.allowedOrigins,
-      );
-      if (responseUrl === undefined) {
-        // redirectResponse belongs to the same request ID and can contain an
-        // excluded origin. Drop the entire chain before retaining any details.
-        state.completeness.exclude(
-          "network_requests",
-          exclusionReasonForUrl(cdpStringValue(redirectResponse.url)),
-        );
-        state.network.delete(requestId);
-        state.networkRequestTimestamps.delete(requestId);
-        return;
-      }
       redirects.push({
         url: previous.url,
         response_url: responseUrl.url,
