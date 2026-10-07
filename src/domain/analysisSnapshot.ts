@@ -208,6 +208,16 @@ export const snapshotEvidenceForQuery = (
   if (!snapshotMatchesBinding(snapshot, target, bindingProfile))
     return undefined;
   const encodedParameters = canonicalJson(parameters);
+  const queryId = analysisQueryId(
+    snapshot.target,
+    snapshot.binding,
+    operation,
+    parameters,
+  );
+  const entry = snapshot.entries.find(
+    (candidate) => candidate.query_id === queryId,
+  );
+  if (entry === undefined) return undefined;
   return snapshot.evidence_bundle.records.find(
     (record) =>
       record.subject?.digest.sha256 === target.sha256 &&
@@ -217,9 +227,33 @@ export const snapshotEvidenceForQuery = (
       record.provider.version === provider.version &&
       "analysis_profile" in record &&
       analysisProfilesEqual(record.analysis_profile, evidenceProfile) &&
-      canonicalJson(record.parameters) === encodedParameters,
+      canonicalJson(record.parameters) === encodedParameters &&
+      evidenceMatchesEntry(record, entry, snapshot),
   );
 };
+
+const evidenceMatchesEntry = (
+  evidence: Evidence,
+  entry: AnalysisSnapshotEntry,
+  snapshot: Pick<AnalysisSnapshot, "target" | "binding">,
+): boolean =>
+  isCorrespondingEvidence(evidence, snapshot) &&
+  canonicalJson({
+    query: evidenceQueryKey(evidence),
+    normalized_result: evidence.normalized_result,
+    raw_result: evidence.raw_result,
+    limitations: evidence.limitations,
+    locations: evidence.locations,
+    subject:
+      evidence.subject === null
+        ? null
+        : {
+            local_path: evidence.subject.local_path,
+            sha256: evidence.subject.digest.sha256,
+            format: evidence.subject.format,
+            architecture: evidence.subject.architecture,
+          },
+  }) === entryEvidenceKey(entry, snapshot.binding);
 
 /** Compute the stable lookup key for one provider/profile-specific query. */
 export const analysisQueryId = (
