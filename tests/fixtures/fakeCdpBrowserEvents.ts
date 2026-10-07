@@ -348,16 +348,19 @@ const emitMalformedRedirect = (
   options: FakeOptions,
 ): string => {
   const finalUrl = `http://127.0.0.1:${String(port)}/malformed-redirect-final`;
+  const redirectResponse = Object.hasOwn(options, "redirectResponseEnvelope")
+    ? options.redirectResponseEnvelope
+    : {
+        ...(options.redirectResponseUrl === undefined
+          ? {}
+          : { url: options.redirectResponseUrl }),
+        status: 302,
+      };
   event(socket, "Network.requestWillBeSent", command.sessionId, {
     requestId: "request-1",
     type: "Fetch",
     request: { url: finalUrl, method: "GET" },
-    redirectResponse: {
-      ...(options.redirectResponseUrl === undefined
-        ? {}
-        : { url: options.redirectResponseUrl }),
-      status: 302,
-    },
+    redirectResponse,
     timestamp: 8,
   });
   return finalUrl;

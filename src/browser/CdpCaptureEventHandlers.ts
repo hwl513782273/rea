@@ -138,6 +138,15 @@ export const handleRequestWillBeSent = (
   }
   const previous = state.network.get(requestId);
   const redirectResponse = recordValue(params.redirectResponse);
+  if (
+    Object.hasOwn(params, "redirectResponse") &&
+    redirectResponse === undefined
+  ) {
+    state.completeness.exclude("network_requests", "invalid_protocol_value");
+    // Preserve evidence already attributed to this CDP request ID. Without a
+    // valid redirect envelope, the continuation cannot safely replace it.
+    if (previous !== undefined) return;
+  }
   const redirects = [...(previous?.redirects ?? [])];
   if (redirectResponse !== undefined) {
     const rawResponseUrl = cdpStringValue(redirectResponse.url);
