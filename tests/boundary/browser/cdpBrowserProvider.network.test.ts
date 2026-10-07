@@ -110,32 +110,53 @@ describeBrowser("CdpBrowserProvider: network 1", () => {
     });
   });
 
-  it("marks a malformed redirect response as unavailable protocol evidence", async () => {
-    const browser = await startFakeCdpBrowser({
-      malformedRedirectResponse: true,
-    });
-    trackBrowser(browser);
-    const result = await new CdpBrowserProvider().inspectPage(
-      inspectWebPageInputSchema.parse({
-        cdp_endpoint: browser.endpoint,
-        allowed_origins: [browser.allowedOrigin],
-        target_id: "allowed-page",
-        observation_ms: 0,
-      }),
-    );
+  it.each([
+    { label: "missing", url: undefined, reason: "invalid_protocol_value" },
+    { label: "malformed", url: "http://%", reason: "invalid_protocol_value" },
+    {
+      label: "unsupported scheme",
+      url: "file:///private/redirect",
+      reason: "unsupported_url",
+    },
+  ])(
+    "classifies $label redirect response URLs accurately",
+    async ({ url, reason }) => {
+      const browser = await startFakeCdpBrowser({
+        malformedRedirectResponse: true,
+        ...(url === undefined ? {} : { redirectResponseUrl: url }),
+      });
+      trackBrowser(browser);
+      const result = await new CdpBrowserProvider().inspectPage(
+        inspectWebPageInputSchema.parse({
+          cdp_endpoint: browser.endpoint,
+          allowed_origins: [browser.allowedOrigin],
+          target_id: "allowed-page",
+          observation_ms: 0,
+        }),
+      );
 
-    if (!result.ok) throw result.error;
-    expect(result.value.network.requests).toEqual([]);
-    expect(result.value.completeness.unavailable_sections).toContain(
-      "network_requests",
-    );
-    expect(result.value.completeness.policy_filtered_sections).not.toContain(
-      "network_requests",
-    );
-    expect(result.value.completeness.excluded).toContainEqual({
-      section: "network_requests",
-      reason: "invalid_protocol_value",
-      count: expect.any(Number),
-    });
-  });
+      if (!result.ok) throw result.error;
+      expect(result.value.network.requests).toEqual([]);
+      expect(result.value.completeness.excluded).toContainEqual({
+        section: "network_requests",
+        reason,
+        count: expect.any(Number),
+      });
+      if (reason === "unsupported_url") {
+        expect(result.value.completeness.policy_filtered_sections).toContain(
+          "network_requests",
+        );
+        expect(result.value.completeness.unavailable_sections).not.toContain(
+          "network_requests",
+        );
+      } else {
+        expect(result.value.completeness.unavailable_sections).toContain(
+          "network_requests",
+        );
+        expect(
+          result.value.completeness.policy_filtered_sections,
+        ).not.toContain("network_requests");
+      }
+    },
+  );
 });

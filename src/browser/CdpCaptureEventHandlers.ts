@@ -145,10 +145,7 @@ export const handleRequestWillBeSent = (
       rawResponseUrl === undefined || rawResponseUrl === ""
         ? undefined
         : allowedSanitizedUrl(rawResponseUrl, state.allowedOrigins);
-    const responseUrlReason =
-      rawResponseUrl === undefined || rawResponseUrl === ""
-        ? "invalid_protocol_value"
-        : exclusionReasonForUrl(rawResponseUrl);
+    const responseUrlReason = redirectResponseUrlReason(rawResponseUrl);
     if (previous === undefined) {
       if (responseUrl === undefined)
         state.completeness.exclude("network_requests", responseUrlReason);
@@ -217,6 +214,22 @@ export const handleRequestWillBeSent = (
   const timestamp = numberValue(params.timestamp);
   if (timestamp === undefined) state.networkRequestTimestamps.delete(requestId);
   else state.networkRequestTimestamps.set(requestId, timestamp);
+};
+
+const redirectResponseUrlReason = (
+  value: string | undefined,
+):
+  | "invalid_protocol_value"
+  | "disallowed_origin"
+  | "unsupported_url"
+  | "unattributed_origin" => {
+  if (value === undefined || value === "") return "invalid_protocol_value";
+  try {
+    new URL(value);
+  } catch {
+    return "invalid_protocol_value";
+  }
+  return exclusionReasonForUrl(value);
 };
 
 export const handleResponseReceived = (

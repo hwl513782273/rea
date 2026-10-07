@@ -345,13 +345,19 @@ const emitMalformedRedirect = (
   socket: WebSocket,
   command: FakeCdpCommand,
   port: number,
+  options: FakeOptions,
 ): string => {
   const finalUrl = `http://127.0.0.1:${String(port)}/malformed-redirect-final`;
   event(socket, "Network.requestWillBeSent", command.sessionId, {
     requestId: "request-1",
     type: "Fetch",
     request: { url: finalUrl, method: "GET" },
-    redirectResponse: { status: 302 },
+    redirectResponse: {
+      ...(options.redirectResponseUrl === undefined
+        ? {}
+        : { url: options.redirectResponseUrl }),
+      status: 302,
+    },
     timestamp: 8,
   });
   return finalUrl;
@@ -410,7 +416,7 @@ const emitNetworkEvents = (
     options.redirectFromDisallowedOrigin === true
       ? emitReturnFromDisallowedRedirect(socket, command, port)
       : options.malformedRedirectResponse === true
-        ? emitMalformedRedirect(socket, command, port)
+        ? emitMalformedRedirect(socket, command, port, options)
         : options.redirectWithinOrigin === true
           ? emitSameOriginRedirectEvents(socket, command, port, url)
           : url;
