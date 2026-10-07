@@ -239,18 +239,17 @@ export const snapshotEvidenceForQuery = (
   if (entry === undefined && workflowEntry === undefined) return undefined;
   return snapshot.evidence_bundle.records.find(
     (record) =>
-      (record.subject?.digest.sha256 === target.sha256 &&
-        record.operation === operation &&
-        record.provider.id === provider.id &&
-        record.provider.name === provider.name &&
-        record.provider.version === provider.version &&
-        "analysis_profile" in record &&
-        analysisProfilesEqual(record.analysis_profile, evidenceProfile) &&
-        canonicalJson(record.parameters) === encodedParameters &&
-        entry !== undefined &&
-        evidenceMatchesEntry(record, entry, snapshot)) ||
-      (workflowEntry !== undefined &&
-        evidenceMatchesWorkflowEntry(record, workflowEntry, snapshot)),
+      record.subject?.digest.sha256 === target.sha256 &&
+      record.operation === operation &&
+      record.provider.id === provider.id &&
+      record.provider.name === provider.name &&
+      record.provider.version === provider.version &&
+      "analysis_profile" in record &&
+      analysisProfilesEqual(record.analysis_profile, evidenceProfile) &&
+      canonicalJson(record.parameters) === encodedParameters &&
+      ((entry !== undefined && evidenceMatchesEntry(record, entry, snapshot)) ||
+        (workflowEntry !== undefined &&
+          evidenceMatchesWorkflowEntry(record, workflowEntry, snapshot))),
   );
 };
 

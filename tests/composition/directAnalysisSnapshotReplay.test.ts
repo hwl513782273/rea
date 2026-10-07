@@ -22,6 +22,7 @@ import {
   REA_WORKFLOW_PROVIDER,
   workflowAnalysisProfile,
 } from "../../src/application/InvestigationProviders.js";
+import { createAnalysisSnapshotWorkflowEntry } from "../../src/domain/analysisSnapshot.js";
 import { createTestBinarySession } from "../fixtures/binarySession.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 
@@ -165,5 +166,80 @@ describe("direct analysis composed snapshot replay", () => {
     expect(second).toEqual(first);
     expect(calls).toEqual(["health", ...operations]);
     expect(starts).toHaveLength(1);
+
+    const alternateProfile = createAnalysisProfile(REA_WORKFLOW_PROVIDER, {
+      workflow: "binary_overview",
+      fixture: "alternate-profile",
+    });
+    const alternateEvidence = createEvidence(
+      {
+        path,
+        sha256: loaded.value.target.sha256,
+        format: loaded.value.target.format,
+        ...(loaded.value.target.architecture === null
+          ? {}
+          : { architecture: loaded.value.target.architecture }),
+      },
+      REA_WORKFLOW_PROVIDER,
+      {
+        operation: current.operation,
+        parameters: current.parameters,
+        result: current.normalized_result,
+        rawResult: current.raw_result,
+        analysisProfile: alternateProfile,
+        confidence: "derived",
+        limitations: current.limitations,
+        locations: current.locations,
+      },
+    );
+    const alternateEntry = createAnalysisSnapshotWorkflowEntry({
+      target: loaded.value.target,
+      binding: loaded.value.binding,
+      operation: current.operation,
+      parameters: current.parameters,
+      execution: {
+        result: current.normalized_result,
+        rawResult: current.raw_result,
+        provider: REA_WORKFLOW_PROVIDER,
+        analysisProfile: alternateProfile,
+        limitations: current.limitations,
+        locations: current.locations,
+        subject: {
+          path,
+          sha256: loaded.value.target.sha256,
+          format: loaded.value.target.format,
+          ...(loaded.value.target.architecture === null
+            ? {}
+            : { architecture: loaded.value.target.architecture }),
+        },
+      },
+    });
+    const alternateProfileSnapshot = {
+      ...loaded.value,
+      workflow_entries: [alternateEntry],
+      evidence_bundle: createEvidenceBundle([
+        ...loaded.value.evidence_bundle.records,
+        alternateEvidence,
+      ]),
+    };
+    expect(
+      (
+        await writeAnalysisSnapshot(
+          alternateProfileSnapshot,
+          snapshotPath,
+          true,
+        )
+      ).ok,
+    ).toBe(true);
+
+    await runDirectAnalysis(
+      dependencies,
+      path,
+      "binary_overview",
+      {},
+      { snapshotPath },
+    );
+    expect(calls).toEqual(["health", ...operations, "health", ...operations]);
+    expect(starts).toHaveLength(2);
   });
 });
