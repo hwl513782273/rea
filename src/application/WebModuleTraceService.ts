@@ -1,3 +1,4 @@
+import { closeOwnedWebResources } from "./closeOwnedWebResources.js";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -9,7 +10,7 @@ import {
 } from "../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../domain/evidence.js";
 import { jsonObjectSchema } from "../domain/jsonValue.js";
-import { projectInputIssues } from "../domain/inputIssueProjection.js";
+import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   collectWebModuleImports,
@@ -69,6 +70,16 @@ export class WebModuleTraceService {
     readonly resolver: WebModuleResolutionPort,
   ) {}
 
+  close(): Promise<void> {
+    return closeOwnedWebResources(
+      [
+        this.artifacts.close?.bind(this.artifacts),
+        this.resolver.close?.bind(this.resolver),
+      ],
+      "Web module trace cleanup failed",
+    );
+  }
+
   async trace(
     rawInput: unknown,
     options?: ExecutionOptions,
@@ -78,11 +89,9 @@ export class WebModuleTraceService {
     const parsed = webModuleTraceInputSchema.safeParse(rawInput);
     if (!parsed.success)
       return err(
-        new AnalysisInputError(
-          OPERATION,
-          { cause: parsed.error },
-          projectInputIssues(parsed.error.issues, rawInput),
-        ),
+        analysisInputErrorFromIssues(OPERATION, parsed.error.issues, rawInput, {
+          cause: parsed.error,
+        }),
       );
     const input = parsed.data;
     for (const [path, value] of [

@@ -1,4 +1,5 @@
-import type { JsonValue } from "./jsonValue.js";
+import { jsonValueSchema, type JsonValue } from "./jsonValue.js";
+import { isImmutableJsonSnapshot } from "./immutableJson.js";
 
 import {
   analysisErrorCategory,
@@ -7,59 +8,117 @@ import {
   assertKnownAnalysisErrorTag,
 } from "./analysisErrorPresentation.js";
 import {
+  AnalysisAccessDeniedError,
+  AnalysisArtifactChangedError,
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
+  AnalysisUnsupportedTargetError,
   AnalysisInputError,
   AnalysisOutputError,
   AnalysisTimeoutError,
+  AnalysisResourceConstraintError,
 } from "./analysisErrorCore.js";
 import { ArtifactOperationError } from "./artifactOperationError.js";
-import { BinaryTargetError } from "./configurationErrors.js";
+import {
+  BinaryTargetError,
+  ConfigurationError,
+} from "./configurationErrors.js";
 import { BrowserObservationError } from "./browserObservationError.js";
-import { EvidenceFileError, EvidenceReferenceError } from "./evidenceErrors.js";
+import {
+  EvidenceFileError,
+  EvidenceIntegrityError,
+  EvidenceReferenceError,
+} from "./evidenceErrors.js";
 import {
   HopperCancelledError,
   HopperProcessError,
   HopperRemoteError,
+  HopperStartError,
   HopperTimeoutError,
 } from "./hopperErrors.js";
 import { ProviderAdapterError } from "./providerAdapterError.js";
 import { ProviderSelectionError } from "./providerSelectionError.js";
 import { UnknownRegistryError } from "./unknownRegistryError.js";
-import {
-  type AnalysisError,
-  type AnalysisErrorTag,
-} from "./analysisErrorBase.js";
+import { providerRetryAction } from "./providerOperationHealth.js";
+import type { AnalysisError, AnalysisErrorTag } from "./analysisErrorBase.js";
 
 /** Project expected failures into exhaustive, secret-safe caller fields. */
 export const projectAnalysisError = (
   error: AnalysisError,
 ): AnalysisErrorProjection => {
   assertKnownAnalysisErrorTag(error._tag);
-  const code = errorCode(error);
-  const details = errorDetails(error);
+  const underlyingCode = underlyingErrorCode(error);
+  const code = error.cleanupIncomplete ? "cleanup_incomplete" : underlyingCode;
+  const primaryDetails = errorDetails(error);
+  const details = {
+    ...primaryDetails,
+    ...(error.diagnostics === undefined
+      ? {}
+      : { diagnostics: error.diagnostics }),
+    ...(error.cleanupIncomplete
+      ? {
+          cleanup: "incomplete",
+          resources: [...error.cleanupResources],
+          ...(error.cleanup === undefined
+            ? {}
+            : { cleanup_reason: error.cleanup.reason }),
+          execution_failure:
+            primaryDetails?.execution_failure ?? underlyingCode,
+        }
+      : {}),
+    ...(error.capturedOutput === undefined
+      ? {}
+      : { captured_output: { ...error.capturedOutput } }),
+    ...(error.partialObservation === undefined
+      ? {}
+      : {
+          partial_observation: isImmutableJsonSnapshot(error.partialObservation)
+            ? error.partialObservation
+            : jsonValueSchema.parse(error.partialObservation),
+        }),
+  };
   return {
     code,
     category: analysisErrorCategory(error),
     message: analysisErrorUserMessage(error),
-    retryable: RETRYABLE_CODES.has(code),
+    retryable:
+      RETRYABLE_CODES.has(code) ||
+      (error instanceof AnalysisCapabilityUnavailableError &&
+        error.retryable) ||
+      (code === "resource_constraint" &&
+        error instanceof AnalysisResourceConstraintError &&
+        error.resource === "capacity"),
     remediation: {
       action: analysisErrorRemediationAction(error),
     },
-    ...(details === undefined ? {} : { details }),
+    ...(Object.keys(details).length === 0 ? {} : { details }),
   };
 };
 
-const errorCode = (error: AnalysisError): AnalysisErrorProjection["code"] => {
-  if (error.cleanupIncomplete) return "cleanup_incomplete";
+const underlyingErrorCode = (
+  error: AnalysisError,
+): AnalysisErrorProjection["code"] => {
+  if (
+    error instanceof HopperRemoteError &&
+    error.diagnosticType === "invalid_request"
+  )
+    return "invalid_request";
   if (error instanceof ProviderSelectionError)
     return error.reason === "provider_unavailable"
       ? "provider_unavailable"
       : "capability_unavailable";
   if (error instanceof BrowserObservationError)
-    return browserErrorCode(error.reason);
+    return error.userCategory === "cancelled"
+      ? "cancelled"
+      : browserErrorCode(error.reason);
   if (error instanceof ArtifactOperationError)
     return artifactOperationCode(error);
+  if (error instanceof BinaryTargetError)
+    return error.constraint === "load_selection_rejected"
+      ? "invalid_request"
+      : error.systemCode === undefined
+        ? "target_unavailable"
+        : "access_denied";
   if (error instanceof EvidenceFileError) return evidenceFileCode(error.reason);
   if (error instanceof UnknownRegistryError)
     return unknownRegistryCode(error.reason);
@@ -70,6 +129,8 @@ const errorCode = (error: AnalysisError): AnalysisErrorProjection["code"] => {
 const browserErrorCode = (
   reason: BrowserObservationError["reason"],
 ): AnalysisErrorProjection["code"] => {
+  if (reason === "cancelled") return "cancelled";
+  if (reason === "timeout") return "provider_timeout";
   if (reason === "payload_limit") return "truncated";
   if (
     reason === "target_not_found" ||
@@ -94,10 +155,12 @@ const artifactOperationCode = (
 
 const evidenceFileCode = (
   reason: EvidenceFileError["reason"],
-): AnalysisErrorProjection["code"] =>
-  reason === "invalid-json"
-    ? "evidence_integrity_mismatch"
-    : "execution_failure";
+): AnalysisErrorProjection["code"] => {
+  if (reason === "invalid-json") return "evidence_integrity_mismatch";
+  // A missing, non-file or already-existing path is the caller's selection.
+  if (reason === "io") return "execution_failure";
+  return "invalid_request";
+};
 
 const unknownRegistryCode = (
   reason: UnknownRegistryError["reason"],
@@ -119,6 +182,7 @@ const processCaptureCode = (
 
 type SpecializedErrorTag =
   | "ArtifactOperationError"
+  | "BinaryTargetError"
   | "BrowserObservationError"
   | "EvidenceFileError"
   | "ProcessCaptureError"
@@ -130,16 +194,19 @@ const STATIC_ERROR_CODES = {
   AnalysisOutputError: "unreadable_output",
   HopperProtocolError: "unreadable_output",
   AnalysisInputError: "invalid_request",
+  AnalysisAccessDeniedError: "access_denied",
+  AnalysisArtifactChangedError: "artifact_changed",
   AnalysisCapabilityUnavailableError: "capability_unavailable",
+  AnalysisUnsupportedTargetError: "unsupported_target",
   AnalysisCancelledError: "cancelled",
   HopperCancelledError: "cancelled",
   AnalysisTimeoutError: "provider_timeout",
+  AnalysisResourceConstraintError: "resource_constraint",
   HopperTimeoutError: "provider_timeout",
   HopperProcessError: "provider_unavailable",
   HopperStartError: "provider_unavailable",
   ConfigurationError: "configuration_invalid",
   NoBinaryOpenError: "target_unavailable",
-  BinaryTargetError: "target_unavailable",
   EvidenceIntegrityError: "evidence_integrity_mismatch",
   ProviderAdapterError: "execution_failure",
   HopperRemoteError: "execution_failure",
@@ -155,6 +222,7 @@ const staticErrorCode = (
 ): AnalysisErrorProjection["code"] => {
   switch (tag) {
     case "ArtifactOperationError":
+    case "BinaryTargetError":
     case "BrowserObservationError":
     case "EvidenceFileError":
     case "ProcessCaptureError":
@@ -177,8 +245,41 @@ const errorDetails = (
 const requestErrorDetails = (
   error: AnalysisError,
 ): Readonly<Record<string, JsonValue>> | undefined => {
+  if (error instanceof AnalysisUnsupportedTargetError)
+    return {
+      operation: error.operation,
+      path: error.path,
+      reason: error.reason,
+    };
+  if (error instanceof AnalysisResourceConstraintError)
+    return {
+      operation: error.operation,
+      resource: error.resource,
+      reason: error.reason,
+      reported_limits: error.reportedLimits,
+    };
+  if (error instanceof AnalysisArtifactChangedError)
+    return {
+      operation: error.operation,
+      path: error.path,
+      reason: error.reason,
+      boundary: "stable-artifact-read",
+    };
+  if (error instanceof AnalysisAccessDeniedError)
+    return {
+      operation: error.operation,
+      path: error.path,
+      system_code: error.systemCode,
+      boundary: "filesystem-read",
+    };
   if (error instanceof AnalysisOutputError)
-    return { operation: error.operation, reason: error.reason };
+    return {
+      operation: error.operation,
+      reason: error.reason,
+      ...(error.diagnostics === undefined
+        ? {}
+        : { diagnostics: error.diagnostics }),
+    };
   if (error instanceof AnalysisInputError && error.issues.length > 0)
     return {
       operation: error.operation,
@@ -198,6 +299,7 @@ const requestErrorDetails = (
       expected: error.expected,
       actual: error.actual,
     };
+  if (error instanceof EvidenceIntegrityError) return { reason: error.message };
   return undefined;
 };
 
@@ -220,7 +322,18 @@ const artifactStateErrorDetails = (
     };
   if (error instanceof UnknownRegistryError) return { reason: error.reason };
   if (error instanceof EvidenceFileError)
-    return { operation: error.operation, reason: error.reason };
+    return {
+      operation: error.operation,
+      reason: error.reason,
+      ...(error.path === undefined ? {} : { path: error.path }),
+      ...(error.published === undefined
+        ? {}
+        : {
+            published: true,
+            bytes: error.published.bytes,
+            published_path: error.published.path,
+          }),
+    };
   return undefined;
 };
 
@@ -256,9 +369,6 @@ const providerErrorDetails = (
             resources: [...error.cleanupResources],
           }
         : {}),
-      ...(error.diagnostics === undefined
-        ? {}
-        : { diagnostics: error.diagnostics }),
     };
   if (error instanceof BrowserObservationError) {
     const primaryReason = primaryBrowserFailureReason(error);
@@ -284,10 +394,16 @@ const providerErrorDetails = (
       ...(error.operation === undefined ? {} : { operation: error.operation }),
       ...(error.requestId === undefined ? {} : { request_id: error.requestId }),
     };
-  if (error instanceof HopperProcessError)
+  if (error instanceof HopperProcessError) {
+    const stage = error.stage;
     return {
       exit_code: error.exitCode,
-      stage: error.operation === undefined ? "connection" : "analysis",
+      stage,
+      provider_state: error.providerState,
+      retry_action: providerRetryAction(
+        error.providerState,
+        error.failureCode !== undefined || error.stage === "launch",
+      ),
       ...(error.failureCode === undefined
         ? {}
         : { failure_code: error.failureCode }),
@@ -296,6 +412,22 @@ const providerErrorDetails = (
       ...(error.diagnostic === undefined
         ? {}
         : { diagnostics: { ...error.diagnostic } }),
+      ...(error.launcherFailure === undefined
+        ? {}
+        : { launcher: error.launcherFailure }),
+    };
+  }
+  if (error instanceof HopperStartError)
+    return {
+      stage: "launch",
+      provider_state: "unknown",
+      retry_action: error.ownerRunId === undefined ? "retry" : "unknown",
+      ...(error.ownerRunId === undefined
+        ? {}
+        : { owner_run_id: error.ownerRunId }),
+      ...(error.launcherFailure === undefined
+        ? {}
+        : { launcher: error.launcherFailure }),
     };
   return undefined;
 };
@@ -319,16 +451,40 @@ const lifecycleErrorDetails = (
   error: AnalysisError,
 ): Readonly<Record<string, JsonValue>> | undefined => {
   if (error instanceof AnalysisCancelledError)
-    return { operation: error.operation, cleanup: "complete" };
+    return {
+      operation: error.operation,
+      cleanup: error.cleanupIncomplete ? "incomplete" : "complete",
+      ...(error.cleanup === undefined || !error.cleanupIncomplete
+        ? {}
+        : {
+            cleanup_reason: error.cleanup.reason,
+            resources: [...error.cleanup.resources],
+            execution_failure: "cancelled",
+          }),
+    };
   if (error instanceof HopperCancelledError)
     return { operation: "hopper", cleanup: "complete" };
   if (error instanceof AnalysisTimeoutError)
-    return { operation: error.operation, timeout_ms: error.timeoutMs };
+    return {
+      operation: error.operation,
+      timeout_ms: error.timeoutMs,
+      ...(error.cleanup === undefined || !error.cleanupIncomplete
+        ? {}
+        : {
+            cleanup: "incomplete",
+            cleanup_reason: error.cleanup.reason,
+            resources: [...error.cleanup.resources],
+          }),
+    };
   if (error instanceof HopperTimeoutError)
     return {
-      stage: error.operation === undefined ? "startup" : "analysis",
+      stage: error.operation === undefined ? "startup" : error.stage,
       timeout_ms: error.timeoutMs,
+      ...(error.launcherOutcome === undefined
+        ? {}
+        : { launcher: error.launcherOutcome }),
       provider_state: error.providerState,
+      retry_action: error.providerState === "busy" ? "wait" : "retry",
       ...(error.operation === undefined ? {} : { operation: error.operation }),
       ...(error.requestId === undefined ? {} : { request_id: error.requestId }),
     };
@@ -336,12 +492,34 @@ const lifecycleErrorDetails = (
     return {
       cleanup: "incomplete",
       resources: [...error.cleanupResources],
+      ...(error.cleanupReport === undefined
+        ? {}
+        : { cleanup_report: jsonValueSchema.parse(error.cleanupReport) }),
+      ...(error.executionFailure === undefined
+        ? {}
+        : { execution_failure: error.executionFailure }),
     };
-  if (
-    error._tag === "ProcessCaptureError" &&
-    error.userCategory === "cancelled"
-  )
-    return { operation: "process_capture", cleanup: "complete" };
+  if (error._tag === "ProcessCaptureError") {
+    const details = {
+      ...(error.userCategory === "cancelled"
+        ? { operation: "process_capture", cleanup: "complete" }
+        : {}),
+      ...(error.cleanupReport === undefined
+        ? {}
+        : { cleanup_report: jsonValueSchema.parse(error.cleanupReport) }),
+      ...(error.executionFailure === undefined
+        ? {}
+        : { execution_failure: error.executionFailure }),
+    };
+    return Object.keys(details).length === 0 ? undefined : details;
+  }
+  if (error instanceof ConfigurationError && error.settings.length > 0)
+    return {
+      settings: error.settings.map(({ setting, constraint }) => ({
+        setting,
+        constraint,
+      })),
+    };
   if (error instanceof BinaryTargetError)
     return {
       path: error.path,
@@ -349,11 +527,15 @@ const lifecycleErrorDetails = (
       ...(error.constraint === undefined
         ? {}
         : { constraint: error.constraint }),
+      ...(error.systemCode === undefined
+        ? {}
+        : { system_code: error.systemCode, boundary: "filesystem-read" }),
     };
   return undefined;
 };
 
 const RETRYABLE_CODES: ReadonlySet<AnalysisErrorProjection["code"]> = new Set([
+  "artifact_changed",
   "invalid_request",
   "provider_timeout",
   "cancelled",
@@ -366,10 +548,14 @@ export interface AnalysisErrorProjection extends Readonly<
 > {
   readonly code:
     | "invalid_request"
+    | "access_denied"
+    | "artifact_changed"
     | "unreadable_output"
     | "capability_unavailable"
+    | "unsupported_target"
     | "provider_unavailable"
     | "provider_timeout"
+    | "resource_constraint"
     | "cancelled"
     | "artifact_integrity_mismatch"
     | "artifact_operation_failed"
@@ -384,10 +570,12 @@ export interface AnalysisErrorProjection extends Readonly<
   readonly category:
     | "invalid_input"
     | "unsupported_provider"
+    | "unsupported_target"
     | "integrity_mismatch"
     | "truncated"
     | "cancelled"
     | "timeout"
+    | "resource_constraint"
     | "unavailable"
     | "execution_failure";
   readonly message: string;

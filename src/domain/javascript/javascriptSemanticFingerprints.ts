@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 
 import * as t from "@babel/types";
+import { runtimeFunctionParameters } from "./javascriptAstValues.js";
 
-import { compareCodePoints } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { JavaScriptSemanticCallAnalysis } from "./javascriptSemanticCalls.js";
 import type {
   JavaScriptSemanticCallable,
@@ -17,7 +18,7 @@ import type {
 } from "./javascriptSemanticIr.js";
 import { semanticCallableIdForNode } from "./javascriptSemanticProjection.js";
 import type { JavaScriptSemanticAnalysisState } from "./javascriptSemanticState.js";
-import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
+import { traverseJavaScriptAstSteps } from "./javascriptSemanticTraversal.js";
 
 interface SemanticFingerprintCollectionInput {
   readonly state: JavaScriptSemanticAnalysisState;
@@ -33,10 +34,10 @@ interface SemanticFingerprintCollectionInput {
   readonly parserPartial: boolean;
 }
 
-/** Build bounded rename- and formatting-resistant components per callable. */
-export const collectJavaScriptSemanticFingerprints = (
+/** Build bounded rename- and formatting-resistant components per callable, yielding between callables. */
+export function* collectJavaScriptSemanticFingerprintsSteps(
   input: SemanticFingerprintCollectionInput,
-): JavaScriptSemanticFunctionFingerprint[] => {
+): Generator<void, JavaScriptSemanticFunctionFingerprint[]> {
   const {
     state,
     callables,
@@ -67,11 +68,13 @@ export const collectJavaScriptSemanticFingerprints = (
   );
   const networkEffectsByOwner = groupByOwner(requestOperations, ownerId);
   const resourceEffectsByOwner = groupByOwner(resourceOperations, ownerId);
-  return callables.flatMap((callable) => {
-    if (callable.kind === "class") return [];
+  const fingerprints: JavaScriptSemanticFunctionFingerprint[] = [];
+  for (const callable of callables) {
+    if (callable.kind === "class") continue;
     const node = state.callableNodesById.get(callable.callableId);
-    if (node === undefined) return [];
-    const syntax = fingerprintSyntax(node, callable.callableId);
+    if (node === undefined) continue;
+    yield;
+    const syntax = yield* fingerprintSyntaxSteps(node);
     const promiseEffects = promiseEffectsByOwner.get(callable.callableId) ?? [];
     const eventEffects = eventEffectsByOwner.get(callable.callableId) ?? [];
     const timerEffects = timerEffectsByOwner.get(callable.callableId) ?? [];
@@ -80,50 +83,49 @@ export const collectJavaScriptSemanticFingerprints = (
     const networkEffects = networkEffectsByOwner.get(callable.callableId) ?? [];
     const resourceEffects =
       resourceEffectsByOwner.get(callable.callableId) ?? [];
-    return [
-      {
-        callableId: callable.callableId,
-        status:
-          parserPartial || callable.returnCoverage.status !== "complete"
-            ? "partial"
-            : "complete",
-        components: {
-          parameterArity: callableParameterArity(node),
-          normalizedAstSha256: digest(syntax.normalizedTokens),
-          controlFlowSha256: digest(syntax.controlFlowTokens),
-          relationShapeSha256: digest(
-            relationShape(
-              callable,
-              callSitesByCaller.get(callable.callableId) ?? [],
-              captureCountByCallable.get(callable.callableId) ?? 0,
-              promiseEffects,
-            ),
+    fingerprints.push({
+      callableId: callable.callableId,
+      status:
+        parserPartial || callable.returnCoverage.status !== "complete"
+          ? "partial"
+          : "complete",
+      components: {
+        parameterArity: callableParameterArity(node),
+        normalizedAstSha256: digest(syntax.normalizedTokens),
+        controlFlowSha256: digest(syntax.controlFlowTokens),
+        relationShapeSha256: digest(
+          relationShape(
+            callable,
+            callSitesByCaller.get(callable.callableId) ?? [],
+            captureCountByCallable.get(callable.callableId) ?? 0,
+            promiseEffects,
           ),
-          literalSetSha256: digest(
-            [...new Set(syntax.literals)].sort(compareCodePoints),
-          ),
-          effects: [
-            ...(isAsyncCallable(node) ? (["async"] as const) : []),
-            ...(childProcessEffects.length > 0
-              ? (["child-process"] as const)
-              : []),
-            ...(eventEffects.length > 0 ? (["event"] as const) : []),
-            ...(networkEffects.length > 0 ? (["network"] as const) : []),
-            ...(promiseEffects.length > 0 ? (["promise"] as const) : []),
-            ...(resourceEffects.length > 0 ? (["resource"] as const) : []),
-            ...(timerEffects.length > 0 ? (["timer"] as const) : []),
-          ],
-        },
-        limitations: [
-          "The fingerprint is a static candidate and does not prove behavioral equivalence.",
-          ...(parserPartial
-            ? ["Incomplete semantic recovery makes this fingerprint partial."]
+        ),
+        literalSetSha256: digest(
+          [...new Set(syntax.literals)].sort(compareUnicodeCodePoints),
+        ),
+        effects: [
+          ...(isAsyncCallable(node) ? (["async"] as const) : []),
+          ...(childProcessEffects.length > 0
+            ? (["child-process"] as const)
             : []),
+          ...(eventEffects.length > 0 ? (["event"] as const) : []),
+          ...(networkEffects.length > 0 ? (["network"] as const) : []),
+          ...(promiseEffects.length > 0 ? (["promise"] as const) : []),
+          ...(resourceEffects.length > 0 ? (["resource"] as const) : []),
+          ...(timerEffects.length > 0 ? (["timer"] as const) : []),
         ],
       },
-    ];
-  });
-};
+      limitations: [
+        "The fingerprint is a static candidate and does not prove behavioral equivalence.",
+        ...(parserPartial
+          ? ["Incomplete semantic recovery makes this fingerprint partial."]
+          : []),
+      ],
+    });
+  }
+  return fingerprints;
+}
 
 const ownerId = <T extends { readonly ownerCallableId: string | null }>(
   value: T,
@@ -161,33 +163,24 @@ interface FingerprintSyntax {
   readonly literals: readonly string[];
 }
 
-const fingerprintSyntax = (
+function* fingerprintSyntaxSteps(
   root: t.Node,
-  targetCallableId: string,
-): FingerprintSyntax => {
+): Generator<void, FingerprintSyntax> {
   const normalizedTokens: string[] = [];
   const controlFlowTokens: string[] = [];
   const literals: string[] = [];
-  const callableStack: string[] = [];
-  traverseJavaScriptAst(root, {
+  yield* traverseJavaScriptAstSteps(root, {
+    skip: (node) => semanticCallableIdForNode(node) !== null,
     enter: (node, parent) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null) callableStack.push(callableId);
-      if (callableStack.at(-1) !== targetCallableId) return;
       normalizedTokens.push(normalizedNodeToken(node, parent));
       const control = controlFlowToken(node);
       if (control !== null) controlFlowTokens.push(control);
       const literal = semanticLiteral(node);
       if (literal !== null) literals.push(literal);
     },
-    exit: (node) => {
-      const callableId = semanticCallableIdForNode(node);
-      if (callableId !== null && callableStack.at(-1) === callableId)
-        callableStack.pop();
-    },
   });
   return { normalizedTokens, controlFlowTokens, literals };
-};
+}
 
 const normalizedNodeToken = (node: t.Node, parent: t.Node | null): string => {
   if (t.isIdentifier(node))
@@ -205,6 +198,8 @@ const normalizedNodeToken = (node: t.Node, parent: t.Node | null): string => {
     primitiveAttribute(node, "optional"),
     primitiveAttribute(node, "async"),
     primitiveAttribute(node, "generator"),
+    primitiveAttribute(node, "delegate"),
+    primitiveAttribute(node, "prefix"),
   ].filter((value): value is string => value !== null);
   return [node.type, ...attributes].join(":");
 };
@@ -257,6 +252,9 @@ const controlFlowToken = (node: t.Node): string | null => {
 };
 
 const semanticLiteral = (node: t.Node): string | null => {
+  // Babel retains directive escapes in value; decoding them would erase the
+  // distinction between a strict-mode directive and an escaped lookalike.
+  if (t.isDirectiveLiteral(node)) return `directive:${node.value}`;
   if (t.isStringLiteral(node)) return `string:${node.value}`;
   if (t.isNumericLiteral(node)) return `number:${String(node.value)}`;
   if (t.isBooleanLiteral(node)) return `boolean:${String(node.value)}`;
@@ -287,7 +285,7 @@ const relationShape = (
 ];
 
 const callableParameterArity = (node: t.Node): number =>
-  t.isFunction(node) ? node.params.length : 0;
+  t.isFunction(node) ? runtimeFunctionParameters(node).length : 0;
 
 const isAsyncCallable = (node: t.Node): boolean =>
   t.isFunction(node) && node.async;

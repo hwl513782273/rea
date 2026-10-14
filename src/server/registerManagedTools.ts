@@ -1,30 +1,33 @@
-import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
-import type { McpServer } from "@modelcontextprotocol/server";
-
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
-import type { BinarySessionPort } from "../application/binary/BinarySession.js";
 import { MANAGED_TOOL_CONTRACTS } from "../contracts/managed/managedToolContracts.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { err } from "../domain/result.js";
-import type { Logger } from "../logger.js";
 import { registerEvidenceTools } from "./registerEvidenceTools.js";
+import {
+  retainedSummaryDelivery,
+  withoutDeliveryDetail,
+  type EvidenceToolFamilyOptions,
+} from "./retainedSummaryDelivery.js";
 import { runManagedProviderExecution } from "../composition/directAnalysis.js";
 import { isManagedToolName } from "../contracts/managed/managedToolContracts.js";
 
+/** Operations whose MCP delivery may be a retained summary view. */
+const SUMMARY_DELIVERY: ReadonlySet<string> = new Set([
+  "inspect_managed_artifact",
+  "inspect_managed_members",
+]);
+
 /** Register execution-free managed PE/CLI inspection. */
 export const registerManagedTools = (
-  server: McpServer,
-  analysis: AnalysisOperationPort,
-  options: {
-    readonly logger: Logger;
-    readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
-    readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
-    readonly session: BinarySessionPort | undefined;
-  },
+  server: EvidenceMcpServer,
+  options: EvidenceToolFamilyOptions,
 ): void => {
   let selectedManagedPath: string | undefined;
-  const managedAnalysis: AnalysisOperationPort = {
+  const withoutDelivery = withoutDeliveryDetail(SUMMARY_DELIVERY);
+  const analysisForAdmission = (
+    analysis: AnalysisOperationPort,
+  ): AnalysisOperationPort => ({
     execute: async (operation, parameters, executionOptions) => {
       if (!isManagedToolName(operation))
         return analysis.execute(operation, parameters, executionOptions);
@@ -52,16 +55,18 @@ export const registerManagedTools = (
         path,
         operation,
         executionOptions?.signal,
+        parameters,
       );
       if (execution.ok && typeof requestedPath === "string")
         selectedManagedPath = requestedPath;
       return execution;
     },
-  };
-  registerEvidenceTools(
-    server,
-    managedAnalysis,
-    MANAGED_TOOL_CONTRACTS,
-    options,
-  );
+  });
+  registerEvidenceTools(server, MANAGED_TOOL_CONTRACTS, {
+    ...options,
+    ...retainedSummaryDelivery(SUMMARY_DELIVERY, options),
+    parametersForExecution: withoutDelivery,
+    parametersForEvidence: withoutDelivery,
+    analysisForAdmission,
+  });
 };

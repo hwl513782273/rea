@@ -1,10 +1,11 @@
 import { z } from "zod";
 
 import {
+  artifactInventoryOutputSchema,
   artifactInventoryResultSchema,
   type ArtifactInventoryResult,
 } from "./artifactGraph.js";
-import { canonicalDigest } from "./comparisonSemantics.js";
+import { digestCanonicalValue } from "./canonicalDigest.js";
 import { uniqueSorted } from "./canonicalOrdering.js";
 import { evidenceSchema, parseEvidence, type Evidence } from "./evidence.js";
 import { jsonValueSchema } from "./jsonValue.js";
@@ -16,27 +17,9 @@ const artifactIdSchema = prefixedDigestSchema("art");
 
 const inspectionObservationSchema = z.strictObject({
   observation_id: prefixedDigestSchema("aio"),
-  kind: z.enum(["root-manifest", "artifact", "occurrence", "integrity"]),
+  kind: z.enum(["root-manifest", "integrity"]),
   subject: textSchema,
   value: jsonValueSchema,
-  evidence_id: evidenceIdSchema,
-});
-
-const inspectionRelationshipSchema = z.strictObject({
-  relationship_id: prefixedDigestSchema("air"),
-  relation: z.enum([
-    "contains",
-    "extracts",
-    "slice-of",
-    "embeds",
-    "loads",
-    "maps-source",
-    "derived-from",
-  ]),
-  source_artifact_id: artifactIdSchema,
-  target_artifact_id: artifactIdSchema,
-  occurrence_id: prefixedDigestSchema("occ"),
-  logical_path: textSchema.nullable(),
   evidence_id: evidenceIdSchema,
 });
 
@@ -97,7 +80,6 @@ export const artifactInspectionResultSchema = z.strictObject({
     )
     .min(1),
   observations: z.array(inspectionObservationSchema),
-  derived_relationships: z.array(inspectionRelationshipSchema),
   hypotheses: z.array(inspectionHypothesisSchema),
   contradictions: z.array(inspectionContradictionSchema),
   unexplored_branches: z.array(unexploredBranchSchema),
@@ -107,8 +89,6 @@ export const artifactInspectionResultSchema = z.strictObject({
     substeps_completed: z.literal(1),
     observations_retained: z.number().int().min(0),
     observations_omitted: z.number().int().min(0),
-    relationships_retained: z.number().int().min(0),
-    relationships_omitted: z.number().int().min(0),
     hypotheses_retained: z.number().int().min(0),
     hypotheses_omitted: z.number().int().min(0),
     unexplored_branches_retained: z.number().int().min(0),
@@ -124,6 +104,24 @@ export type ArtifactInspectionResult = z.infer<
   typeof artifactInspectionResultSchema
 >;
 
+/**
+ * The current producer guarantees a concrete inventory payload. Specialize
+ * its output without narrowing the historical inspection/Evidence input
+ * parser or applying inventory defaults inside an authenticated imported record.
+ */
+export const artifactInspectionOutputSchema =
+  artifactInspectionResultSchema.safeExtend({
+    substeps: z
+      .array(
+        artifactInspectionResultSchema.shape.substeps.element.safeExtend({
+          evidence: evidenceSchema.safeExtend({
+            normalized_result: artifactInventoryOutputSchema,
+          }),
+        }),
+      )
+      .min(1),
+  });
+
 /** Project one successful inventory Evidence record into an inspection report. */
 export const createArtifactInspection = (
   inventoryInput: unknown,
@@ -136,10 +134,6 @@ export const createArtifactInspection = (
     inventory,
     inventoryEvidence.evidence_id,
   );
-  const relationships = allRelationships(
-    inventory,
-    inventoryEvidence.evidence_id,
-  );
   const hypotheses = allHypotheses(inventory, inventoryEvidence.evidence_id);
   const nextProbes = probesFor(inventory);
   const branches = allUnexploredBranches(
@@ -149,14 +143,12 @@ export const createArtifactInspection = (
   );
   const retained = {
     observations,
-    relationships,
     hypotheses,
     branches,
     probes: nextProbes,
   };
   const omissions = {
     observations: 0,
-    relationships: 0,
     hypotheses: 0,
     branches: 0,
     probes: 0,
@@ -170,7 +162,7 @@ export const createArtifactInspection = (
     },
     substeps: [
       {
-        substep_id: `ais_${canonicalDigest(
+        substep_id: `ais_${digestCanonicalValue(
           {
             operation: "inventory_artifact",
             evidence_id: inventoryEvidence.evidence_id,
@@ -184,7 +176,6 @@ export const createArtifactInspection = (
       },
     ],
     observations: retained.observations,
-    derived_relationships: retained.relationships,
     hypotheses: retained.hypotheses,
     contradictions: contradictions(inventory, inventoryEvidence.evidence_id),
     unexplored_branches: retained.branches,
@@ -194,8 +185,6 @@ export const createArtifactInspection = (
       substeps_completed: 1 as const,
       observations_retained: retained.observations.length,
       observations_omitted: omissions.observations,
-      relationships_retained: retained.relationships.length,
-      relationships_omitted: omissions.relationships,
       hypotheses_retained: retained.hypotheses.length,
       hypotheses_omitted: omissions.hypotheses,
       unexplored_branches_retained: retained.branches.length,
@@ -211,7 +200,7 @@ export const createArtifactInspection = (
   };
   return artifactInspectionResultSchema.parse({
     ...semantic,
-    inspection_id: `ai_${canonicalDigest(semantic, "Artifact inspection")}`,
+    inspection_id: `ai_${digestCanonicalValue(semantic, "Artifact inspection")}`,
   });
 };
 
@@ -224,6 +213,8 @@ const parseInventoryEvidence = (input: unknown): Evidence => {
   return evidence;
 };
 
+// Artifact, occurrence, and edge records stay in the nested inventory Evidence;
+// restating each one here would repeat the complete graph in every result.
 const allObservations = (
   inventory: ArtifactInventoryResult,
   evidenceId: string,
@@ -233,12 +224,6 @@ const allObservations = (
     inventory.manifest.root_artifact_id,
     inventory.manifest,
     evidenceId,
-  ),
-  ...inventory.nodes.map((node) =>
-    observation("artifact", node.artifact_id, node, evidenceId),
-  ),
-  ...inventory.occurrences.map((occurrence) =>
-    observation("occurrence", occurrence.occurrence_id, occurrence, evidenceId),
   ),
   ...inventory.integrity_contradictions.map((value) =>
     observation("integrity", value.contradiction_id, value, evidenceId),
@@ -258,29 +243,10 @@ const observation = (
     evidence_id: evidenceId,
   };
   return {
-    observation_id: `aio_${canonicalDigest(semantic, "Artifact inspection")}`,
+    observation_id: `aio_${digestCanonicalValue(semantic, "Artifact inspection")}`,
     ...semantic,
   };
 };
-
-const allRelationships = (
-  inventory: ArtifactInventoryResult,
-  evidenceId: string,
-): ArtifactInspectionResult["derived_relationships"] =>
-  inventory.edges.map((edge) => {
-    const semantic = {
-      relation: edge.relation,
-      source_artifact_id: edge.parent_artifact_id,
-      target_artifact_id: edge.child_artifact_id,
-      occurrence_id: edge.occurrence_id,
-      logical_path: edge.logical_path,
-      evidence_id: evidenceId,
-    };
-    return {
-      relationship_id: `air_${canonicalDigest(semantic, "Artifact inspection")}`,
-      ...semantic,
-    };
-  });
 
 const allHypotheses = (
   inventory: ArtifactInventoryResult,
@@ -305,7 +271,7 @@ const allHypotheses = (
         "Format classification proposes a bounded follow-up; it is not semantic proof.",
     };
     return {
-      hypothesis_id: `aih_${canonicalDigest(semantic, "Artifact inspection")}`,
+      hypothesis_id: `aih_${digestCanonicalValue(semantic, "Artifact inspection")}`,
       ...semantic,
     };
   });
@@ -324,7 +290,7 @@ const contradictions = (
       evidence_id: evidenceId,
     };
     return {
-      contradiction_id: `aic_${canonicalDigest(semantic, "Artifact inspection")}`,
+      contradiction_id: `aic_${digestCanonicalValue(semantic, "Artifact inspection")}`,
       ...semantic,
     };
   });
@@ -333,7 +299,53 @@ const probesFor = (
   inventory: ArtifactInventoryResult,
 ): ArtifactInspectionResult["next_probes"] => {
   const format = inventory.manifest.root_format;
-  if (["asar", "javascript-bundle", "directory"].includes(format))
+  return format === "directory"
+    ? directoryProbes(inventory)
+    : probesForFormat(format);
+};
+
+// An application bundle directory is only a container, so its probes follow
+// the formats it holds: a bundle of Mach-O executables is not a JavaScript tree.
+// Formats are ordered so a repeated operation keeps its most general rationale.
+const DIRECTORY_MEMBER_FORMATS: readonly ArtifactInventoryResult["manifest"]["root_format"][] =
+  [
+    "asar",
+    "javascript-bundle",
+    "mach-o-universal",
+    "mach-o",
+    "elf",
+    "pe",
+    "plist",
+  ];
+
+const directoryProbes = (
+  inventory: ArtifactInventoryResult,
+): ArtifactInspectionResult["next_probes"] => {
+  // JavaScript acquisition does not follow symlinks. Other probes retain
+  // their own applicability rules; plist inspection follows readable links.
+  const present = new Set(
+    inventory.occurrences
+      .filter(
+        ({ entry_kind, artifact_format }) =>
+          entry_kind !== "symlink" || artifact_format !== "javascript-bundle",
+      )
+      .map(({ artifact_format }) => artifact_format),
+  );
+  const members = DIRECTORY_MEMBER_FORMATS.filter((memberFormat) =>
+    present.has(memberFormat),
+  );
+  const probes = members.flatMap(probesForFormat);
+  return probes.filter(
+    (probe, index) =>
+      probes.findIndex(({ operation }) => operation === probe.operation) ===
+      index,
+  );
+};
+
+const probesForFormat = (
+  format: ArtifactInventoryResult["manifest"]["root_format"],
+): ArtifactInspectionResult["next_probes"] => {
+  if (["asar", "javascript-bundle"].includes(format))
     return [
       {
         operation: "analyze_javascript_application",
@@ -418,7 +430,7 @@ const branch = (
     evidence_id: evidenceId,
   };
   return {
-    branch_id: `aib_${canonicalDigest(semantic, "Artifact inspection")}`,
+    branch_id: `aib_${digestCanonicalValue(semantic, "Artifact inspection")}`,
     ...semantic,
   };
 };

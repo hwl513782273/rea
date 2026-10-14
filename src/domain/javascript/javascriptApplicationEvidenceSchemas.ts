@@ -6,7 +6,7 @@ const boundedTextSchema = z.string().min(1);
 const boundedKeySchema = z.string().min(1);
 const unsafePathSegments = new Set(["", ".", ".."]);
 const isSafeRelativePath = (path: string): boolean => {
-  if (path.startsWith("/") || path.includes("\\")) return false;
+  if (path.startsWith("/")) return false;
   return path.split("/").every((part) => !unsafePathSegments.has(part));
 };
 const relativePathSchema = z
@@ -269,6 +269,14 @@ const applicationGraphEvidenceBaseSchema = z.strictObject({
   evidence_ids: z.array(prefixedDigestSchema("ev")),
 });
 
+/** Shared provenance fields apart from the fact-specific evidence location. */
+export const applicationGraphEvidenceContextSchema =
+  applicationGraphEvidenceBaseSchema.omit({ location: true });
+
+/** Exact coordinates retained on each graph fact. */
+export const applicationGraphEvidenceLocationSchema =
+  applicationLocationReferenceSchema;
+
 type EvidenceValue = z.infer<typeof applicationGraphEvidenceBaseSchema>;
 
 const checkAuthorityState = (
@@ -421,6 +429,8 @@ export const applicationNodeIdentitySchema = z.discriminatedUnion("strategy", [
     source_map_sha256: digestSchema,
     // The exact `sources` entry; `""` is a legal relative reference.
     original_source: z.string(),
+    // Exact leaf-local root; null means omitted or explicitly null.
+    source_root: z.string().nullable(),
     source_sha256: digestSchema.nullable(),
   }),
   z.strictObject({
@@ -472,6 +482,11 @@ export const applicationNodeIdentitySchema = z.discriminatedUnion("strategy", [
 /** Evidence coordinates attached to one graph observation or edge. */
 export type ApplicationGraphEvidence = z.infer<
   typeof applicationGraphEvidenceSchema
+>;
+
+/** Provenance shared by facts with the same non-location evidence. */
+export type ApplicationGraphEvidenceContext = z.infer<
+  typeof applicationGraphEvidenceContextSchema
 >;
 
 /** Explicit stable identity strategy for one application entity. */

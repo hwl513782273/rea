@@ -1,3 +1,4 @@
+import type { JsonValue } from "../../src/domain/jsonValue.js";
 export interface FakeCdpCommand {
   readonly id: number;
   readonly method: string;
@@ -10,6 +11,10 @@ export interface FakeCdpBrowser {
   readonly browserWebSocketUrl: string;
   readonly allowedOrigin: string;
   readonly commands: readonly FakeCdpCommand[];
+  /** Actual WebSocket connections still held by the wire fixture. */
+  activeConnectionCount(): number;
+  /** WebSocket upgrades accepted over the fixture's lifetime. */
+  openedConnectionCount(): number;
   /** Deliver actual malformed wire data without bypassing the production transport parser. */
   emitRawMessage(message: string): void;
   emitEvent(event: {
@@ -27,6 +32,8 @@ export interface FakeCdpBrowser {
 }
 
 export interface FakeOptions {
+  /** Send these commands' producer events before acknowledging completion, as a wire barrier. */
+  readonly eventsBeforeReply?: readonly string[];
   /** Return a native-shaped command rejection through the actual wire parser. */
   readonly commandError?: (
     command: FakeCdpCommand,
@@ -75,10 +82,20 @@ export interface FakeOptions {
   readonly indexedDbDateKeys?: boolean;
   readonly foreignSessionEvents?: boolean;
   readonly redirectToDisallowedOrigin?: boolean;
+  readonly redirectFromDisallowedOrigin?: boolean;
+  readonly redirectWithinOrigin?: boolean;
+  readonly malformedRedirectResponse?: boolean;
+  readonly omitRedirectResponse?: boolean;
+  readonly redirectResponseUrl?: string;
+  readonly redirectResponseEnvelope?: unknown;
+  readonly responseAfterMalformedUrl?: string;
   readonly unrelatedWorker?: boolean;
   readonly binaryWebSocketEvent?: boolean;
+  /** Emit an allowed WebSocket creation without any frames in the capture window. */
+  readonly webSocketWithoutFrames?: boolean;
   readonly invalidBinaryWebSocketEvent?: boolean;
   readonly sourceMapBody?: string;
+  readonly sourceMapRedirect?: string;
   readonly sessionTimeline?:
     | "same_origin"
     | "outside_policy"
@@ -90,14 +107,18 @@ export interface FakeOptions {
   readonly cachedResponseBody?: string;
   readonly invalidResponseBodyBase64?: boolean;
   readonly webMcpTools?: boolean;
+  readonly webMcpConsequential?: JsonValue;
   readonly webMcpSameUrlRegistrations?: "retain" | "remove-second";
   readonly webMcpFrameCount?: number;
   readonly webMcpSchemaPropertyCount?: number;
+  readonly webMcpInputSchema?: JsonValue;
   readonly webMcpChildLeavesScope?: boolean;
   readonly webMcpChildTransientBlank?: boolean;
   readonly webMcpChildRecoversAfterTransient?: boolean;
   readonly webMcpChildNavigatesAllowed?: boolean;
   readonly electronFileUrl?: string;
+  /** Omit attached from the Electron page's HTTP discovery target. */
+  readonly omitElectronTargetAttachmentState?: boolean;
   readonly duplicateElectronInventory?: boolean;
   readonly electronInventoryCount?: number;
   readonly urlShapedAllowedTitle?:

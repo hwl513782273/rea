@@ -1,10 +1,15 @@
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import {
+  admitManagedProjection,
+  managedDecodeBudget,
+} from "./ManagedDecodeBudget.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   managedArtifactInspectionSchema,
   type ManagedArtifactInspection,
   type ManagedParseIssue,
 } from "../domain/managed/managedArtifact.js";
 import {
+  managedCli32BitRequirement,
   readManagedPeLayout,
   type ManagedCliHeader,
   type ManagedPeLayout,
@@ -13,12 +18,13 @@ import {
   managedTableRowCounts,
   readManagedMetadataInventory,
   type ManagedMetadataInventory,
-  type ManagedResourceDirectory,
+  readManagedResourceDirectory,
 } from "./ManagedMetadataInventory.js";
 import {
   readManagedMetadataLayout,
   type ManagedMetadataLayout,
 } from "./ManagedMetadataLayout.js";
+import { readTypeMemberListFacts } from "./ManagedTypeMemberLists.js";
 import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 
 const flagNames = (flags: number): string[] => {
@@ -98,7 +104,7 @@ const unavailableResult = (
   bytes: Buffer,
   layout: ManagedPeLayout,
 ): ManagedArtifactInspection => {
-  const malformed = layout.cliDirectoryPresent;
+  const malformed = layout.cliDirectoryState !== "absent";
   const issues = layout.cliIssue === null ? [] : [layout.cliIssue];
   const limitations = malformed
     ? [
@@ -107,40 +113,44 @@ const unavailableResult = (
     : [
         "The PE has no CLI data directory; managed metadata and CIL are unavailable.",
       ];
-  return managedArtifactInspectionSchema.parse({
-    ...base(target, bytes, layout),
-    classification: {
-      status: malformed ? "malformed" : "not-managed",
-      container: "pe",
-      runtime_family: "unknown",
-      implementation: malformed ? "unknown" : "not-managed",
-      managed_architecture: "unknown",
-      evidence: [
-        {
-          code: malformed ? "cli-directory-malformed" : "cli-directory-absent",
-          detail: limitations[0],
-          file_offset: layout.cliIssue?.offset ?? null,
-        },
-      ],
-    },
-    metadata: {
-      status: malformed ? "malformed" : "absent",
-      version: null,
-      stream_names: [],
-      table_row_counts: {},
-    },
-    module: null,
-    assembly: null,
-    target_frameworks: [],
-    references: [],
-    resources: [],
-    attributes: [],
-    coverage: {
-      state: malformed ? "partial" : "unavailable",
-      issues,
-    },
-    limitations,
-  });
+  return managedArtifactInspectionSchema.parse(
+    admitManagedProjection({
+      ...base(target, bytes, layout),
+      classification: {
+        status: malformed ? "malformed" : "not-managed",
+        container: "pe",
+        runtime_family: "unknown",
+        implementation: malformed ? "unknown" : "not-managed",
+        managed_architecture: "unknown",
+        evidence: [
+          {
+            code: malformed
+              ? "cli-directory-malformed"
+              : "cli-directory-absent",
+            detail: limitations[0],
+            file_offset: layout.cliIssue?.offset ?? null,
+          },
+        ],
+      },
+      metadata: {
+        status: malformed ? "malformed" : "absent",
+        version: null,
+        stream_names: [],
+        table_row_counts: {},
+      },
+      module: null,
+      assembly: null,
+      target_frameworks: [],
+      references: [],
+      resources: [],
+      attributes: [],
+      coverage: {
+        state: malformed ? "partial" : "unavailable",
+        issues,
+      },
+      limitations,
+    }),
+  );
 };
 
 interface RuntimeClassificationInput {
@@ -148,6 +158,15 @@ interface RuntimeClassificationInput {
   readonly metadata: ManagedMetadataLayout;
   readonly inventory: ManagedMetadataInventory;
 }
+
+const runtimeFamilyFromCliHeader = (
+  cli: ManagedCliHeader | null,
+): ManagedArtifactInspection["classification"]["runtime_family"] =>
+  cli?.readyToRunSignature === true
+    ? "modern-dotnet"
+    : cli !== null && (cli.flags & 1) === 0
+      ? "mixed-clr-native"
+      : "unknown";
 
 const runtimeFamilyFor = (
   cli: ManagedCliHeader,
@@ -171,7 +190,9 @@ const runtimeFamilyFor = (
   );
   let runtimeFamily: ManagedArtifactInspection["classification"]["runtime_family"] =
     "unknown";
-  if ((cli.flags & 1) === 0) {
+  // crossgen2 clears ILONLY on ReadyToRun output, so only a clear flag
+  // without the ReadyToRun signature indicates mixed CLR/native code.
+  if (runtimeFamilyFromCliHeader(cli) === "mixed-clr-native") {
     runtimeFamily = "mixed-clr-native";
     evidence.push({
       code: "cli-il-only-clear",
@@ -196,10 +217,7 @@ const runtimeFamilyFor = (
       file_offset: metadata.table(12)?.offset ?? null,
     });
   } else if (
-    frameworks.some(
-      (value) =>
-        value.startsWith(".NETCoreApp,") || value.startsWith(".NETStandard,"),
-    ) ||
+    frameworks.some((value) => value.startsWith(".NETCoreApp,")) ||
     cli.readyToRunSignature
   ) {
     runtimeFamily = "modern-dotnet";
@@ -218,6 +236,13 @@ const runtimeFamilyFor = (
           )
         : (metadata.table(12)?.offset ?? null),
     });
+  } else if (frameworks.some((value) => value.startsWith(".NETStandard,"))) {
+    evidence.push({
+      code: "target-framework-observed",
+      detail:
+        "An assembly-level TargetFrameworkAttribute names .NET Standard, an API specification that does not identify a runtime family.",
+      file_offset: metadata.table(12)?.offset ?? null,
+    });
   }
   return { runtime_family: runtimeFamily, evidence };
 };
@@ -226,8 +251,8 @@ const implementationFor = (
   cli: ManagedCliHeader,
   metadata: ManagedMetadataLayout,
 ): ManagedArtifactInspection["classification"]["implementation"] => {
-  if ((cli.flags & 1) === 0) return "cpp-cli-mixed";
   if (cli.readyToRunSignature) return "cil-and-ready-to-run";
+  if ((cli.flags & 1) === 0) return "cpp-cli-mixed";
   return (metadata.rowCounts[6] ?? 0) === 0 ? "metadata-only" : "cil";
 };
 
@@ -237,9 +262,9 @@ const managedArchitectureFor = (
 ): ManagedArtifactInspection["classification"]["managed_architecture"] => {
   if (layout.architecture !== "x86" || (cli.flags & 1) === 0)
     return layout.architecture;
-  if ((cli.flags & 0x0000_0002) !== 0) return "x86";
-  if ((cli.flags & 0x0002_0000) !== 0) return "anycpu-prefer-32";
-  return "anycpu";
+  const requirement = managedCli32BitRequirement(cli.flags);
+  if (requirement === "required") return "x86";
+  return requirement === "preferred" ? "anycpu-prefer-32" : "anycpu";
 };
 
 const runtimeClassification = ({
@@ -288,10 +313,9 @@ const partialMetadataResult = ({
 }: PartialMetadataContext): ManagedArtifactInspection => ({
   ...base(target, bytes, layout),
   classification: {
-    status: "malformed",
+    status: issue.code === "resource-limit" ? "managed" : "malformed",
     container: "pe",
-    runtime_family:
-      (layout.cli?.flags ?? 1) & 1 ? "unknown" : "mixed-clr-native",
+    runtime_family: runtimeFamilyFromCliHeader(layout.cli),
     implementation: "unknown",
     managed_architecture: "unknown",
     evidence: [
@@ -303,7 +327,7 @@ const partialMetadataResult = ({
     ],
   },
   metadata: {
-    status: "malformed",
+    status: issue.code === "resource-limit" ? "partial" : "malformed",
     version: null,
     stream_names: [],
     table_row_counts: {},
@@ -316,33 +340,11 @@ const partialMetadataResult = ({
   attributes: [],
   coverage: { state: "partial", issues: [issue] },
   limitations: [
-    "CLI metadata could not be read because the PE/CLI structure is malformed or unsupported.",
+    issue.code === "resource-limit"
+      ? "CLI metadata inspection stopped at its representation budget; omitted facts are unknown."
+      : "CLI metadata could not be read because the PE/CLI structure is malformed or unsupported.",
   ],
 });
-
-const mapResources = (
-  bytes: Buffer,
-  layout: ManagedPeLayout,
-  issues: ManagedParseIssue[],
-): ManagedResourceDirectory | null => {
-  const resources = layout.cli?.resources;
-  if (resources === undefined || (resources.rva === 0 && resources.size === 0))
-    return null;
-  try {
-    return {
-      offset: layout.rvaToOffset(
-        resources.rva,
-        resources.size,
-        "cli.resources",
-      ),
-      size: resources.size,
-    };
-  } catch (cause: unknown) {
-    if (!(cause instanceof ManagedReaderFailure)) throw cause;
-    issues.push(cause.issue);
-    return null;
-  }
-};
 
 /** Inspect PE/CLI identity directly from local bytes without CLR loading. */
 export const inspectManagedArtifactBytes = (
@@ -367,53 +369,74 @@ export const inspectManagedArtifactBytes = (
   } catch (cause: unknown) {
     if (!(cause instanceof ManagedReaderFailure)) throw cause;
     return managedArtifactInspectionSchema.parse(
-      partialMetadataResult({
-        target,
-        bytes,
-        layout,
-        issue: cause.issue,
-      }),
+      admitManagedProjection(
+        partialMetadataResult({
+          target,
+          bytes,
+          layout,
+          issue: cause.issue,
+        }),
+      ),
     );
   }
   const resourceIssues: ManagedParseIssue[] = [];
-  const resourceDirectory = mapResources(bytes, layout, resourceIssues);
-  const inventory = readManagedMetadataInventory(
-    bytes,
-    metadata,
-    resourceDirectory,
+  const resourceDirectory = readManagedResourceDirectory(
+    layout,
+    resourceIssues,
   );
-  const issues = [...resourceIssues, ...inventory.issues];
-  const limitations = [
-    ...(issues.length === 0
-      ? []
-      : [
-          "At least one metadata or resource item could not be read; coverage is partial.",
-        ]),
-    "Static inspection did not load the assembly, resolve dependencies through a CLR, decompile C#, or execute target code.",
-  ];
-  return managedArtifactInspectionSchema.parse({
-    ...base(target, bytes, layout),
-    classification: {
-      status: "managed",
-      container: "pe",
-      ...runtimeClassification({ layout, metadata, inventory }),
-    },
-    metadata: {
-      status: issues.length === 0 ? "complete" : "partial",
-      version: metadata.version,
-      stream_names: metadata.streamNames,
-      table_row_counts: managedTableRowCounts(metadata),
-    },
-    module: inventory.module,
-    assembly: inventory.assembly,
-    target_frameworks: inventory.targetFrameworks,
-    references: inventory.references,
-    resources: inventory.resources,
-    attributes: inventory.attributes,
-    coverage: {
-      state: issues.length === 0 ? "complete" : "partial",
-      issues,
-    },
-    limitations,
-  });
+  try {
+    const memberLists = readTypeMemberListFacts(bytes, metadata);
+    const inventory = readManagedMetadataInventory(
+      bytes,
+      metadata,
+      resourceDirectory,
+      memberLists,
+    );
+    const issues = [...resourceIssues, ...inventory.issues];
+    const limitations = [
+      ...(issues.length === 0
+        ? []
+        : [
+            "At least one metadata or resource item could not be read; coverage is partial.",
+          ]),
+      "Static inspection did not load the assembly, resolve dependencies through a CLR, decompile C#, or execute target code.",
+    ];
+    return managedArtifactInspectionSchema.parse(
+      admitManagedProjection(
+        {
+          ...base(target, bytes, layout),
+          classification: {
+            status: "managed",
+            container: "pe",
+            ...runtimeClassification({ layout, metadata, inventory }),
+          },
+          metadata: {
+            status: issues.length === 0 ? "complete" : "partial",
+            version: metadata.version,
+            stream_names: metadata.streamNames,
+            table_row_counts: managedTableRowCounts(metadata),
+          },
+          module: inventory.module,
+          assembly: inventory.assembly,
+          target_frameworks: inventory.targetFrameworks,
+          references: inventory.references,
+          resources: inventory.resources,
+          attributes: inventory.attributes,
+          coverage: {
+            state: issues.length === 0 ? "complete" : "partial",
+            issues,
+          },
+          limitations,
+        },
+        managedDecodeBudget(metadata),
+      ),
+    );
+  } catch (cause: unknown) {
+    if (!(cause instanceof ManagedReaderFailure)) throw cause;
+    return managedArtifactInspectionSchema.parse(
+      admitManagedProjection(
+        partialMetadataResult({ target, bytes, layout, issue: cause.issue }),
+      ),
+    );
+  }
 };

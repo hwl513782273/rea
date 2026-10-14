@@ -17,34 +17,89 @@ export const featureSeedMatchMode = (seed: {
 }): "exact" | "contains" =>
   seed.match ?? (seed.kind === "string" ? "contains" : "exact");
 
-const literalSeedKinds = [
-  "route",
-  "string",
-  "api",
-  "channel",
-  "module",
-  "native-export",
-] as const;
+const apiSeedSchema = z.union([
+  z.strictObject({
+    kind: z.literal("api"),
+    value: boundedTextSchema,
+    match: z.enum(["exact", "contains"]).nullable().default(null),
+    case_sensitive: z.boolean().default(false),
+  }),
+  z.strictObject({
+    kind: z.literal("api"),
+    value: z.literal(""),
+    match: z.literal("exact"),
+    case_sensitive: z.boolean().default(false),
+  }),
+]);
+
+const apiPathSeedSchema = z.union([
+  z.strictObject({
+    kind: z.literal("api"),
+    value: boundedTextSchema,
+    match: z.enum(["exact", "contains"]).nullable().default(null),
+    case_sensitive: z.boolean().default(false),
+    entry_path: z.array(z.string()).min(1),
+  }),
+  z.strictObject({
+    kind: z.literal("api"),
+    value: z.literal(""),
+    match: z.literal("exact"),
+    case_sensitive: z.boolean().default(false),
+    entry_path: z.array(z.string()).min(1),
+  }),
+]);
 
 /**
  * Literal starting point for one application feature trace. An empty value,
  * such as the channel in `ipcMain.handle("")`, must be an explicit exact
  * literal seed: empty containment would select every node.
  */
-const applicationFeatureSeedSchema = z.union([
+export const applicationFeatureSeedSchema = z.union([
   z.strictObject({
-    kind: z.enum(["node-id", ...literalSeedKinds]),
+    kind: z.enum([
+      "node-id",
+      "route",
+      "string",
+      "channel",
+      "module",
+      "native-export",
+    ]),
     value: boundedTextSchema,
     match: z.enum(["exact", "contains"]).nullable().default(null),
     case_sensitive: z.boolean().default(false),
   }),
   z.strictObject({
-    kind: z.enum(literalSeedKinds),
+    kind: z.enum(["route", "string", "channel", "module", "native-export"]),
     value: z.literal(""),
     match: z.literal("exact"),
     case_sensitive: z.boolean().default(false),
   }),
+  apiSeedSchema,
+  apiPathSeedSchema,
 ]);
+
+/** Check unique native identities before projecting an application trace. */
+const validateApplicationTraceIdentities = (
+  input: {
+    readonly native_observations: readonly { readonly evidence_id: string }[];
+  },
+  context: z.RefinementCtx,
+): void => {
+  const ids = input.native_observations.map(({ evidence_id: id }) => id);
+  if (new Set(ids).size !== ids.length)
+    context.addIssue({
+      code: "custom",
+      path: ["native_observations"],
+      message: "Native observations must be unique",
+    });
+};
+
+/** Validate native trace identities without capturing their complete Evidence. */
+export const applicationTraceIdentitiesSchema = z
+  .object({
+    native_observations: z.array(z.object({ evidence_id: evidenceIdSchema })),
+  })
+  .superRefine(validateApplicationTraceIdentities);
 
 /** Evidence-backed application graph and feature seed. */
 export const traceApplicationFeatureInputSchema = z
@@ -54,15 +109,7 @@ export const traceApplicationFeatureInputSchema = z
     seed: applicationFeatureSeedSchema,
     direction: z.enum(["outgoing", "incoming", "both"]).default("both"),
   })
-  .superRefine((input, context) => {
-    const ids = input.native_observations.map(({ evidence_id: id }) => id);
-    if (new Set(ids).size !== ids.length)
-      context.addIssue({
-        code: "custom",
-        path: ["native_observations"],
-        message: "Native observations must be unique",
-      });
-  });
+  .superRefine(validateApplicationTraceIdentities);
 
 const seedMatchSchema = z.strictObject({
   node_id: nodeIdSchema,
@@ -141,7 +188,10 @@ export const applicationFeatureTraceResultSchema = z.strictObject({
 export type TraceApplicationFeatureInput = z.infer<
   typeof traceApplicationFeatureInputSchema
 >;
-export type ApplicationFeatureSeed = z.infer<
+export type ApplicationFeatureSeed = z.output<
+  typeof applicationFeatureSeedSchema
+>;
+export type ApplicationFeatureSeedInput = z.input<
   typeof applicationFeatureSeedSchema
 >;
 export type ApplicationFeatureTraceResult = z.infer<

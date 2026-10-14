@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -11,9 +11,11 @@ import {
   requireFunctionDossier,
   requirePseudocode,
 } from "../dist/application/RealHopperAssertions.js";
-import { HOPPER_PROVIDER_IDENTITY } from "../dist/hopper/HopperProvider.js";
+import { HOPPER_PROVIDER_IDENTITY } from "../dist/hopper/HopperProviderCapabilities.js";
+import { HOPPER_TARGET_LEASE_DIRECTORY } from "../dist/hopper/HopperTargetLease.js";
 import { REA_WORKFLOW_PROVIDER } from "../dist/application/InvestigationProviders.js";
 import { loadRealHopperFixtureTargets } from "./lib/real-hopper-fixture.mjs";
+import { verifyHopperStringObjects } from "./lib/real-hopper-search.mjs";
 import {
   requireBridgeDiagnostic,
   requireBridgeProgress,
@@ -25,15 +27,27 @@ import {
 import {
   mcpTextValue,
   requireEvidenceProvider,
-  requireMcpResult,
+  requireMcpOperationResult,
+  requireMcpLifecycleResult,
+  requireMcpEvidenceResult,
+  sortVerifierNames,
   requireWorkflowEvidenceProvider,
 } from "./lib/mcp-verifier-results.mjs";
-import { verifyHopperFunctionBasics } from "./lib/real-hopper-function-basics.mjs";
+import {
+  verifyHopperTerminalInstructions,
+  verifyHopperFunctionBasics,
+} from "./lib/real-hopper-function-basics.mjs";
 import { openAndVerifyLargeFixture } from "./lib/real-hopper-exhaustive-search.mjs";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
 import { requireHopperSelection } from "./lib/real-hopper-selection.mjs";
 import { verifyHopperInventories } from "./lib/real-hopper-inventory.mjs";
+import {
+  verifyHopperBoundaryContracts,
+  verifyHopperLifecycleAndCli,
+} from "./lib/real-hopper-boundaries.mjs";
 import { startUnrelatedHopperSentinel } from "./lib/unrelated-hopper-sentinel.mjs";
+import { snapshotHopperRuntime } from "./lib/real-hopper-cleanup.mjs";
+import { verifyLinuxHopperOwnerExit } from "./lib/real-hopper-owner-exit.mjs";
 const execFileAsync = promisify(execFile);
 const verifierRun = createVerifierRun();
 const timeout = 180_000;
@@ -47,11 +61,13 @@ const parseServerArgs = (encoded) => {
   return parsed;
 };
 
-const sessionsBefore = new Set(
-  (await readdir("/tmp")).filter((name) => name.startsWith("rea-")),
+const runtimeParent = process.platform === "darwin" ? "/tmp" : tmpdir();
+const sessionsBefore = await snapshotHopperRuntime(
+  runtimeParent,
+  HOPPER_TARGET_LEASE_DIRECTORY,
 );
+const ownedProcessIds = new Set();
 const textValue = mcpTextValue;
-const requireSuccessfulTool = requireMcpResult;
 
 const requireOverview = (value, operation) => {
   if (
@@ -74,7 +90,7 @@ const verifyRelationships = async (client, options, procedure) => {
   const related = {};
   for (const operation of ["procedure_callers", "procedure_callees"]) {
     related[operation] = requireAddressArray(
-      requireSuccessfulTool(
+      requireMcpEvidenceResult(
         await client.callTool(
           { name: operation, arguments: { procedure } },
           options,
@@ -85,7 +101,7 @@ const verifyRelationships = async (client, options, procedure) => {
     );
   }
   related.xrefs = requireAddressArray(
-    requireSuccessfulTool(
+    requireMcpEvidenceResult(
       await client.callTool(
         { name: "xrefs", arguments: { address: procedure } },
         options,
@@ -98,7 +114,7 @@ const verifyRelationships = async (client, options, procedure) => {
 };
 
 const verifyByteAccess = async (client, options, firstAddress) => {
-  const byteRead = requireSuccessfulTool(
+  const byteRead = requireMcpEvidenceResult(
     await client.callTool(
       { name: "read_bytes", arguments: { address: firstAddress, length: 16 } },
       options,
@@ -114,7 +130,7 @@ const verifyByteAccess = async (client, options, firstAddress) => {
   ) {
     throw new Error("read_bytes returned an invalid bounded byte window");
   }
-  const mappedOffset = requireSuccessfulTool(
+  const mappedOffset = requireMcpEvidenceResult(
     await client.callTool(
       {
         name: "address_to_file_offset",
@@ -138,7 +154,7 @@ const verifyByteAccess = async (client, options, firstAddress) => {
 };
 
 const verifyCurrentTarget = async (client, options) => {
-  const procedures = requireSuccessfulTool(
+  const procedures = requireMcpEvidenceResult(
     await client.callTool({ name: "list_procedures", arguments: {} }, options),
     "list_procedures",
   );
@@ -154,7 +170,7 @@ const verifyCurrentTarget = async (client, options) => {
     options,
     firstAddress,
   );
-  const boundedResult = requireSuccessfulTool(
+  const boundedResult = requireMcpEvidenceResult(
     await client.callTool(
       {
         name: "batch_decompile",
@@ -183,7 +199,7 @@ const verifyCurrentTarget = async (client, options) => {
     "batch_decompile",
   );
   const dossier = requireFunctionDossier(
-    requireSuccessfulTool(
+    requireMcpEvidenceResult(
       await client.callTool(
         {
           name: "analyze_function",
@@ -197,7 +213,7 @@ const verifyCurrentTarget = async (client, options) => {
   );
   return {
     procedure: dossier.procedure,
-    procedureCount: procedures.total,
+    procedureCount: procedures.length,
     boundedPseudocodeChars: boundedPseudocode.length,
     analyzedPseudocodeChars: [...dossier.pseudocode].length,
     callerCount: relationships.procedure_callers.length,
@@ -241,7 +257,7 @@ let stderrBytes = 0;
 const stderrChunks = [];
 transport.stderr?.on("data", (chunk) => {
   stderrBytes += chunk.length;
-  if (stderrBytes <= 16_384) stderrChunks.push(chunk.toString("utf8"));
+  stderrChunks.push(chunk.toString("utf8"));
 });
 const client = new Client({ name: "real-hopper-verifier", version: "1.0.0" });
 const unrelatedHopper = await startUnrelatedHopperSentinel();
@@ -250,6 +266,9 @@ let summary;
 
 try {
   await client.connect(transport);
+  if (transport.pid === null)
+    throw new Error("The verifier did not capture its MCP process identity");
+  ownedProcessIds.add(transport.pid);
   const progressUpdates = [];
   const options = {
     timeout,
@@ -258,13 +277,18 @@ try {
   const fullSessionStatus = () =>
     client.callTool({ name: "binary_session", arguments: {} }, options);
   const initialSession = await fullSessionStatus();
-  const initialStatus = requireMcpResult(initialSession, "binary_session");
+  const initialStatus = requireMcpLifecycleResult(
+    initialSession,
+    "binary_session",
+  );
   const listed = await client.listTools();
   const availableTools = initialStatus.tool_availability;
   if (!Array.isArray(availableTools))
     throw new Error("The real session omitted tool availability");
-  const expectedNames = availableTools.map(({ name }) => name).sort();
-  const actualNames = listed.tools.map(({ name }) => name).sort();
+  const expectedNames = sortVerifierNames(
+    availableTools.map(({ name }) => name),
+  );
+  const actualNames = sortVerifierNames(listed.tools.map(({ name }) => name));
   if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
     const expected = new Set(expectedNames);
     const actual = new Set(actualNames);
@@ -284,7 +308,7 @@ try {
     options,
   );
   if (opened.isError === true) throw new Error(textValue(opened));
-  const firstStatus = requireMcpResult(
+  const firstStatus = requireMcpLifecycleResult(
     await fullSessionStatus(),
     "binary_session",
   );
@@ -296,6 +320,7 @@ try {
     { name: "list_documents", arguments: {} },
     options,
   );
+  requireMcpEvidenceResult(documents, "list_documents");
   requireBridgeProgress(progressUpdates);
   const rejectedProcedure = await client.callTool(
     {
@@ -310,7 +335,7 @@ try {
     { name: "binary_overview", arguments: {} },
     options,
   );
-  requireSuccessfulTool(overview, "binary_overview");
+  requireMcpEvidenceResult(overview, "binary_overview");
   const inventoryCounts = await verifyHopperInventories(client, options);
   requireEvidenceProvider(
     documents,
@@ -326,9 +351,9 @@ try {
     options,
   );
   requireTruthfulMemoryRegions(
-    requireSuccessfulTool(segments, "list_segments"),
+    requireMcpEvidenceResult(segments, "list_segments"),
   );
-  const firstDocuments = requireSuccessfulTool(documents, "list_documents");
+  const firstDocuments = requireMcpEvidenceResult(documents, "list_documents");
   if (
     !Array.isArray(firstDocuments) ||
     firstDocuments.length === 0 ||
@@ -339,26 +364,36 @@ try {
     client,
     options,
     firstDocuments,
-    requireSuccessfulTool,
+    requireMcpEvidenceResult,
   );
   const firstOverview = requireOverview(
-    requireSuccessfulTool(overview, "binary_overview"),
+    requireMcpEvidenceResult(overview, "binary_overview"),
     "binary_overview",
   );
+  if (firstOverview.document !== currentDocument)
+    throw new Error(
+      "binary_overview did not identify the selected Hopper document",
+    );
   const firstAnalysis = await verifyCurrentTarget(client, options);
   const fixtureAnalysis = await verifyRealHopperFixture({
     client,
     options,
     document: currentDocument,
     oracle: fixtureTargets.oracle,
-    normalizedResult: requireSuccessfulTool,
+    normalizedResult: requireMcpEvidenceResult,
   });
+  const boundaryContracts = await verifyHopperBoundaryContracts(
+    client,
+    options,
+    fixtureAnalysis.procedures.entry,
+    targetA,
+  );
   const switched = await client.callTool(
     { name: "open_binary", arguments: { path: targetB } },
     options,
   );
   if (switched.isError === true) throw new Error(textValue(switched));
-  const secondSession = requireMcpResult(
+  const secondSession = requireMcpLifecycleResult(
     await fullSessionStatus(),
     "binary_session",
   );
@@ -373,28 +408,41 @@ try {
     options,
   );
   const verifiedSecondOverview = requireOverview(
-    requireSuccessfulTool(secondOverview, "binary_overview"),
+    requireMcpEvidenceResult(secondOverview, "binary_overview"),
     "binary_overview after target switch",
   );
   const secondAnalysis = await verifyCurrentTarget(client, options);
-  const documentsAfterTargetSwitch = requireMcpResult(
+  const documentsAfterTargetSwitch = requireMcpEvidenceResult(
     await client.callTool({ name: "list_documents", arguments: {} }, options),
-    "list_documents after target switch",
+    "list_documents",
   );
+  const secondDocument = await requireCurrentDocument(
+    client,
+    options,
+    documentsAfterTargetSwitch,
+    requireMcpEvidenceResult,
+  );
+  if (verifiedSecondOverview.document !== secondDocument)
+    throw new Error(
+      "binary_overview retained another document after target switch",
+    );
+  const expectedDocumentsAfterTargetSwitch = firstDocuments.length;
   if (
     !Array.isArray(documentsAfterTargetSwitch) ||
-    documentsAfterTargetSwitch.length !== firstDocuments.length + 1
+    documentsAfterTargetSwitch.length !== expectedDocumentsAfterTargetSwitch
   )
-    throw new Error("A distinct target did not receive one Hopper document");
+    throw new Error(
+      "Target switching did not replace the previous Hopper document",
+    );
   const reopenedTarget = await client.callTool(
     { name: "open_binary", arguments: { path: targetB } },
     options,
   );
   if (reopenedTarget.isError === true)
     throw new Error(textValue(reopenedTarget));
-  const documentsAfterReopen = requireMcpResult(
+  const documentsAfterReopen = requireMcpEvidenceResult(
     await client.callTool({ name: "list_documents", arguments: {} }, options),
-    "list_documents after reopening target B",
+    "list_documents",
   );
   if (
     !Array.isArray(documentsAfterReopen) ||
@@ -406,7 +454,7 @@ try {
   const largeInventory = await openAndVerifyLargeFixture({
     client,
     options,
-    normalizedResult: requireSuccessfulTool,
+    normalizedResult: requireMcpEvidenceResult,
     path: largeTarget,
     expectedCount: fixtureTargets.largeOracle.symbolCount,
     symbolPrefix: fixtureTargets.largeOracle.symbolPrefix,
@@ -422,20 +470,52 @@ try {
       "Hopper's bundled MCP server was running during verification",
     );
   }
-  const diagnosticCount = requireSafeDiagnostics(stderrChunks);
-  requireBridgeDiagnostic(stderrChunks);
-
   const closed = await client.callTool(
     { name: "close_binary", arguments: {} },
     options,
   );
   if (closed.isError === true) throw new Error(textValue(closed));
-  const closedSession = requireMcpResult(
+  let unicodeStrings = null;
+  let terminalInstructions = null;
+  if (fixtureTargets.unicode !== undefined) {
+    const call = async (name, args = {}) =>
+      requireMcpOperationResult(
+        await client.callTool({ name, arguments: args }, options),
+        name,
+      );
+    await call("open_binary", { path: fixtureTargets.unicode.path });
+    terminalInstructions = await verifyHopperTerminalInstructions(call);
+    unicodeStrings = await verifyHopperStringObjects(call, [
+      { value: "REA_UTF16_é_😀", encoding: "utf-16-le" },
+      { value: 'REA_UTF16_ESCAPED_é_"\\line\nend\t\r', encoding: "utf-16-le" },
+      { value: "\nREA_UTF16_LEADING_é", encoding: "utf-16-le" },
+    ]);
+    await call("close_binary");
+  }
+  const lifecycleAndCli = await verifyHopperLifecycleAndCli(client, options, {
+    primary: targetA,
+    secondary: targetB,
+    ...(fixtureTargets.unicode === undefined
+      ? {}
+      : { unicode: fixtureTargets.unicode.path }),
+    ownedProcessIds,
+  });
+  const closedSession = requireMcpLifecycleResult(
     await fullSessionStatus(),
     "binary_session",
   );
   if (closedSession.open !== false)
     throw new Error("The real session remained open after close_binary");
+  const diagnosticCount = requireSafeDiagnostics(
+    stderrChunks,
+    [
+      "procedure_info",
+      "batch_decompile",
+      ...boundaryContracts.rejectedOperations,
+    ],
+    ["HopperRemoteError", "HopperCancelledError", "AnalysisCancelledError"],
+  );
+  requireBridgeDiagnostic(stderrChunks);
 
   summary = {
     toolCount: actualNames.length,
@@ -444,6 +524,10 @@ try {
     segmentCount: firstOverview.segment_count,
     analyses: [firstAnalysis, secondAnalysis],
     fixtureAnalysis,
+    unicodeStrings,
+    terminalInstructions,
+    boundaryContracts,
+    lifecycleAndCli,
     inventoryCounts,
     largeInventory,
     fixtureManifest: fixtureTargets.manifestPath,
@@ -472,35 +556,56 @@ try {
 }
 
 await new Promise((resolve) => setTimeout(resolve, 500));
-const sessionsAfter = (await readdir("/tmp")).filter(
-  (name) => name.startsWith("rea-") && !sessionsBefore.has(name),
-);
+const sessionsAfter = [
+  ...(await snapshotHopperRuntime(
+    runtimeParent,
+    HOPPER_TARGET_LEASE_DIRECTORY,
+    ownedProcessIds,
+  )),
+]
+  .filter((path) => !sessionsBefore.has(path))
+  .sort();
 if (sessionsAfter.length > 0) {
-  throw new Error("The MCP runtime leaked a bridge session directory");
-}
-const afterCloseProcesses = await execFileAsync("ps", [
-  "-ax",
-  "-o",
-  "command=",
-]);
-if (
-  afterCloseProcesses.stdout
-    .split("\n")
-    .some((line) => line.includes("node dist/main.js"))
-) {
+  await writeVerificationReport({
+    ...summary,
+    unrelatedHopperSurvived,
+    cleanShutdown: false,
+    retainedRuntimePaths: sessionsAfter,
+  });
   throw new Error(
-    "The TypeScript MCP server remained alive after client close",
+    `The MCP runtime retained Hopper resources: ${sessionsAfter.join(", ")}`,
   );
 }
 if (summary === undefined)
   throw new Error("Real-Hopper verification did not produce a summary");
+if (process.platform === "linux")
+  summary.ownerExit = await verifyLinuxHopperOwnerExit({
+    primary: targetA,
+    secondary: targetB,
+    serverCommand,
+    serverArgs,
+    environment: serverEnvironment,
+  });
 const completedVerifierRun = await completeVerifierRun(verifierRun);
-await new Promise((resolve, reject) => {
-  process.stdout.write(
-    `${JSON.stringify({ verifier_run: completedVerifierRun, ...summary, unrelatedHopperSurvived, cleanShutdown: true }, null, 2)}\n`,
-    (cause) => {
+if (
+  completedVerifierRun.process_lineage.status !== "verified" ||
+  completedVerifierRun.process_lineage.descendants.length !== 0
+)
+  throw new Error(
+    "The verifier's process lineage did not prove owned child cleanup",
+  );
+await writeVerificationReport({
+  verifier_run: completedVerifierRun,
+  ...summary,
+  unrelatedHopperSurvived,
+  cleanShutdown: true,
+});
+
+async function writeVerificationReport(report) {
+  await new Promise((resolve, reject) => {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`, (cause) => {
       if (cause) reject(cause);
       else resolve();
-    },
-  );
-});
+    });
+  });
+}

@@ -1,6 +1,6 @@
 import type { BinarySession } from "../application/binary/BinarySession.js";
-import type { AppConfig } from "../config.js";
-import type { Logger } from "../logger.js";
+import type { AppConfig } from "../config/types.js";
+import type { Logger } from "pino";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 
 export const openInitialTarget = async (
@@ -16,11 +16,18 @@ export const openInitialTarget = async (
     targetKind: config.hopperTargetKind,
   });
   if (opened.ok) return { ok: true };
-  await session.close();
+  const closed = await session.close();
   serverLogger.error(
-    { errorTag: opened.error._tag },
+    {
+      error: projectAnalysisError(opened.error),
+      ...(closed.ok
+        ? {}
+        : { cleanup_error: projectAnalysisError(closed.error) }),
+    },
     "Initial target failed to open",
   );
   writeStderr(`${projectAnalysisError(opened.error).message}\n`);
+  if (!closed.ok)
+    writeStderr(`${projectAnalysisError(closed.error).message}\n`);
   return { ok: false, exitCode: 1 };
 };

@@ -1,39 +1,19 @@
-import { canonicalDigest } from "../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import type { ProviderIdentity } from "./AnalysisProvider.js";
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import type { BrowserScenarioCapture } from "../domain/browserScenarioCapture.js";
-import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import {
   createEvidence,
   type Evidence,
   type EvidenceObservation,
 } from "../domain/evidence.js";
-import { jsonValueSchema } from "../domain/jsonValue.js";
+import { jsonObjectSchema, jsonValueSchema } from "../domain/jsonValue.js";
 
 const browserScenarioParameters = (
   scenario: BrowserScenario,
 ): EvidenceObservation["parameters"] => ({
-  scenario_sha256: canonicalDigest(scenario, "Browser scenario"),
-  browser_mode: scenario.browser.mode,
-  ...(scenario.browser.mode === "launch"
-    ? { browser_headless: scenario.browser.headless }
-    : {}),
-  start_url: sanitizeBrowserUrl(scenario.start_url.url),
-  environment: scenario.environment,
-  actions: scenario.actions.map(({ step_id, action }) => ({
-    step_id,
-    action,
-  })),
-  action_timeouts_ms: scenario.actions.map((item) =>
-    "timeout_ms" in item ? (item.timeout_ms ?? null) : null,
-  ),
-  secret_declarations: scenario.secrets.map(
-    ({ secret_id, environment_variable }) => ({
-      secret_id,
-      environment_variable,
-    }),
-  ),
-  capture: scenario.capture,
+  ...jsonObjectSchema.parse(scenario),
+  scenario_sha256: digestCanonicalValue(scenario, "Browser scenario"),
 });
 
 /** Create Evidence without retaining resolved scenario secret values. */

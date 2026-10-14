@@ -30,7 +30,7 @@ class FakeDocument:
         return 0x401000
 
     def getSegmentsList(self):
-        return [FakeInventorySegment()]
+        return []
 
 
 class FakeDocumentProvider:
@@ -47,39 +47,6 @@ class FakeDocumentProvider:
         return cls.current
 
 
-class FakeStringSegment:
-    def getStringsList(self):
-        return [("fixture string", FakeStringAddress())]
-
-
-class FakeStringAddress:
-    def __init__(self, value="0x401234"):
-        self.value = value
-
-    def __str__(self):
-        return self.value
-
-
-class FakeInventorySegment:
-    addresses = [FakeStringAddress("0x10"), 0x100, 0x2]
-
-    def getStringsList(self):
-        return [
-            ("string-" + str(self.number(address)), address)
-            for address in self.addresses
-        ]
-
-    def getNamedAddresses(self):
-        return self.addresses
-
-    def getNameAtAddress(self, address):
-        return "name-" + str(self.number(address))
-
-    @staticmethod
-    def number(address):
-        return address if isinstance(address, int) else int(str(address), 16)
-
-
 class FakeReferenceSegment:
     def getNameAtAddress(self, address):
         return "fixture-procedure"
@@ -89,6 +56,12 @@ class FakeReferenceSegment:
 
     def getReferencesOfAddress(self, address):
         return []
+
+    def getCommentAtAddress(self, address):
+        return None
+
+    def getInlineCommentAtAddress(self, address):
+        return None
 
 
 class FakeProcedure:
@@ -104,6 +77,9 @@ class FakeProcedure:
     def basicBlockIterator(self):
         return [FakeBlock()]
 
+    def getBasicBlockAtAddress(self, address):
+        return None
+
     def getBasicBlockCount(self):
         return 1
 
@@ -111,6 +87,15 @@ class FakeProcedure:
         return "int fixture-procedure()"
 
     def getLocalVariableList(self):
+        return []
+
+    def getAllCallees(self):
+        return []
+
+    def getAllCallerProcedures(self):
+        return []
+
+    def getAllCalleeProcedures(self):
         return []
 
 
@@ -121,12 +106,8 @@ class FakeBlock:
     def getEndingAddress(self):
         return 0x401004
 
-
-class FakeStringsDocument:
-    def getSegmentsList(self):
-        return [FakeStringSegment()]
-
-
+    def getSuccessorCount(self):
+        return 0
 def load_bridge(path):
     namespace = {
         "__file__": path,
@@ -181,7 +162,6 @@ def main():
     bridge["REA_OWNS_PROCESS_LIFETIME"] = False
     bridge["_configure_hopper_api"](FakeDocumentProvider)
     bridge["_bind_session_document"]()
-    strings = bridge["_strings"](FakeStringsDocument())
     current = bridge["_dispatch"]("current_document", {})
     current_address = bridge["_dispatch"]("current_address", {})
     selected = bridge["_session_document"]() is FakeDocumentProvider.current
@@ -219,17 +199,14 @@ def main():
     procedure_info = bridge["_dispatch"](
         "procedure_info", {"procedure": "0x401000"}
     )
-    inventories = bridge_replies(bridge, [
-        request(method, params, index)
-        for index, (method, params) in enumerate([
-            ("list_strings", {}),
-            ("list_names", {}),
-            ("list_strings", {"address": "0x10"}),
-            ("list_names", {"address": "0x10"}),
-            ("list_strings", {"address": "0xff"}),
-            ("list_names", {"address": "0xff"}),
-        ], 1)
-    ])
+    bridge["_assembly"] = lambda procedure: "ret"
+    bridge["_pseudocode"] = lambda document, procedure: None
+    bridge["_native_calls"] = lambda procedure, direction: ({}, [])
+    bridge["_string_inventory"] = lambda document, targets=None: {}
+    bridge["_search_inventory"] = lambda document, kind: []
+    analyze_function = bridge["_dispatch"](
+        "analyze_function", {"procedure": "0x401000"}
+    )
     provider_faults = []
     for error_type in (TypeError, ValueError, KeyError):
         FakeDocumentProvider.current.address_error = error_type("credential=supersecret")
@@ -279,11 +256,10 @@ def main():
                 "imported_without_hopper": unavailable,
                 "current_document": current,
                 "current_address": current_address,
-                "strings": strings,
-                "inventory_replies": inventories,
                 "containing_procedure": containing_procedure,
                 "procedure_references": procedure_references,
                 "procedure_info": procedure_info,
+                "analyze_function": analyze_function,
                 "provider_faults": provider_faults,
                 "malformed_requests": malformed_requests,
                 "session_document_reused": selected,

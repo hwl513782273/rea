@@ -4,8 +4,13 @@ import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { CdpCommandRejection } from "./CdpCommandRejection.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { safeParseJson } from "../domain/safeJson.js";
+import { WEB_RUNTIME_LIMITS } from "../domain/webRuntime.js";
+
+// ws currently stores maxPayload as a signed 32-bit integer. Larger values can
+// wrap to a negative number, which disables its limit check.
+const MAX_WEBSOCKET_PAYLOAD_BYTES = 0x7fff_ffff;
 
 export interface CdpEvent {
   readonly method: string;
@@ -15,6 +20,7 @@ export interface CdpEvent {
 
 interface PendingCommand {
   readonly method: string;
+  readonly sessionId?: string;
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: AnalysisError) => void;
   readonly removeAbort: () => void;
@@ -24,12 +30,15 @@ interface PendingCommand {
 export class CdpConnection {
   readonly #pending = new Map<number, PendingCommand>();
   readonly #listeners = new Set<(event: CdpEvent) => void>();
-  readonly #disconnectListeners = new Set<() => void>();
+  readonly #disconnectListeners = new Set<
+    (error: BrowserObservationError) => void
+  >();
   readonly #protocolFailureListeners = new Set<
     (error: BrowserObservationError) => void
   >();
   #nextId = 1;
   #closed = false;
+  #closePromise: Promise<void> | undefined;
   #protocolFailed = false;
   #transportFailure: "disconnected" | "payload_limit" = "disconnected";
 
@@ -57,13 +66,25 @@ export class CdpConnection {
     limits?: { readonly maxPayloadBytes: number },
   ): Promise<CdpConnection> {
     if (signal?.aborted === true) throw new AnalysisCancelledError(operation);
+    const maxPayloadBytes =
+      limits === undefined
+        ? WEB_RUNTIME_LIMITS.protocolBytes
+        : limits.maxPayloadBytes;
+    if (
+      !Number.isSafeInteger(maxPayloadBytes) ||
+      maxPayloadBytes <= 0 ||
+      maxPayloadBytes > MAX_WEBSOCKET_PAYLOAD_BYTES
+    )
+      throw new RangeError(
+        `CDP maxPayloadBytes must be a positive safe integer no greater than ${String(MAX_WEBSOCKET_PAYLOAD_BYTES)}.`,
+      );
     const socket = new WebSocket(url, {
       handshakeTimeout: 0,
-      maxPayload: limits?.maxPayloadBytes ?? 0,
+      maxPayload: maxPayloadBytes,
       perMessageDeflate: false,
     });
     await waitForOpen(socket, operation, signal);
-    return new CdpConnection(socket, operation, limits?.maxPayloadBytes ?? 0);
+    return new CdpConnection(socket, operation, maxPayloadBytes);
   }
 
   /** Subscribe to validated CDP event envelopes. */
@@ -73,9 +94,9 @@ export class CdpConnection {
   }
 
   /** Subscribe to an unexpected transport loss while an operation is active. */
-  onDisconnect(listener: () => void): () => void {
+  onDisconnect(listener: (error: BrowserObservationError) => void): () => void {
     if (this.#closed) {
-      listener();
+      listener(this.#transportError(this.#transportFailure));
       return () => undefined;
     }
     this.#disconnectListeners.add(listener);
@@ -120,6 +141,7 @@ export class CdpConnection {
       signal?.addEventListener("abort", onAbort, { once: true });
       this.#pending.set(id, {
         method,
+        ...(sessionId === undefined ? {} : { sessionId }),
         resolve,
         reject,
         removeAbort: () => signal?.removeEventListener("abort", onAbort),
@@ -147,8 +169,15 @@ export class CdpConnection {
   }
 
   /** Close only REA's socket; never close the browser or selected page. */
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    this.#closePromise ??= this.#closeTransport().catch((cause: unknown) => {
+      this.#closePromise = undefined;
+      throw cause;
+    });
+    return this.#closePromise;
+  }
+
+  async #closeTransport(): Promise<void> {
     this.#closed = true;
     this.#failPending("disconnected");
     if (this.socket.readyState === WebSocket.CLOSED) return;
@@ -211,24 +240,45 @@ export class CdpConnection {
   #receiveResponse(message: Record<string, unknown>, id: number): void {
     const pending = this.#pending.get(id);
     if (pending === undefined) return;
-    this.#complete(id, pending);
-    if ("error" in message) {
-      const reported = message.error;
-      pending.reject(
-        new CdpCommandRejection(
-          this.operation,
-          pending.method,
-          isRecord(reported) && typeof reported.code === "number"
-            ? reported.code
-            : null,
-          isRecord(reported) && typeof reported.message === "string"
-            ? reported.message
-            : null,
-        ),
-      );
+    const hasResult = "result" in message;
+    const hasError = "error" in message;
+    if (
+      (pending.sessionId === undefined
+        ? "sessionId" in message
+        : message.sessionId !== pending.sessionId) ||
+      hasResult === hasError
+    ) {
+      this.#failPending("protocol_error");
       return;
     }
-    pending.resolve("result" in message ? message.result : {});
+    if (hasResult) {
+      if (!isRecord(message.result)) {
+        this.#failPending("protocol_error");
+        return;
+      }
+      this.#complete(id, pending);
+      pending.resolve(message.result);
+      return;
+    }
+    const reported = message.error;
+    if (
+      !isRecord(reported) ||
+      typeof reported.code !== "number" ||
+      !Number.isSafeInteger(reported.code) ||
+      typeof reported.message !== "string"
+    ) {
+      this.#failPending("protocol_error");
+      return;
+    }
+    this.#complete(id, pending);
+    pending.reject(
+      new CdpCommandRejection(
+        this.operation,
+        pending.method,
+        reported.code,
+        reported.message,
+      ),
+    );
   }
 
   #complete(id: number, pending: PendingCommand): void {
@@ -258,7 +308,8 @@ export class CdpConnection {
     if (!wasClosed) this.#transportFailure = reason;
     this.#failPending(reason);
     if (wasClosed) return;
-    for (const listener of this.#disconnectListeners) listener();
+    const error = this.#transportError(reason);
+    for (const listener of this.#disconnectListeners) listener(error);
     this.#disconnectListeners.clear();
   }
 

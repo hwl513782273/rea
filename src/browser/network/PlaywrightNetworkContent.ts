@@ -33,12 +33,15 @@ const credentialHeaders = new Set([
 const errorMessage = (
   cause: unknown,
   secrets: BrowserScenarioSecrets,
-): string =>
-  secrets.redact(
+): string => {
+  const message =
     cause instanceof Error && cause.message !== ""
       ? cause.message
-      : "Network read failed",
-  );
+      : "Network read failed";
+  return secrets.redactionAllocationCost(message.length) <= 1024 * 1024
+    ? secrets.redact(message)
+    : "Network read failed; diagnostic exceeds the allocation budget.";
+};
 
 /** Read actual producer headers without flattening duplicates or exposing credentials. */
 export const captureNetworkHeaders = async (
@@ -52,6 +55,15 @@ export const captureNetworkHeaders = async (
       options.timeoutMs,
       options.signal,
     );
+    let cost = 0;
+    for (const { name, value } of headers) {
+      cost += secrets.redactionAllocationCost(name.length + value.length) + 128;
+      if (cost > 1024 * 1024)
+        return {
+          state: "unavailable",
+          message: "Headers exceed the 1 MiB allocation budget.",
+        };
+    }
     return {
       state: "captured",
       items: headers.map(({ name, value }) => {
@@ -72,7 +84,7 @@ export const captureNetworkHeaders = async (
   }
 };
 
-/** Retain only bytes exposed by the browser; no fetch or wire-byte reconstruction occurs. */
+/** Retain bytes returned by Playwright's body API, after declared-secret redaction. */
 export const captureNetworkBody = async (
   read: () => Promise<Buffer | null>,
   phase: "request" | "response",
@@ -87,14 +99,37 @@ export const captureNetworkBody = async (
       options.signal,
     );
     if (observed === null) return { state: "not_exposed" };
+    // This bounds subsequent redaction, base64 and validation copies, but the
+    // Playwright API itself has already materialized the body (see PR limits).
+    if (observed.length > 64 * 1024)
+      return {
+        state: "unavailable",
+        reason: "body-read-failed",
+        message: "Body exceeds the 64 KiB retained-content budget.",
+      };
+    if (secrets.redactionAllocationCost(observed.length) > 1024 * 1024)
+      return {
+        state: "unavailable",
+        reason: "body-read-failed",
+        message: "Body redaction exceeds the allocation budget.",
+      };
     const retained = secrets.redactBytes(observed);
     const contentType = source.headers()["content-type"];
+    if (
+      contentType !== undefined &&
+      secrets.redactionAllocationCost(contentType.length) > 64 * 1024
+    )
+      return {
+        state: "unavailable",
+        reason: "body-read-failed",
+        message: "Content type exceeds the retained metadata budget.",
+      };
     return {
       state: "captured",
       representation:
         phase === "request"
           ? "browser-exposed-request-bytes"
-          : "browser-decoded-response-bytes",
+          : "playwright-response-body-bytes",
       encoding: "base64",
       content: retained.toString("base64"),
       bytes: retained.length,

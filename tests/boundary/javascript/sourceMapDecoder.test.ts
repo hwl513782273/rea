@@ -1,8 +1,11 @@
 import { fileURLToPath } from "node:url";
-import type { SourceMapDecoderDependencies } from "../../../src/javascript/sourceMaps/SourceMapDecoder.js";
 import { access } from "node:fs/promises";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { SourceMapDecoder } from "../../../src/javascript/sourceMaps/SourceMapDecoder.js";
+import {
+  SOURCE_MAP_CODEC_MEMORY_LIMIT_BYTES,
+  type SourceMapDecoderDependencies,
+} from "../../../src/javascript/sourceMaps/SourceMapCommand.js";
 import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
 import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import { waitForProviderProcessReady } from "../../fixtures/providerProcess.js";
@@ -41,6 +44,32 @@ const input = {
   position: webSourceLocationArgs.generated_position,
 };
 
+it("starts the codec deadline after cold ownership preparation", async () => {
+  vi.useFakeTimers();
+  try {
+    let prepared = false;
+    const responsePromise = realDecoder({
+      prepareOwnership: async (signal) => {
+        await vi.advanceTimersByTimeAsync(20_001);
+        expect(signal?.aborted).not.toBe(true);
+        prepared = true;
+      },
+      launcher: (options) => {
+        expect(prepared).toBe(true);
+        expect(options.signal?.aborted).not.toBe(true);
+        return Promise.reject(new Error("observed launch after preparation"));
+      },
+    }).trace(input);
+    const response = await responsePromise;
+    if (response.ok) throw new Error("expected launch failure");
+    expect(response.error).toMatchObject({
+      diagnostics: { error_message: "observed launch after preparation" },
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("runs the real pinned codec with an independent heap and removes its private request directory", async () => {
   let path: string | undefined;
   const environment = {
@@ -59,12 +88,25 @@ it("runs the real pinned codec with an independent heap and removes its private 
   if (!response.ok) throw response.error;
   expect(response.value).toMatchObject({
     engine: { id: "jridgewell-trace-mapping", version: "0.3.31" },
-    runtime: { id: "node-v8" },
     matches: [{ content: { text: "original" } }],
   });
-  expect(response.value.runtime.v8_heap_limit_bytes).toBeLessThanOrEqual(
-    256 * 1024 * 1024,
-  );
+  if (process.versions.bun === undefined) {
+    expect(response.value.runtime).toMatchObject({
+      id: "node-v8",
+      version: process.version,
+    });
+    expect(response.value.runtime.v8_heap_limit_bytes).toBeLessThanOrEqual(
+      256 * 1024 * 1024,
+    );
+  } else
+    expect(response.value.runtime).toEqual({
+      id: "bun",
+      version: process.versions.bun,
+      node_compatibility_version: process.versions.node,
+      v8_heap_limit_bytes: null,
+      // Windows enforces a Job Object commit limit in place of the heap flags.
+      process_memory_limit_bytes: SOURCE_MAP_CODEC_MEMORY_LIMIT_BYTES,
+    });
   expect(environment.NODE_OPTIONS).toBe(
     "--require=/rea-file-that-does-not-exist",
   );
@@ -187,6 +229,95 @@ it("rejects a malformed actual subprocess reply", async () => {
   if (response.ok) throw new Error("expected malformed reply");
   expect(response.error._tag).toBe("AnalysisOutputError");
 });
+it("rejects a codec report from a runtime other than the launching one", async () => {
+  const actual = await realDecoder().trace(input);
+  if (!actual.ok) throw actual.error;
+  const replay = (report: unknown) =>
+    realDecoder({
+      launcher: (options) =>
+        spawnOwnedProviderProcess({
+          ...options,
+          arguments: [
+            "-e",
+            `process.stdout.write(${JSON.stringify(JSON.stringify({ state: "success", report }))})`,
+          ],
+        }),
+    }).trace(input);
+  const unchanged = await replay(actual.value);
+  if (!unchanged.ok) throw unchanged.error;
+  expect(unchanged.value).toEqual(actual.value);
+  const response = await replay({
+    ...actual.value,
+    runtime:
+      actual.value.runtime.id === "bun"
+        ? { id: "node-v8", version: "v24.18.0", v8_heap_limit_bytes: 1 }
+        : {
+            id: "bun",
+            version: "1.4.2",
+            node_compatibility_version: "24.18.0",
+            v8_heap_limit_bytes: null,
+            process_memory_limit_bytes: null,
+          },
+  });
+  if (response.ok) throw new Error("expected runtime mismatch");
+  expect(response.error._tag).toBe("AnalysisOutputError");
+  if (actual.value.runtime.id !== "bun") return;
+  // A Bun codec must report exactly the process limit its launcher enforced.
+  const limit = await replay({
+    ...actual.value,
+    runtime: {
+      ...actual.value.runtime,
+      process_memory_limit_bytes:
+        SOURCE_MAP_CODEC_MEMORY_LIMIT_BYTES === null ? 4096 : null,
+    },
+  });
+  if (limit.ok) throw new Error("expected process limit mismatch");
+  expect(limit.error.message).toContain("process memory limit");
+});
+it.each([true, false])(
+  "classifies a codec exit by the job memory notification (reached: %s)",
+  async (reached) => {
+    const response = await realDecoder({
+      launcher: async ({ memoryLimitBytes, ...options }) => {
+        expect(memoryLimitBytes).toBe(
+          SOURCE_MAP_CODEC_MEMORY_LIMIT_BYTES ?? undefined,
+        );
+        // Without a job limit any artifact runs the child; its handle reports
+        // the notification an owned Windows job records before exit.
+        const spawned = await spawnOwnedProviderProcess({
+          ...options,
+          arguments: [
+            "-e",
+            'process.stderr.write("panic: out of memory"); process.exit(3)',
+          ],
+        });
+        let exited = false;
+        spawned.process.once("exit", () => {
+          exited = true;
+        });
+        Object.defineProperty(spawned.process, "memoryLimitReached", {
+          get: () => reached && exited,
+        });
+        return spawned;
+      },
+    }).trace(input);
+    if (response.ok) throw new Error("expected codec failure");
+    expect(response.error).toMatchObject(
+      reached
+        ? {
+            _tag: "AnalysisResourceConstraintError",
+            resource: "memory",
+            reason: expect.stringContaining("process memory limit"),
+            reportedLimits: {
+              codec_process_memory_limit_bytes:
+                SOURCE_MAP_CODEC_MEMORY_LIMIT_BYTES,
+            },
+            capturedOutput: { stderr: "panic: out of memory" },
+          }
+        : { diagnostics: { exit_code: 3, stderr: "panic: out of memory" } },
+    );
+  },
+);
 it("removes the private request when launching the codec fails", async () => {
   let path: string | undefined;
   const response = await realDecoder({

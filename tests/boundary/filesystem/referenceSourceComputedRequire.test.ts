@@ -6,12 +6,53 @@ import { promisify } from "node:util";
 
 import { expect, it } from "vitest";
 
-import { importReferenceSource } from "../../../src/application/ReferenceSourceImport.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 it("distinguishes computed require member values from literal members in source evidence", async () => {
   const root = await createTestTempDirectory("rea-reference-require-members-");
-  const sources = {
+  const literalCallees = [
+    "require",
+    "require.resolve",
+    'require["resolve"]',
+    "require.main",
+    'require["main"]',
+    'require[("resolve")]',
+    'require["res\\u006flve"]',
+  ];
+  const ignoredSources = [
+    'require[resolve]("./dep.js");',
+    'require[main]("./dep.js");',
+    'const resolve = "toString"; require[resolve]("./dep.js");',
+    'const main = "toString"; require[main]("./dep.js");',
+    'const resolve = "resolve"; require[resolve]("./dep.js");',
+    'const main = "main"; require[main]("./dep.js");',
+    'const method = "resolve"; require[method]("./dep.js");',
+    'require[`resolve`]("./dep.js");',
+    'require["re" + "solve"]("./dep.js");',
+    ...[
+      "require?.",
+      "require.resolve?.",
+      'require["resolve"]?.',
+      "require.main?.",
+      'require["main"]?.',
+      "require?.resolve",
+      'require?.["resolve"]',
+      "require?.[resolve]",
+      "require?.main",
+      'require?.["main"]',
+      "require?.[main]",
+      "(require?.resolve)",
+      "require.resolve.call",
+      "require.main.require",
+      "module.require",
+      "other.resolve",
+      "other.require",
+      "require.toString",
+      'require["toString"]',
+    ].map((callee) => `${callee}("./dep.js");`),
+  ];
+  const sources: Record<string, string> = {
     "computed.cjs": [
       'const resolve = "toString";',
       'const main = "toString";',
@@ -21,15 +62,21 @@ it("distinguishes computed require member values from literal members in source 
     ].join("\n"),
     "literal.cjs": 'console.log(require["resolve"]("./dep.js"));\n',
     "dep.js": 'throw new Error("The dependency must not execute");\n',
+    "ignored.cjs": ignoredSources.map((source) => `{ ${source} }`).join("\n"),
     "unknown.cjs": [
       "function load(target) {",
-      "  require(target);",
-      "  require.resolve(target);",
-      '  require["resolve"](target);',
+      ...literalCallees.flatMap((callee) => [
+        `  ${callee}(target);`,
+        `  ${callee}(\`./dep.js\`);`,
+        `  ${callee}(getTarget());`,
+        `  ${callee}();`,
+      ]),
       "  return import(target);",
       "}",
     ].join("\n"),
   };
+  for (const [index, callee] of literalCallees.entries())
+    sources[`member-${index}.cjs`] = `${callee}("./dep.js");\n`;
   await Promise.all(
     Object.entries(sources).map(([path, source]) =>
       writeFile(join(root, path), source),
@@ -56,8 +103,7 @@ it("distinguishes computed require member values from literal members in source 
     caller: "reference-require-members-test",
     policy: { secretPatterns: [] },
   });
-  expect(result.ok).toBe(true);
-  if (!result.ok) return;
+  if (!result.ok) throw result.error;
   const graph = result.value;
   expect(graph.parse_failures).toEqual([]);
   expect(graph.relationships).toEqual([
@@ -68,6 +114,13 @@ it("distinguishes computed require member values from literal members in source 
       resolution: "internal",
       parse_state: "parsed",
     },
+    ...literalCallees.map((_, index) => ({
+      from_path: `member-${index}.cjs`,
+      to: "dep.js",
+      kind: "requires",
+      resolution: "internal",
+      parse_state: "parsed",
+    })),
     {
       from_path: "unknown.cjs",
       to: "<dynamic-import>",

@@ -1,9 +1,12 @@
 import { access, open } from "node:fs/promises";
+import { join } from "node:path";
+import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 
 import { readWindowsPrivateRuntimeFile } from "../windows/WindowsPrivateRuntime.js";
 
 import { err, ok, type Result } from "../domain/result.js";
 import { GhidraSessionError } from "./GhidraSessionError.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 /** Local bridge transports used by the current Ghidra session. */
 export type GhidraTransportKind = "unix-socket" | "authenticated-loopback-tcp";
@@ -13,6 +16,37 @@ export interface GhidraEndpoint {
   readonly transport: GhidraTransportKind;
   readonly path: string;
 }
+
+/** Allocate an endpoint that fits the host's Unix sockaddr without moving the project. */
+export const createGhidraEndpoint = async (
+  runtimeRoot: string,
+  transport: GhidraTransportKind,
+  platform: NodeJS.Platform,
+): Promise<{
+  readonly endpoint: GhidraEndpoint;
+  readonly socketRoot?: PrivateRuntimeRoot;
+}> => {
+  const path = join(
+    runtimeRoot,
+    transport === "unix-socket" ? "bridge.sock" : "bridge-endpoint.json",
+  );
+  // sockaddr_un includes a terminating NUL: macOS has 104 bytes, Linux 108.
+  const maximumPathBytes = platform === "darwin" ? 103 : 107;
+  if (
+    transport !== "unix-socket" ||
+    Buffer.byteLength(path, "utf8") <= maximumPathBytes
+  )
+    return { endpoint: { transport, path } };
+  const socketRoot = await PrivateRuntimeRoot.create({
+    parent: "/tmp",
+    prefix: "rea-ghidra-socket-",
+    platform,
+  });
+  return {
+    endpoint: { transport, path: join(socketRoot.path, "s") },
+    socketRoot,
+  };
+};
 
 /** Exact Node connection target after endpoint discovery. */
 export type GhidraConnectTarget =
@@ -114,7 +148,7 @@ const hasExactKeys = (
   expected: readonly string[],
 ): value is Record<string, unknown> => {
   const keys = Object.keys(value).sort((left, right) =>
-    left.localeCompare(right),
+    compareUnicodeCodePoints(left, right),
   );
   return (
     keys.length === expected.length &&

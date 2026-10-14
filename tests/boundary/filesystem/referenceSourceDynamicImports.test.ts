@@ -3,8 +3,8 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { importReferenceSource } from "../../../src/application/ReferenceSourceImport.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 it("resolves dynamic source imports while retaining computed targets as unknown", async () => {
   const root = await createTestTempDirectory("rea-reference-dynamic-import-");
@@ -17,6 +17,8 @@ it("resolves dynamic source imports while retaining computed targets as unknown"
         'const lazy = import("./lazy");',
         'async function load() { return await import("./data.json", { with: { type: "json" } }); }',
         'const name = "./not-guessed.js"; import(name);',
+        "import(`./${name}.js`);",
+        'import("node:fs");',
       ].join("\n"),
     ),
     ...["static.ts", "common.js", "lazy.ts"].map((path) =>
@@ -30,10 +32,9 @@ it("resolves dynamic source imports while retaining computed targets as unknown"
     caller: "reference-dynamic-import-test",
     policy: { secretPatterns: [] },
   });
-  expect(result.ok).toBe(true);
-  if (!result.ok) return;
+  if (!result.ok) throw result.error;
   expect(result.value.parse_failures).toEqual([]);
-  expect(result.value.relationships).toHaveLength(5);
+  expect(result.value.relationships).toHaveLength(6);
   for (const [to, kind] of [
     ["static.ts", "imports"],
     ["common.js", "requires"],
@@ -53,5 +54,12 @@ it("resolves dynamic source imports while retaining computed targets as unknown"
     kind: "imports",
     resolution: "unknown",
     parse_state: "partial",
+  });
+  expect(result.value.relationships).toContainEqual({
+    from_path: "main.ts",
+    to: "node:fs",
+    kind: "imports",
+    resolution: "external",
+    parse_state: "parsed",
   });
 });

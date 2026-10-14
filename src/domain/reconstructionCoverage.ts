@@ -3,6 +3,11 @@ import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
 import { z } from "zod";
 
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "./unicodeCodePointOrder.js";
+
 import { evidenceBundleSchema, parseEvidenceBundle } from "./evidenceBundle.js";
 import {
   evaluateReconstructionClaims,
@@ -14,9 +19,15 @@ import {
 } from "./reconstructionCoverageEvaluation.js";
 import { digestSchema } from "./../domain/digests.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
+import {
+  offsetDateTimeInstantFromEpochMilliseconds,
+  offsetDateTimeSchema,
+} from "./offsetDateTime.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
-const stableIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._:/-]{0,199}$/u);
+const stableIdSchema = z
+  .string()
+  .regex(/^[A-Za-z][A-Za-z0-9._:\x2f\x2d]{0,199}$/u);
 const boundedTextSchema = z.string().trim().min(1);
 
 const authoritySchema = z.enum([
@@ -106,7 +117,7 @@ const verifierContractSchema = verifierContractBaseSchema.extend({
 const verifierResultSchema = z.strictObject({
   verifier_id: stableIdSchema,
   contract_sha256: digestSchema,
-  observed_at: z.string().datetime({ offset: true }),
+  observed_at: offsetDateTimeSchema,
   status: z.enum([
     "pass",
     "fail",
@@ -205,6 +216,7 @@ const closureReasonSchema = z.strictObject({
     "verifier-result-missing",
     "verifier-result-stale",
     "verifier-result-incompatible",
+    "verifier-result-ambiguous",
     "verifier-failed",
     "verifier-unknown",
     "active-unknown",
@@ -266,10 +278,12 @@ export const evaluateReconstructionClosure = (
   );
   if (boundary === undefined)
     throw new TypeError(`Unknown reconstruction boundary: ${boundaryId}`);
+  const nowInstant = offsetDateTimeInstantFromEpochMilliseconds(nowEpochMs);
   const context: ReconstructionEvaluationContext = {
     coverage,
     boundary,
     nowEpochMs,
+    nowInstant,
     reasons: [],
     evidenceIds: new Set<string>(),
   };
@@ -386,6 +400,7 @@ const closureStatus = (
       [
         "verifier-result-stale",
         "verifier-result-incompatible",
+        "verifier-result-ambiguous",
         "verifier-unknown",
         "active-unknown",
         "owner-path-unknown",
@@ -400,8 +415,9 @@ const closureStatus = (
 };
 
 const reasonOrder = (left: ClosureReason, right: ClosureReason): number =>
-  `${left.code}:${left.subject_id}`.localeCompare(
-    `${right.code}:${right.subject_id}`,
+  compareUnicodeCodePoints(
+    compositeKey([left.code, left.subject_id]),
+    compositeKey([right.code, right.subject_id]),
   );
 
 const digest = (value: unknown): string => {

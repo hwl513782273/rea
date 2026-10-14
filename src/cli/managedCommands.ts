@@ -3,22 +3,29 @@ import { z } from "incur";
 import { compareManagedMemberPaths } from "../application/managed/ManagedMemberComparisonService.js";
 import { verifyManagedNativeBoundariesEvidence } from "../application/managed/ManagedNativeVerificationService.js";
 import { importManagedReconstructionEvidence } from "../application/managed/ManagedReconstructionService.js";
-import { runProviderAnalysis } from "../composition/directAnalysis.js";
+import type { DirectAnalysis } from "../composition/directAnalysis.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { parseCliJsonInput } from "../cliJsonInput.js";
+import { MANAGED_STATIC_PROVIDER } from "../application/InvestigationProviders.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { registerProjectManagedApplicationGraph } from "./managedProjectGraphCommand.js";
+import { managedMembersInputSchema } from "../contracts/managed/managedToolContracts.js";
 
 export const registerManagedCommands = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
-  registerInspectManagedArtifact(cli, logger);
-  registerInspectManagedMembers(cli, logger);
-  registerInspectManagedNativeBoundaries(cli, logger);
+  registerInspectManagedArtifact(cli, logger, runProviderAnalysis);
+  registerInspectManagedMembers(cli, logger, runProviderAnalysis);
+  registerInspectManagedNativeBoundaries(cli, logger, runProviderAnalysis);
   registerCompareManagedMembers(cli, logger);
   registerImportManagedReconstruction(cli, logger);
   registerVerifyManagedNativeBoundaries(cli, logger);
@@ -28,6 +35,7 @@ export const registerManagedCommands = (
 const registerInspectManagedArtifact = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedArtifact, {
     description: "Inspect PE/CLI identity without loading target code",
@@ -44,16 +52,27 @@ const registerInspectManagedArtifact = (
 const registerInspectManagedMembers = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedMembers, {
     description:
-      "Inspect PE/CLI metadata members, signatures, and CIL anchors without loading target code",
+      "Inspect PE/CLI metadata members, signatures, CIL anchors, and ldstr string literals without loading target code",
     args: z.object({
       path: z.string().describe("Managed PE executable or assembly path"),
     }),
-    run: ({ args }) =>
+    options: z.object({
+      type: managedMembersInputSchema.shape.type_names.describe(
+        "Inspect only members declared by this exact type full name, and the string literals they load, such as System.Threading.Monitor; a nested type is named by its bare name, which selects every nested type of that name (repeatable)",
+      ),
+    }),
+    run: ({ args, options }) =>
       logCliCommand(logger, "inspect-managed-members", () =>
-        runProviderAnalysis(args.path, "inspect_managed_members", {}, logger),
+        runProviderAnalysis(
+          args.path,
+          "inspect_managed_members",
+          options.type === undefined ? {} : { type_names: options.type },
+          logger,
+        ),
       ),
   });
 };
@@ -61,6 +80,7 @@ const registerInspectManagedMembers = (
 const registerInspectManagedNativeBoundaries = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectManagedNativeBoundaries, {
     description:
@@ -95,10 +115,44 @@ const registerCompareManagedMembers = (
     args: compareManagedMemberArgs,
     run: ({ args }) =>
       logCliCommand(logger, "compare-managed-members", async () => {
-        const result = await compareManagedMemberPaths({
-          leftPath: args.leftPath,
-          rightPath: args.rightPath,
-        });
+        const resources = new ArtifactResourceScope();
+        const result = await compareManagedMemberPaths(
+          {
+            leftPath: args.leftPath,
+            rightPath: args.rightPath,
+          },
+          {},
+          resources,
+        );
+        try {
+          await resources.close();
+        } catch (cause: unknown) {
+          const cleanup = ArtifactReaderFailure.cleanupObservation(
+            cause,
+            "Managed member comparison resources",
+          );
+          const failure = new ProviderCleanupError(
+            MANAGED_STATIC_PROVIDER.id,
+            cleanup.resources,
+            { reason: cleanup.reason },
+            {
+              cause,
+              operation: "compare_managed_members",
+              ...(result.ok ? { partialObservation: result.value } : {}),
+            },
+          );
+          const error = result.ok
+            ? failure
+            : analysisErrorWithCleanupFailure(
+                result.error,
+                failure,
+                "compare_managed_members",
+              );
+          return {
+            error: "Managed member comparison failed",
+            ...projectAnalysisError(error),
+          };
+        }
         return result.ok
           ? result.value
           : {

@@ -1,20 +1,17 @@
+import { compactStringIdentityKey } from "../../domain/compactStringIdentity.js";
 import { createJavaScriptSemanticGraphUnknown } from "../../domain/javascript/javascriptSemanticGraph.js";
-import type { JavaScriptSemanticGraphNode } from "../../domain/javascript/javascriptSemanticGraph.js";
+import type { JavaScriptSemanticGraphNode } from "../../domain/javascript/javascriptSemanticGraphSchemas.js";
 import type {
   JavaScriptSemanticEventOperation,
   JavaScriptSemanticTimerOperation,
 } from "../../domain/javascript/javascriptSemanticIr.js";
 import {
-  addSemanticGraphNode,
+  retainSemanticGraphNode,
   addSemanticGraphRelation,
   addSemanticGraphUnknown,
-  constructSemanticGraphNode,
 } from "./JavaScriptSemanticGraphConstruction.js";
 import { unknownSemanticEvidence } from "./JavaScriptSemanticGraphEvidence.js";
-import {
-  semanticCallSiteAt,
-  type SemanticFlowProjectionContext,
-} from "./JavaScriptSemanticGraphFlowProjection.js";
+import type { SemanticFlowProjectionContext } from "./JavaScriptSemanticGraphFlowProjection.js";
 
 /** Project literal EventEmitter registrations, removals, and dispatches. */
 export const projectSemanticEvents = (
@@ -25,7 +22,7 @@ export const projectSemanticEvents = (
     const eventKey =
       operation.eventName === null
         ? operation.eventId
-        : `${operation.emitterKey}\u0000${operation.eventName}`;
+        : `${operation.emitterKey}\u0000${compactStringIdentityKey(operation.eventName)}`;
     const event =
       eventNodes.get(eventKey) ?? addEventNode(context, operation, eventKey);
     if (event === null) continue;
@@ -59,55 +56,47 @@ const addEventNode = (
   operation: JavaScriptSemanticEventOperation,
   eventKey: string,
 ): JavaScriptSemanticGraphNode | null =>
-  addSemanticGraphNode(
-    context.state,
-    constructSemanticGraphNode(
-      context.file,
-      {
-        kind: "event",
-        roleKey: `event:${eventKey}`,
-        location: operation.eventName === null ? operation.location : null,
-        label: operation.eventName,
-        functionNodeId: null,
-        properties: {
-          emitter_key: operation.emitterKey,
-          event_name: operation.eventName,
-        },
-      },
-      context.state,
-    ),
-  );
+  retainSemanticGraphNode(context.state, context.file, {
+    kind: "event",
+    roleKey: `event:${eventKey}`,
+    location: operation.eventName === null ? operation.location : null,
+    label:
+      operation.eventName === null ||
+      operation.eventName.length <= "event".length
+        ? operation.eventName
+        : "event",
+    functionNodeId: null,
+    properties: {
+      emitter_key: operation.emitterKey,
+      event_name: operation.eventName,
+    },
+  });
 
 const addListenerNode = (
   context: SemanticFlowProjectionContext,
   operation: JavaScriptSemanticEventOperation,
 ): JavaScriptSemanticGraphNode | null =>
-  addSemanticGraphNode(
-    context.state,
-    constructSemanticGraphNode(
-      context.file,
-      {
-        kind: "listener",
-        roleKey: `listener:${operation.eventId}`,
-        location: operation.listenerLocation ?? operation.location,
-        label:
-          operation.eventName === null
-            ? operation.method
-            : `${operation.method}:${operation.eventName}`,
-        functionNodeId:
-          operation.ownerCallableId === null
-            ? null
-            : (context.callableNodes.get(operation.ownerCallableId)?.node_id ??
-              null),
-        properties: {
-          emitter_key: operation.emitterKey,
-          event_name: operation.eventName,
-          method: operation.method,
-        },
-      },
-      context.state,
-    ),
-  );
+  retainSemanticGraphNode(context.state, context.file, {
+    kind: "listener",
+    roleKey: `listener:${operation.eventId}`,
+    location: operation.listenerLocation ?? operation.location,
+    label:
+      operation.eventName === null
+        ? operation.method
+        : operation.eventName.length <= "listener".length
+          ? `${operation.method}:${operation.eventName}`
+          : `${operation.method}:listener`,
+    functionNodeId:
+      operation.ownerCallableId === null
+        ? null
+        : (context.callableNodes.get(operation.ownerCallableId)?.node_id ??
+          null),
+    properties: {
+      emitter_key: operation.emitterKey,
+      event_name: operation.eventName,
+      method: operation.method,
+    },
+  });
 
 const eventEmitterNode = (
   context: SemanticFlowProjectionContext,
@@ -138,18 +127,21 @@ const addEventUnknown = (
 ): void => {
   addSemanticGraphUnknown(
     context.state,
-    createJavaScriptSemanticGraphUnknown({
-      node_id: event.node_id,
-      family: "event",
-      relation_kinds: [relation],
-      reason: "ambiguous-target",
-      detail:
-        operation.eventName === null
-          ? `Dynamic ${operation.method} event name remains unresolved.`
-          : `Static ${operation.method} emitter identity is partial.`,
-      candidate_node_ids: [],
-      evidence: unknownSemanticEvidence(context.file, operation.location),
-    }),
+    createJavaScriptSemanticGraphUnknown(
+      {
+        node_id: event.node_id,
+        family: "event",
+        relation_kinds: [relation],
+        reason: "ambiguous-target",
+        detail:
+          operation.eventName === null
+            ? `Dynamic ${operation.method} event name remains unresolved.`
+            : `Static ${operation.method} emitter identity is partial.`,
+        candidate_node_ids: [],
+        evidence: unknownSemanticEvidence(context.file, operation.location),
+      },
+      context.state.evidenceContexts,
+    ),
   );
 };
 
@@ -164,24 +156,17 @@ export const projectSemanticTimers = (
         operation.ownerCallableId === null
           ? undefined
           : context.callableNodes.get(operation.ownerCallableId);
-      const timer = addSemanticGraphNode(
-        context.state,
-        constructSemanticGraphNode(
-          context.file,
-          {
-            kind: "timer",
-            roleKey: operation.timerId,
-            location: operation.location,
-            label: operation.method,
-            functionNodeId: owner?.node_id ?? null,
-            properties: {
-              delay_milliseconds: operation.delayMilliseconds,
-              method: operation.method,
-            },
-          },
-          context.state,
-        ),
-      );
+      const timer = retainSemanticGraphNode(context.state, context.file, {
+        kind: "timer",
+        roleKey: operation.timerId,
+        location: operation.location,
+        label: operation.method,
+        functionNodeId: owner?.node_id ?? null,
+        properties: {
+          delay_milliseconds: operation.delayMilliseconds,
+          method: operation.method,
+        },
+      });
       return timer === null ? [] : [[operation.timerId, timer] as const];
     }),
   );
@@ -197,7 +182,7 @@ const projectTimerSchedule = (
   timerNodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>,
 ): void => {
   addSemanticGraphRelation(context.state, {
-    source: semanticCallSiteAt(context, operation.location),
+    source: context.callSiteAt(operation.location),
     target: timerNodes.get(operation.timerId),
     relation: "schedules-timer",
     resolution: "resolved",
@@ -221,7 +206,7 @@ const projectTimerCancellation = (
   operation: JavaScriptSemanticTimerOperation,
   timerNodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>,
 ): void => {
-  const callSite = semanticCallSiteAt(context, operation.location);
+  const callSite = context.callSiteAt(operation.location);
   const target =
     operation.linkedTimerId === null
       ? undefined
@@ -235,14 +220,17 @@ const projectTimerCancellation = (
   if (operation.resolution === "complete") return;
   addSemanticGraphUnknown(
     context.state,
-    createJavaScriptSemanticGraphUnknown({
-      node_id: callSite?.node_id ?? null,
-      family: "timer",
-      relation_kinds: ["cancels-timer"],
-      reason: "ambiguous-target",
-      detail: `Static ${operation.method} handle resolution was ${operation.resolution}.`,
-      candidate_node_ids: [],
-      evidence: unknownSemanticEvidence(context.file, operation.location),
-    }),
+    createJavaScriptSemanticGraphUnknown(
+      {
+        node_id: callSite?.node_id ?? null,
+        family: "timer",
+        relation_kinds: ["cancels-timer"],
+        reason: "ambiguous-target",
+        detail: `Static ${operation.method} handle resolution was ${operation.resolution}.`,
+        candidate_node_ids: [],
+        evidence: unknownSemanticEvidence(context.file, operation.location),
+      },
+      context.state.evidenceContexts,
+    ),
   );
 };

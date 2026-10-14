@@ -1,21 +1,8 @@
 import { formatGeneratedFile } from "./format-generated-file.mjs";
 
 import { assertSameNames, digest, loadSources } from "./catalog-core.mjs";
-import {
-  createCliInventory,
-  cliCommandDescriptionIssues,
-  cliCommandOptionNames,
-} from "./catalog-cli.mjs";
+import { createCliInventory } from "./catalog-cli.mjs";
 import { providerCatalog, toolFamilyCatalog } from "./catalog-builders.mjs";
-
-export {
-  createCliInventory,
-  cliCommandDescriptionIssues,
-  cliCommandOptionNames,
-};
-
-/** Return the stable digest for the source-derived provider projection. */
-export const providerCatalogDigest = (providers) => digest(providers);
 
 /** Project current runtime contracts into deterministic, machine-readable facts. */
 export const createProductCatalog = async (root) => {
@@ -24,7 +11,7 @@ export const createProductCatalog = async (root) => {
   assertSameNames(
     "Primary CLI inventory",
     cli.primary,
-    sources.catalogIdentity.CLI_COMMAND_NAMES,
+    sources.cliCommandNames.CLI_COMMAND_NAMES,
   );
   const tools = toolFamilyCatalog(sources);
   const providers = providerCatalog(sources);
@@ -58,16 +45,16 @@ export const createProductCatalog = async (root) => {
     runtime_catalog: {
       counts: sources.catalogIdentity.CATALOG_IDENTITY.counts,
       digests: {
-        ...sources.catalogIdentity.CATALOG_IDENTITY.digests,
-        providers_sha256: providerCatalogDigest(providers),
+        // Full runtime schema digests belong to server identity, not this facts projection.
+        providers_sha256: digest(providers),
       },
     },
   };
 };
 
-/** Stable checked-in representation of the product catalog. */
+/** Stable build-generated representation of the product catalog. */
 export const serializeProductCatalog = (catalog) =>
   formatGeneratedFile(
-    "docs/product-catalog.json",
+    "docs/public/product-catalog.json",
     JSON.stringify(catalog, null, 2),
   );

@@ -1,23 +1,30 @@
 import { z } from "zod";
 
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import {
   analyzeJavaScriptApplicationInputSchema,
-  javascriptApplicationAnalysisResultSchema,
+  type JavaScriptApplicationAnalysisResult,
+  parseOwnedJavaScriptApplicationAnalysisSteps,
 } from "../../domain/javascript/javascriptApplicationAnalysis.js";
-import {
-  AnalysisInputError,
-  AnalysisOutputError,
-} from "../../domain/analysisErrorCore.js";
+import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
 import { ArtifactOperationError } from "../../domain/artifactOperationError.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { Evidence } from "../../domain/evidence.js";
-import { projectInputIssues } from "../../domain/inputIssueProjection.js";
+import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import type { ExecutionOptions } from "../AnalysisProvider.js";
-import { createJavaScriptApplicationEvidence } from "./JavaScriptApplicationEvidence.js";
-import { reconstructJavaScriptArtifact } from "./JavaScriptArtifactReconstruction.js";
+import { createOwnedJavaScriptApplicationEvidenceCooperatively } from "./JavaScriptApplicationEvidence.js";
+import {
+  assertJavaScriptAnalysisActive,
+  checkpointJavaScriptAnalysis,
+  completeJavaScriptAnalysisSteps,
+} from "./JavaScriptAnalysisControl.js";
+import {
+  reconstructJavaScriptArtifact,
+  type JavaScriptArtifactReconstructionResult,
+} from "./JavaScriptArtifactReconstruction.js";
 import { JAVASCRIPT_APPLICATION_PROVIDER } from "../InvestigationProviders.js";
 
 const OPERATION = "analyze_javascript_application" as const;
@@ -25,45 +32,71 @@ const OPERATION = "analyze_javascript_application" as const;
 /** Statically analyze one local JavaScript/Electron application. */
 export const analyzeJavaScriptApplication = async (
   rawInput: unknown,
+  scope: ArtifactResourceScope,
   options: ExecutionOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
   const parsed = analyzeJavaScriptApplicationInputSchema.safeParse(rawInput);
   if (!parsed.success)
     return err(
-      new AnalysisInputError(
-        OPERATION,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      analysisInputErrorFromIssues(OPERATION, parsed.error.issues, rawInput),
     );
-  return analyzeJavaScriptApplicationValidated(parsed.data, options);
+  return analyzeJavaScriptApplicationValidated(parsed.data, scope, options);
 };
 
 /** Analyze input already parsed by a trusted adapter boundary. */
 export const analyzeJavaScriptApplicationValidated = async (
   input: z.output<typeof analyzeJavaScriptApplicationInputSchema>,
+  scope: ArtifactResourceScope,
   options: ExecutionOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
-  await options.progress?.report({
-    phase: "analyze_javascript_application",
-    completed: 0,
-    total: 1,
-    message: "Inventorying and parsing application artifacts",
-  });
+  let reconstructed: JavaScriptArtifactReconstructionResult | undefined;
+  let result: JavaScriptApplicationAnalysisResult | undefined;
+  let evidence: Evidence | undefined;
   try {
-    const reconstructed = await reconstructJavaScriptArtifact(
-      {
-        input_path: input.input_path,
-        format: input.format,
-      },
+    assertJavaScriptAnalysisActive(options.signal);
+    await options.progress?.report({
+      phase: "analyze_javascript_application",
+      completed: 0,
+      total: 1,
+      message: "Inventorying and parsing application artifacts",
+    });
+    await checkpointJavaScriptAnalysis(options.signal);
+    reconstructed = await reconstructJavaScriptArtifact(
+      input,
+      scope,
       options.signal,
+      options.progress,
     );
     const { electron_summary: summary, ...application } = reconstructed;
-    const result = javascriptApplicationAnalysisResultSchema.parse({
-      ...application,
-      summary,
-      limitations: reconstructed.graph.limitations,
+    await options.progress?.report({
+      phase: "validate_javascript_application_result",
+      completed: 0,
+      total: 1,
+      message: "Validating result metadata and cross-graph bindings",
     });
+    await checkpointJavaScriptAnalysis(options.signal);
+    result = await completeJavaScriptAnalysisSteps(
+      parseOwnedJavaScriptApplicationAnalysisSteps({
+        ...application,
+        summary,
+        limitations: reconstructed.graph.limitations,
+      }),
+      options.signal,
+    );
+    await options.progress?.report({
+      phase: "create_javascript_application_evidence",
+      completed: 0,
+      total: 1,
+      message: "Creating and hashing application analysis Evidence",
+    });
+    await checkpointJavaScriptAnalysis(options.signal);
+    evidence = await createOwnedJavaScriptApplicationEvidenceCooperatively(
+      input,
+      result,
+      options.signal,
+      options.progress,
+    );
+    await checkpointJavaScriptAnalysis(options.signal);
     await options.progress?.report({
       phase: "analyze_javascript_application",
       completed: 1,
@@ -71,17 +104,45 @@ export const analyzeJavaScriptApplicationValidated = async (
       message: "Application graph and Electron boundaries reconstructed",
       terminal: true,
     });
-    return ok(createJavaScriptApplicationEvidence(input, result));
+    assertJavaScriptAnalysisActive(options.signal);
+    return ok(evidence);
   } catch (cause: unknown) {
+    if (
+      cause instanceof ArtifactReaderFailure &&
+      cause.reason === "cancelled" &&
+      reconstructed !== undefined
+    ) {
+      try {
+        if (result === undefined) {
+          const { electron_summary: summary, ...application } = reconstructed;
+          result = await completeJavaScriptAnalysisSteps(
+            parseOwnedJavaScriptApplicationAnalysisSteps({
+              ...application,
+              summary,
+              limitations: reconstructed.graph.limitations,
+            }),
+          );
+        }
+        evidence ??=
+          await createOwnedJavaScriptApplicationEvidenceCooperatively(
+            input,
+            result,
+          );
+        return err(
+          artifactFailureToOperationError(cause).retainPartialObservation(
+            evidence,
+          ),
+        );
+      } catch (completionCause: unknown) {
+        // A validation or Evidence failure while finishing the partial result
+        // remains the primary failure instead of being hidden by cancellation.
+        cause = completionCause;
+      }
+    }
+    // Preserve execution constraints and their completed partial Evidence.
+    if (cause instanceof AnalysisError) return err(cause);
     if (cause instanceof ArtifactReaderFailure)
-      return err(
-        new ArtifactOperationError(
-          OPERATION,
-          cause.reason,
-          cause.details,
-          cause.message,
-        ),
-      );
+      return err(artifactFailureToOperationError(cause));
     if (cause instanceof z.ZodError)
       return err(
         new AnalysisOutputError(OPERATION, describeResultSchemaFailure(cause), {
@@ -112,6 +173,23 @@ export const analyzeJavaScriptApplicationValidated = async (
     );
   }
 };
+
+const artifactFailureToOperationError = (
+  cause: ArtifactReaderFailure,
+): ArtifactOperationError =>
+  new ArtifactOperationError(
+    OPERATION,
+    cause.reason,
+    cause.details,
+    cause.message,
+    {
+      cause,
+      ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
+      ...(cause.partialObservation === undefined
+        ? {}
+        : { partialObservation: cause.partialObservation }),
+    },
+  );
 
 const describeResultSchemaFailure = (cause: z.ZodError): string => {
   const issue = cause.issues[0];

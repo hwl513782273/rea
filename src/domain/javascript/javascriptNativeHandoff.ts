@@ -1,9 +1,9 @@
-import { compareCodePoints } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { Evidence } from "../evidence.js";
-import {
-  type ApplicationEdge,
-  type ApplicationNode,
-} from "./javascriptApplicationGraph.js";
+import type {
+  ApplicationEdge,
+  ApplicationNode,
+} from "./javascriptApplicationGraphSchemas.js";
 import type { ApplicationFeatureTraceResult } from "./javascriptFeatureTraceSchemas.js";
 
 type NativeHandoff = ApplicationFeatureTraceResult["native_handoffs"][number];
@@ -38,7 +38,7 @@ export const buildJavaScriptNativeHandoffs = (
           providers: uniqueProviders(linked),
           evidence_ids: linked
             .map(({ evidence_id: id }) => id)
-            .sort(compareCodePoints),
+            .sort(compareUnicodeCodePoints),
           recommended_tools: [
             "open_binary" as const,
             "binary_overview" as const,
@@ -50,7 +50,7 @@ export const buildJavaScriptNativeHandoffs = (
       ];
     })
     .sort((left, right) =>
-      compareCodePoints(left.native_node_id, right.native_node_id),
+      compareUnicodeCodePoints(left.native_node_id, right.native_node_id),
     );
 };
 
@@ -95,18 +95,25 @@ const nativeExportNodes = (
   return [...new Set(ids)]
     .map((id) => nodeById.get(id))
     .filter((node): node is ApplicationNode => node?.kind === "native-export")
-    .sort((left, right) => compareCodePoints(left.node_id, right.node_id));
+    .sort((left, right) =>
+      compareUnicodeCodePoints(left.node_id, right.node_id),
+    );
 };
 
 const requestedExports = (nodes: readonly ApplicationNode[]): string[] => {
   const values = nodes.flatMap((node) =>
     node.observations.flatMap((observation) => [
-      ...(observation.label === null ? [] : [observation.label]),
+      // Display labels can summarize several names or namespace access.
+      // Only legacy observations without structured member facts need them.
+      ...(observation.label === null ||
+      Array.isArray(observation.properties.requested_members)
+        ? []
+        : [observation.label]),
       ...stringArray(observation.properties.requested_members),
       ...stringArray(observation.properties.members),
     ]),
   );
-  return [...new Set(values)].sort(compareCodePoints);
+  return [...new Set(values)].sort(compareUnicodeCodePoints);
 };
 
 const stringArray = (value: unknown): string[] =>
@@ -125,7 +132,7 @@ const uniqueProviders = (
       ]),
     ).values(),
   ].sort((left, right) =>
-    compareCodePoints(
+    compareUnicodeCodePoints(
       `${left.id}\0${left.name}\0${left.version ?? ""}`,
       `${right.id}\0${right.name}\0${right.version ?? ""}`,
     ),

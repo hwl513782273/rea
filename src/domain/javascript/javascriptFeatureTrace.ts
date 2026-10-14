@@ -1,14 +1,19 @@
-import { canonicalDigest } from "../comparisonSemantics.js";
-import { compareCodePoints, uniqueSorted } from "../canonicalOrdering.js";
+import { digestCanonicalValue } from "../canonicalDigest.js";
+import { uniqueSorted } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { Evidence } from "../evidence.js";
 import {
   createJavaScriptApplicationGraph,
-  type ApplicationEdge,
-  type ApplicationNode,
   type JavaScriptApplicationGraph,
 } from "./javascriptApplicationGraph.js";
+import type {
+  ApplicationEdge,
+  ApplicationNode,
+} from "./javascriptApplicationGraphSchemas.js";
 import {
   applicationFeatureTraceResultSchema,
+  applicationFeatureSeedSchema,
+  type ApplicationFeatureSeedInput,
   type ApplicationFeatureTraceResult,
   type TraceApplicationFeatureInput,
 } from "./javascriptFeatureTraceSchemas.js";
@@ -27,14 +32,18 @@ export interface ApplicationFeatureTraceProjectionInput {
   readonly sourceEvidenceId: string;
   readonly graph: JavaScriptApplicationGraph;
   readonly nativeEvidence: readonly Evidence[];
-  readonly seed: TraceApplicationFeatureInput["seed"];
+  readonly seed: ApplicationFeatureSeedInput;
   readonly direction: TraceApplicationFeatureInput["direction"];
 }
 
 /** Trace a literal feature through its complete reachable, authority-preserving JAG. */
 export const traceApplicationFeature = (
-  input: ApplicationFeatureTraceProjectionInput,
+  source: ApplicationFeatureTraceProjectionInput,
 ): ApplicationFeatureTraceResult => {
+  const input = {
+    ...source,
+    seed: applicationFeatureSeedSchema.parse(source.seed),
+  };
   const allSeedMatches = findApplicationFeatureSeeds(
     input.graph.nodes,
     input.seed,
@@ -84,7 +93,7 @@ export const traceApplicationFeature = (
   };
   return applicationFeatureTraceResultSchema.parse({
     ...semantic,
-    trace_id: `jatr_${canonicalDigest(semantic, "Feature trace")}`,
+    trace_id: `jatr_${digestCanonicalValue(semantic, "Feature trace")}`,
   });
 };
 
@@ -124,7 +133,7 @@ const noMatchResult = (
   };
   return applicationFeatureTraceResultSchema.parse({
     ...semantic,
-    trace_id: `jatr_${canonicalDigest(semantic, "Feature trace")}`,
+    trace_id: `jatr_${digestCanonicalValue(semantic, "Feature trace")}`,
   });
 };
 
@@ -168,7 +177,9 @@ const terminalPaths = (
     )
     .map((node) => pathTo(node, traversal.predecessors, edgeById))
     .filter((path): path is NonNullable<typeof path> => path !== null)
-    .sort((left, right) => compareCodePoints(left.path_id, right.path_id));
+    .sort((left, right) =>
+      compareUnicodeCodePoints(left.path_id, right.path_id),
+    );
 };
 
 const pathTo = (
@@ -205,14 +216,16 @@ const pathTo = (
   };
   return {
     ...semantic,
-    path_id: `jatp_${canonicalDigest(semantic, "Feature trace")}`,
+    path_id: `jatp_${digestCanonicalValue(semantic, "Feature trace")}`,
   };
 };
 
 const isTerminal = (node: ApplicationNode): boolean =>
   ["endpoint", "storage", "native-addon", "native-export", "unknown"].includes(
     node.kind,
-  );
+  ) ||
+  (node.kind === "javascript-expression" &&
+    node.observations.some((o) => o.properties.step_kind === "terminal"));
 
 const factSummary = (
   nodes: readonly ApplicationNode[],

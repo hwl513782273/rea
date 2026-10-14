@@ -1,9 +1,33 @@
 import * as t from "@babel/types";
 
-import { compareCodePoints } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { ElectronStaticValue } from "./electronStaticAnalysisTypes.js";
-import { semanticStaticPropertyName } from "./javascriptAstValues.js";
+import {
+  readExactJavaScriptLiteral,
+  semanticStaticPropertyKey,
+  semanticStaticPropertyName,
+} from "./javascriptAstValues.js";
 import { sourceSlice } from "./javascriptStaticAnalysisHelpers.js";
+import type { JavaScriptFindingContext } from "./javascriptStaticAnalysisState.js";
+
+/** Resolve a callee only when its root has a proven Electron module identity. */
+export const electronCalleePath = (
+  callee: t.Node,
+  context: JavaScriptFindingContext,
+): readonly string[] | undefined => {
+  const members: string[] = [];
+  let root = callee;
+  while (t.isMemberExpression(root) || t.isOptionalMemberExpression(root)) {
+    const member = semanticStaticPropertyName(root.property, root.computed);
+    if (member === "" || !t.isNode(root.object)) return undefined;
+    members.push(member);
+    root = root.object;
+  }
+  const exported = context.electronBindings?.get(root.start ?? -1);
+  return exported === undefined
+    ? undefined
+    : [...exported, ...members.toReversed()];
+};
 
 /** Preserve one literal value or the exact inert expression. */
 export const electronStaticValue = (
@@ -101,8 +125,8 @@ export const collectContextBridgeMembers = (
     members: [],
     unknown: 0,
   };
-  collectMembersAt(node, "", 0, state);
-  const members = [...new Set(state.members)].sort(compareCodePoints);
+  collectMembersAt(node, [], state);
+  const members = [...new Set(state.members)].sort(compareUnicodeCodePoints);
   return {
     status: "object-literal",
     members,
@@ -112,11 +136,10 @@ export const collectContextBridgeMembers = (
 
 const collectMembersAt = (
   object: t.ObjectExpression,
-  prefix: string,
-  depth: number,
+  prefix: readonly string[],
   state: { members: string[]; unknown: number },
 ): void => {
-  if (depth >= 8) {
+  if (prefix.length >= 8) {
     state.unknown += 1;
     return;
   }
@@ -125,15 +148,23 @@ const collectMembersAt = (
       state.unknown += 1;
       continue;
     }
-    const name = semanticStaticPropertyName(property.key, property.computed);
-    if (name === "" || property.computed) {
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) {
       state.unknown += 1;
       continue;
     }
-    const path = prefix === "" ? name : `${prefix}.${name}`;
+    if (
+      t.isObjectProperty(property) &&
+      !property.computed &&
+      !property.shorthand &&
+      name === "__proto__"
+    )
+      continue;
+    const segments = [...prefix, name];
+    const path = segments.join(".");
     state.members.push(path);
     if (t.isObjectProperty(property) && t.isObjectExpression(property.value))
-      collectMembersAt(property.value, path, depth + 1, state);
+      collectMembersAt(property.value, segments, state);
   }
 };
 
@@ -142,19 +173,17 @@ const literalValue = (
 ):
   | { readonly found: true; readonly value: string | number | boolean | null }
   | { readonly found: false } => {
-  if (t.isStringLiteral(node) || t.isNumericLiteral(node))
-    return { found: true, value: node.value };
-  if (t.isBooleanLiteral(node)) return { found: true, value: node.value };
-  if (t.isNullLiteral(node)) return { found: true, value: null };
-  if (t.isTemplateLiteral(node) && node.expressions.length === 0)
-    return {
-      found: true,
-      value: node.quasis[0]?.value.cooked ?? node.quasis[0]?.value.raw ?? "",
-    };
+  if (node === null || node === undefined) return { found: false };
+  const literal = readExactJavaScriptLiteral(node);
+  if (literal.found) return literal;
   if (
     t.isUnaryExpression(node, { operator: "-" }) &&
     t.isNumericLiteral(node.argument)
-  )
-    return { found: true, value: -node.argument.value };
+  ) {
+    const value = -node.argument.value;
+    return Number.isFinite(value) && !Object.is(value, -0)
+      ? { found: true, value }
+      : { found: false };
+  }
   return { found: false };
 };

@@ -1,15 +1,19 @@
+import { parseEvidence } from "../../../src/domain/evidence.js";
+import { ok as resultOk } from "../../../src/domain/result.js";
 import { rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { createStrippedAsarAddon } from "../../fixtures/strippedAsarAddon.js";
 
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import type { ElectronActiveObservationPort } from "../../../src/application/javascript/ElectronActiveObservationPort.js";
+import { analyzeJavaScriptApplication } from "../../support/javascriptApplicationScope.js";
 import { CdpElectronProvider } from "../../../src/browser/CdpElectronProvider.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed } from "../../fixtures/analysisExecution.js";
@@ -19,10 +23,64 @@ import {
 } from "../../fixtures/fakeCdpBrowser.js";
 import { writeElectronBoundaryFixture } from "../../fixtures/electronBoundaryApplication.js";
 import { createElectronActiveObservationFixtureResult } from "../../../src/domain/javascript/electronActiveObservation.fixture.js";
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
+import { AsarArtifactReader } from "../../../src/artifacts/AsarArtifactReader.js";
 
 const browsers: FakeCdpBrowser[] = [];
 const resources: Array<{ close(): Promise<unknown> }> = [];
 const temporary: string[] = [];
+
+it("retains failed JavaScript inventory cleanup through server shutdown retries", async () => {
+  const { archive } = await createStrippedAsarAddon();
+  const session = createTestBinarySession(() => ({
+    execute: () => Promise.resolve(observed(null)),
+    close: () => Promise.resolve(resultOk(null)),
+  }));
+  const server = createServer({ kind: "session", session });
+  const client = new Client({ name: "javascript-cleanup-owner", version: "1" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  const originalClose = AsarArtifactReader.prototype.close;
+  const owners = new Set<AsarArtifactReader>();
+  let blocked = true;
+  const close = vi
+    .spyOn(AsarArtifactReader.prototype, "close")
+    .mockImplementation(function (this: AsarArtifactReader) {
+      owners.add(this);
+      if (blocked) return Promise.reject(new Error("snapshot cleanup blocked"));
+      return originalClose.call(this);
+    });
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const response = await client.callTool({
+      name: "analyze_javascript_application",
+      arguments: {
+        input_path: archive,
+        integrity_policy: "record-and-continue",
+      },
+    });
+    expect(parseMcpToolError(response)).toMatchObject({
+      error: {
+        code: "cleanup_incomplete",
+        details: {
+          resources: [expect.stringContaining(archive)],
+          partial_observation: { kind: "artifact-inventory" },
+        },
+      },
+    });
+    expect(owners.size).toBe(1);
+    await expect(server.close()).rejects.toThrow();
+    blocked = false;
+    await server.close();
+    expect(owners.size).toBe(1);
+    expect(close.mock.calls.length).toBeGreaterThanOrEqual(3);
+  } finally {
+    blocked = false;
+    await Promise.all([client.close(), server.close(), session.close()]);
+    close.mockRestore();
+  }
+});
 
 afterEach(async () => {
   await Promise.all(resources.splice(0).map(async (item) => item.close()));
@@ -32,6 +90,52 @@ afterEach(async () => {
       .splice(0)
       .map(async (path) => rm(path, { recursive: true, force: true })),
   );
+});
+
+it("lets MCP JavaScript analysis continue only with recorded untrusted ASAR bytes", async () => {
+  const { archive, addon } = await createStrippedAsarAddon();
+  const session = createTestBinarySession(() => ({
+    execute: () => Promise.resolve(observed(null)),
+    close: () => Promise.resolve(resultOk(null)),
+  }));
+  const server = createServer({ kind: "session", session });
+  const client = new Client({ name: "asar-integrity-policy", version: "1" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  resources.push(client, server, session);
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  const rejected = await client.callTool({
+    name: "analyze_javascript_application",
+    arguments: { input_path: archive },
+  });
+  expect(parseMcpToolError(rejected)).toMatchObject({
+    error: {
+      code: "artifact_integrity_mismatch",
+      remediation: {
+        action: expect.stringContaining("integrity_policy=record-and-continue"),
+      },
+    },
+  });
+
+  const continued = await client.callTool({
+    name: "analyze_javascript_application",
+    arguments: {
+      input_path: archive,
+      integrity_policy: "record-and-continue",
+    },
+  });
+  expect(continued.isError).not.toBe(true);
+  expect(continued.structuredContent).toMatchObject({
+    parameters: { integrity_policy: "record-and-continue" },
+    normalized_result: {
+      integrity_contradictions: [
+        { logical_path: addon, trust: "observed-untrusted" },
+      ],
+      graph: { coverage: { status: "partial" } },
+    },
+  });
 });
 
 it("exposes endpoint-scoped Electron discovery and inspection as Evidence", async () => {
@@ -49,19 +153,36 @@ it("exposes endpoint-scoped Electron discovery and inspection as Evidence", asyn
   await writeFile(join(root, "worker.js"), "self.onmessage = () => {};\n");
   const browser = await startFakeCdpBrowser({
     electronFileUrl: pathToFileURL(join(root, "index.html")).href,
+    commandEvents: ({ method }) =>
+      method === "Debugger.enable"
+        ? [
+            {
+              method: "Debugger.scriptParsed",
+              sessionId: "session-1",
+              params: {
+                scriptId: "partial-script",
+                url: pathToFileURL(join(root, "app.js")).href,
+                executionContextId: 1,
+              },
+            },
+          ]
+        : undefined,
   });
   browsers.push(browser);
   const session = createTestBinarySession(() => ({
     execute: () => Promise.resolve(observed(null)),
-    close: () => Promise.resolve(),
+    close: () => Promise.resolve(resultOk(null)),
   }));
-  const server = createServer(session, session, {
-    electronObservation: new CdpElectronProvider(),
-    availabilityPolicy: () => ({
-      processCaptureEnabled: false,
-      investigationInputRoots: 1,
-    }),
-  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      electronObservation: new CdpElectronProvider(),
+      availabilityPolicy: () => ({
+        processCaptureEnabled: false,
+        investigationInputRoots: 1,
+      }),
+    },
+  );
   const client = new Client({ name: "electron-mcp-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -77,7 +198,7 @@ it("exposes endpoint-scoped Electron discovery and inspection as Evidence", asyn
   });
   expect(listed.isError).not.toBe(true);
   expect(listed.structuredContent).toMatchObject({
-    result: {
+    normalized_result: {
       targets: [{ target_id: "electron-page" }],
     },
   });
@@ -96,7 +217,9 @@ it("exposes endpoint-scoped Electron discovery and inspection as Evidence", asyn
   });
   expect(analyzed.isError).not.toBe(true);
   expect(analyzed.structuredContent).toMatchObject({
-    result: { graph: { nodes: expect.any(Array), edges: expect.any(Array) } },
+    normalized_result: {
+      graph: { nodes: expect.any(Array), edges: expect.any(Array) },
+    },
   });
   const analysisText = analyzed.content.find(({ type }) => type === "text");
   expect(analysisText).toBeDefined();
@@ -117,20 +240,23 @@ it("exposes endpoint-scoped Electron discovery and inspection as Evidence", asyn
   });
   expect(reconciled.isError).not.toBe(true);
   expect(reconciled.structuredContent).toMatchObject({
-    result: {
+    normalized_result: {
       summary: { runtime_scripts: 1, matched: expect.any(Number) },
       source_map_authority: { used_for_primary_matching: false },
     },
   });
   expect(inspected.isError).not.toBe(true);
   expect(inspected.structuredContent).toMatchObject({
-    result: {
-      target: { file_path: expect.stringMatching(/\/index\.html$/u) },
+    normalized_result: {
+      target: { file_path: expect.stringMatching(/[\\/]index\.html$/u) },
       scripts: {
         items: [
           expect.objectContaining({
             frame_id: "frame-main",
-            file_path: expect.stringMatching(/\/app\.js$/u),
+            file_path: expect.stringMatching(/[\\/]app\.js$/u),
+            cdp_hash: null,
+            length: null,
+            is_module: null,
           }),
         ],
       },
@@ -138,7 +264,7 @@ it("exposes endpoint-scoped Electron discovery and inspection as Evidence", asyn
         expect.objectContaining({
           target_id: "electron-worker",
           opener_target_id: "electron-page",
-          file_path: expect.stringMatching(/\/worker\.js$/u),
+          file_path: expect.stringMatching(/[\\/]worker\.js$/u),
         }),
       ],
     },
@@ -150,8 +276,13 @@ it("runs active Electron scenarios with selected paths and inferred working dire
   temporary.push(root);
   const applicationPath = join(root, "main.js");
   await writeFile(applicationPath, "module.exports = {};\n");
-  const aliasedRoot = join(root, "..", `${root.split("/").at(-1)}-alias`);
-  await symlink(root, aliasedRoot, "dir");
+  const aliasedRoot = join(root, "..", `${basename(root)}-alias`);
+  // A junction needs no symlink privilege on Windows.
+  await symlink(
+    root,
+    aliasedRoot,
+    process.platform === "win32" ? "junction" : "dir",
+  );
   temporary.push(aliasedRoot);
   const workingDirectory = await createTestTempDirectory(
     "rea-electron-working-directory-",
@@ -173,15 +304,18 @@ it("runs active Electron scenarios with selected paths and inferred working dire
   };
   const session = createTestBinarySession(() => ({
     execute: () => Promise.resolve(observed(null)),
-    close: () => Promise.resolve(),
+    close: () => Promise.resolve(resultOk(null)),
   }));
-  const server = createServer(session, session, {
-    electronActiveObservation: provider,
-    availabilityPolicy: () => ({
-      processCaptureEnabled: false,
-      investigationInputRoots: 0,
-    }),
-  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      electronActiveObservation: provider,
+      availabilityPolicy: () => ({
+        processCaptureEnabled: false,
+        investigationInputRoots: 0,
+      }),
+    },
+  );
   const client = new Client({ name: "electron-active-mcp-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -203,7 +337,7 @@ it("runs active Electron scenarios with selected paths and inferred working dire
   });
   expect(captured.isError, JSON.stringify(captured)).not.toBe(true);
   expect(captured.structuredContent).toMatchObject({
-    result: {
+    normalized_result: {
       application: { process_ownership: "provider-owned" },
       ipc: { events: [{ channel: "readiness:echo" }] },
       coverage: {
@@ -230,18 +364,21 @@ it("runs active Electron scenarios with selected paths and inferred working dire
     application_path: applicationPath,
     application_root: root,
   });
-  expect(JSON.stringify(captured.structuredContent)).not.toContain(
-    "submit-secret",
-  );
+  expect(JSON.stringify(captured.structuredContent)).toContain("submit-secret");
   expect(JSON.stringify(captured.structuredContent)).toContain("super-secret");
   expect(captured.structuredContent).toMatchObject({
-    evidence: {
-      predicate_type: "rea.electron-active-scenario",
-      operation: "capture_electron_scenario",
-      parameters: {
-        args: ["--token", "super-secret"],
-        actions: [{ step_id: "submit", kind: "click" }],
-      },
+    predicate_type: "rea.electron-active-scenario",
+    operation: "capture_electron_scenario",
+    parameters: {
+      args: ["--token", "super-secret"],
+      actions: [
+        {
+          step_id: "submit",
+          kind: "click",
+          selector: "#submit-secret",
+          window_index: 0,
+        },
+      ],
     },
   });
 }, 20_000);
@@ -252,14 +389,17 @@ it("exposes the target-free static JavaScript application workflow", async () =>
   await writeElectronBoundaryFixture(root);
   const session = createTestBinarySession(() => ({
     execute: () => Promise.resolve(observed(null)),
-    close: () => Promise.resolve(),
+    close: () => Promise.resolve(resultOk(null)),
   }));
-  const server = createServer(session, session, {
-    availabilityPolicy: () => ({
-      processCaptureEnabled: false,
-      investigationInputRoots: 1,
-    }),
-  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      availabilityPolicy: () => ({
+        processCaptureEnabled: false,
+        investigationInputRoots: 1,
+      }),
+    },
+  );
   const client = new Client({
     name: "electron-static-mcp-test",
     version: "1",
@@ -270,16 +410,25 @@ it("exposes the target-free static JavaScript application workflow", async () =>
   await server.connect(serverTransport);
   await client.connect(clientTransport);
 
-  const analyzed = await client.callTool({
-    name: "analyze_javascript_application",
-    arguments: { input_path: root },
-  });
+  const progress: number[] = [];
+  const analyzed = await client.callTool(
+    {
+      name: "analyze_javascript_application",
+      arguments: { input_path: root },
+    },
+    { onprogress: (update) => progress.push(update.progress) },
+  );
 
   expect(analyzed.isError).not.toBe(true);
+  expect(progress[0]).toBe(1);
+  expect(progress.at(-1)).toBeGreaterThan(1);
+  progress.forEach((value, index) => {
+    expect(value).toBeGreaterThan(progress[index - 1] ?? 0);
+  });
   const projected = z
     .object({
       evidence_id: z.string(),
-      result: z.object({
+      normalized_result: z.object({
         input_path: z.string(),
         summary: z.object({
           browser_windows: z.number(),
@@ -297,13 +446,11 @@ it("exposes the target-free static JavaScript application workflow", async () =>
           relations: z.array(z.unknown()),
         }),
       }),
-      evidence: z.object({
-        operation: z.literal("analyze_javascript_application"),
-        parameters: z.object({ format: z.string() }),
-      }),
+      operation: z.literal("analyze_javascript_application"),
+      parameters: z.object({ format: z.string() }),
     })
     .parse(analyzed.structuredContent);
-  expect(projected.result).toMatchObject({
+  expect(projected.normalized_result).toMatchObject({
     input_path: expect.stringMatching(/rea-electron-static-mcp-/u),
     summary: {
       browser_windows: 3,
@@ -311,22 +458,62 @@ it("exposes the target-free static JavaScript application workflow", async () =>
       ipc: { paired_renderer_transmissions: 4 },
     },
   });
-  expect(projected.result.graph.nodes.length).toBeGreaterThan(0);
-  expect(projected.result.semantic_graph.nodes.length).toBeGreaterThan(0);
-  expect(projected.evidence.operation).toBe("analyze_javascript_application");
+  expect(projected.normalized_result.graph.nodes.length).toBeGreaterThan(0);
+  expect(
+    projected.normalized_result.semantic_graph.nodes.length,
+  ).toBeGreaterThan(0);
+  expect(projected.operation).toBe("analyze_javascript_application");
+  const direct = await analyzeJavaScriptApplication({ input_path: root });
+  if (!direct.ok) throw direct.error;
+  expect(projected.evidence_id).toBe(direct.value.evidence_id);
 });
 
 const evidenceFor = (value: unknown) => {
-  const parsed = z
-    .object({
-      evidence_id: z.string(),
-      result: z.unknown(),
-      evidence: z.object({}).passthrough(),
-    })
-    .parse(value);
-  return {
-    ...parsed.evidence,
-    evidence_id: parsed.evidence_id,
-    normalized_result: parsed.result,
-  };
+  return parseEvidence(value);
 };
+
+it("reports every unresolved Electron path without starting a provider", async () => {
+  const root = await createTestTempDirectory("rea-electron-invalid-paths-");
+  const capture = vi.fn();
+  const session = createTestBinarySession(() => {
+    throw new Error("must not start");
+  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      electronActiveObservation: {
+        capture,
+        identity: () => ({ id: "test", name: "test", version: "1" }),
+      },
+    },
+  );
+  const client = new Client({ name: "electron-path-test", version: "1" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  resources.push(client, server, session);
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const fields = ["executable_path", "application_path", "application_root"];
+  const result = await client.callTool({
+    name: "capture_electron_scenario",
+    arguments: {
+      ...Object.fromEntries(fields.map((field) => [field, join(root, field)])),
+      actions: [],
+    },
+  });
+  expect(result.isError).toBe(true);
+  expect(parseMcpToolError(result)).toMatchObject({
+    error: {
+      code: "invalid_request",
+      details: {
+        issues: fields.map((field) => ({
+          path: [field],
+          reason: "invalid_value",
+          message: expect.stringContaining("ENOENT"),
+        })),
+      },
+    },
+  });
+  expect(capture).not.toHaveBeenCalled();
+  await client.ping();
+});

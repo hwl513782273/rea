@@ -6,7 +6,7 @@ export const resultFor = (
   port: number,
   options: FakeOptions,
   frameTreeReads: number,
-): Readonly<Record<string, unknown>> => {
+): Readonly<Record<string, unknown>> | undefined => {
   switch (command.method) {
     case "Target.attachToTarget":
       return attachToTargetResult(options);
@@ -24,6 +24,8 @@ export const resultFor = (
       return responseBodyResult(options);
     case "Page.captureScreenshot":
       return screenshotResult();
+    case "Browser.getVersion":
+      return browserVersionResult();
     case "Target.getTargets":
       return { targetInfos: targets(port, options).map(endpointTargetToInfo) };
     case "Storage.getUsageAndQuota":
@@ -44,10 +46,36 @@ export const resultFor = (
       return cacheEntriesResult(port);
     case "CacheStorage.requestCachedResponse":
       return cachedResponseResult(options);
-    default:
+    case "Page.enable":
+    case "Page.disable":
+    case "Page.setLifecycleEventsEnabled":
+    case "Network.enable":
+    case "Network.disable":
+    case "Debugger.disable":
+    case "Runtime.enable":
+    case "Runtime.disable":
+    case "Runtime.releaseObjectGroup":
+    case "DOM.enable":
+    case "DOM.disable":
       return {};
+    case "Debugger.enable":
+      return { debuggerId: "fake-debugger" };
+    case "Target.detachFromTarget":
+    case "WebMCP.enable":
+      return {};
+    default:
+      return undefined;
   }
 };
+
+/** Chrome's browser-socket reply shape, mirroring the fake's `/json/version`. */
+const browserVersionResult = () => ({
+  protocolVersion: "1.3",
+  product: "FakeChrome/1.0",
+  revision: "@fake-revision",
+  userAgent: "FakeChrome",
+  jsVersion: "13.0",
+});
 
 const attachToTargetResult = (options: FakeOptions) => ({
   sessionId: options.invalidAttachedSession ? "" : "session-1",
@@ -101,7 +129,7 @@ const responseBodyResult = (options: FakeOptions) =>
       };
 
 const screenshotResult = () => ({
-  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PzWvWQAAAABJRU5ErkJggg==",
+  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
 });
 
 const storageUsageResult = () => ({

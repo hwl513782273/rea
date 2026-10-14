@@ -1,7 +1,5 @@
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { CdpEvent } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
 import * as bodyShapes from "./CdpCaptureEventBodyShapes.js";
@@ -9,18 +7,33 @@ import type { CdpCaptureEventsState } from "./CdpCaptureEventState.js";
 import type { CapturedScript, NetworkState } from "./CdpCaptureEventTypes.js";
 import * as handlers from "./CdpCaptureEventHandlers.js";
 import { isJsonMediaType } from "./CdpCaptureEventHelpers.js";
-import { recordValue } from "./CdpCaptureValues.js";
+import { cdpStringValue, recordValue } from "./CdpCaptureValues.js";
 
-export { type CapturedScript } from "./CdpCaptureEventTypes.js";
+export interface ResponseBodyCandidate {
+  readonly requestId: string;
+  readonly occurrence: number;
+}
 
 /** Event accumulator that validates and normalizes payloads at ingestion. */
 export class CdpCaptureEvents implements CdpCaptureEventsState {
+  #scriptMetadataBudgetExclusionsRecorded = false;
+  readonly #networkRequestOccurrences = new Map<string, number>();
+  readonly #responseBodyExaminedOccurrences = new Map<string, number>();
   readonly scripts = new Map<string, CapturedScript>();
+  readonly scriptMetadataBudgetOmissionsById = new Map<string, true>();
+  rejectedScriptMetadataBudgetCount = 0;
+  rejectedSourceMapMetadataBudgetCount = 0;
+  readonly scriptMetadataBytesById = new Map<string, number>();
+  retainedScriptMetadataBytes = 0;
   readonly executionContextFrames = new Map<string, string>();
   readonly network = new Map<string, NetworkState>();
-  readonly allowedWebSockets = new Set<string>();
+  readonly networkRequestTimestamps = new Map<string, number>();
+  readonly malformedRedirectRequestIds = new Set<string>();
+  readonly webSocketConnectionsById = new Map<
+    string,
+    WebPageInspection["network"]["websocket_connections"][number]
+  >();
   console: WebPageInspection["console"]["events"] = [];
-  websockets: WebPageInspection["network"]["websocket_events"] = [];
   responseMetadata: WebPageInspection["metadata"]["responses"] = [];
   agentHints: WebPageInspection["metadata"]["agent_hints"] = [];
   readonly completeness = new CdpCaptureCompleteness([
@@ -49,11 +62,20 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     this.navigationDuringCapture = false;
     this.committedDocument = undefined;
     this.scripts.clear();
+    this.scriptMetadataBudgetOmissionsById.clear();
+    this.rejectedScriptMetadataBudgetCount = 0;
+    this.rejectedSourceMapMetadataBudgetCount = 0;
+    this.scriptMetadataBytesById.clear();
+    this.retainedScriptMetadataBytes = 0;
+    this.#scriptMetadataBudgetExclusionsRecorded = false;
     this.executionContextFrames.clear();
     this.network.clear();
-    this.allowedWebSockets.clear();
+    this.networkRequestTimestamps.clear();
+    this.#networkRequestOccurrences.clear();
+    this.#responseBodyExaminedOccurrences.clear();
+    this.malformedRedirectRequestIds.clear();
+    this.webSocketConnectionsById.clear();
     this.console.length = 0;
-    this.websockets.length = 0;
     this.responseMetadata.length = 0;
     this.agentHints.length = 0;
     this.completeness.reset();
@@ -77,6 +99,28 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     this.committedDocument = undefined;
   }
 
+  /** Record final script metadata omissions after all scriptParsed replacements. */
+  recordScriptMetadataBudgetExclusions(): void {
+    if (this.#scriptMetadataBudgetExclusionsRecorded) return;
+    this.#scriptMetadataBudgetExclusionsRecorded = true;
+    const omittedScripts = this.rejectedScriptMetadataBudgetCount;
+    const omittedSourceMaps =
+      this.rejectedSourceMapMetadataBudgetCount +
+      this.scriptMetadataBudgetOmissionsById.size;
+    if (omittedScripts > 0)
+      this.completeness.exclude(
+        "scripts",
+        "resource_budget_exhausted",
+        omittedScripts,
+      );
+    if (omittedSourceMaps > 0)
+      this.completeness.exclude(
+        "source_maps",
+        "resource_budget_exhausted",
+        omittedSourceMaps,
+      );
+  }
+
   ingest(event: CdpEvent): void {
     const params = recordValue(event.params);
     if (params === undefined) return;
@@ -93,9 +137,18 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
       case "Debugger.scriptParsed":
         handlers.handleScriptParsed(this, params);
         break;
-      case "Network.requestWillBeSent":
+      case "Network.requestWillBeSent": {
+        const requestId = cdpStringValue(params.requestId);
+        const previous =
+          requestId === undefined ? undefined : this.network.get(requestId);
         handlers.handleRequestWillBeSent(this, params);
+        if (requestId !== undefined && this.network.get(requestId) !== previous)
+          this.#networkRequestOccurrences.set(
+            requestId,
+            (this.#networkRequestOccurrences.get(requestId) ?? 0) + 1,
+          );
         break;
+      }
       case "Network.responseReceived":
         handlers.handleResponseReceived(this, params);
         break;
@@ -125,26 +178,73 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     script: CapturedScript,
     allowedFrameIds: ReadonlySet<string>,
   ): string | null {
-    if (script.executionContextKey === null) return null;
-    const frameId = this.executionContextFrames.get(script.executionContextKey);
-    return frameId !== undefined && allowedFrameIds.has(frameId)
-      ? frameId
+    return script.frameId !== null && allowedFrameIds.has(script.frameId)
+      ? script.frameId
       : null;
   }
 
-  responseBodyRequestIds(): readonly string[] {
+  responseBodyRequests(): readonly ResponseBodyCandidate[] {
     if (!this.input.include_json_body_shapes) return [];
     return [...this.network.values()]
+      .filter(
+        (request) => !this.malformedRedirectRequestIds.has(request.request_id),
+      )
       .filter((request) => isJsonMediaType(request.mime_type))
-      .map((request) => request.request_id);
+      .flatMap((request) => {
+        const occurrence = this.#networkRequestOccurrences.get(
+          request.request_id,
+        );
+        return occurrence === undefined
+          ? []
+          : [{ requestId: request.request_id, occurrence }];
+      });
   }
 
-  responseBodyUnavailable(requestId: string): void {
-    bodyShapes.updateResponseBodyShape(this, requestId, null);
+  currentResponseBodyRequest(
+    candidate: ResponseBodyCandidate,
+  ): NetworkState | undefined {
+    if (
+      candidate.occurrence !==
+      this.#networkRequestOccurrences.get(candidate.requestId)
+    )
+      return undefined;
+    return this.network.get(candidate.requestId);
+  }
+
+  responseBodyUnavailable(candidate: ResponseBodyCandidate): void {
+    if (this.currentResponseBodyRequest(candidate) === undefined) return;
+    this.#responseBodyExaminedOccurrences.set(
+      candidate.requestId,
+      candidate.occurrence,
+    );
+    if (this.malformedRedirectRequestIds.has(candidate.requestId)) return;
+    bodyShapes.updateResponseBodyShape(this, candidate.requestId, null);
     this.completeness.unavailable("json_body_shapes");
   }
 
-  ingestResponseBody(requestId: string, value: unknown): void {
-    bodyShapes.ingestResponseBodyShape(this, requestId, value);
+  /**
+   * Mark eligible response bodies that arrived after the fetch pass was
+   * enumerated.
+   */
+  settleUnexaminedResponseBodies(): void {
+    for (const candidate of this.responseBodyRequests()) {
+      const request = this.currentResponseBodyRequest(candidate);
+      if (
+        request?.body_shapes.response === null &&
+        this.#responseBodyExaminedOccurrences.get(candidate.requestId) !==
+          candidate.occurrence
+      )
+        this.responseBodyUnavailable(candidate);
+    }
+  }
+
+  ingestResponseBody(candidate: ResponseBodyCandidate, value: unknown): void {
+    if (this.currentResponseBodyRequest(candidate) === undefined) return;
+    this.#responseBodyExaminedOccurrences.set(
+      candidate.requestId,
+      candidate.occurrence,
+    );
+    if (this.malformedRedirectRequestIds.has(candidate.requestId)) return;
+    bodyShapes.ingestResponseBodyShape(this, candidate.requestId, value);
   }
 }

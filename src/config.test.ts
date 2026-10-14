@@ -1,6 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { parseConfig } from "./config.js";
+import {
+  defaultHopperLauncherPath,
+  parseConfig,
+} from "./config/parseConfig.js";
+import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
+
+it("reports a configuration failure for a NUL in Hopper loader arguments", () => {
+  const result = parseConfig({
+    HOPPER_LOADER_ARGS_JSON: JSON.stringify(["--option", "value\0suffix"]),
+  });
+  if (result.ok)
+    throw new Error("NUL argv cannot be passed to a child process");
+  expect(result.error).toMatchObject({
+    settings: [{ setting: "HOPPER_LOADER_ARGS_JSON" }],
+  });
+  expect(result.error.message).toContain("NUL");
+});
 
 describe("runtime configuration", () => {
   it("allows target-free startup and applies runtime defaults", () => {
@@ -9,6 +25,7 @@ describe("runtime configuration", () => {
     if (empty.ok) {
       expect(empty.value.hopperTargetPath).toBeUndefined();
       expect(empty.value.analysisProvider).toBe("auto");
+      expect(empty.value.hopperStartupTimeoutMs).toBe(120_000);
     }
     const result = parseConfig({ HOPPER_TARGET_PATH: "/usr/bin/true" });
     expect(result.ok).toBe(true);
@@ -82,7 +99,6 @@ describe("runtime configuration", () => {
 describe("runtime target configuration", () => {
   it("rejects invalid target kinds with actionable environment diagnostics", () => {
     const result = parseConfig({ HOPPER_TARGET_KIND: "archive" });
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("Expected invalid target kind");
     expect(result.error.message).toContain("Invalid REA environment");
   });
@@ -114,6 +130,18 @@ describe("runtime target configuration", () => {
 });
 
 describe("runtime collection configuration", () => {
+  it("preserves empty loader arguments and rejects empty exclusion patterns", () => {
+    expect(
+      parseConfig({ HOPPER_LOADER_ARGS_JSON: '["", " ", "--option"]' }),
+    ).toMatchObject({
+      ok: true,
+      value: { hopperLoaderArgs: ["", " ", "--option"] },
+    });
+    expect(parseConfig({ REA_REFERENCE_SECRET_PATTERNS_JSON: '[""]' }).ok).toBe(
+      false,
+    );
+  });
+
   it.each(["not-json", "{}", '"just a string"', '["ok",1]'])(
     "rejects invalid loader args: %s",
     (encoded) => {
@@ -121,7 +149,6 @@ describe("runtime collection configuration", () => {
         HOPPER_TARGET_PATH: "/tmp/a",
         HOPPER_LOADER_ARGS_JSON: encoded,
       });
-      expect(result.ok).toBe(false);
       if (result.ok)
         throw new Error("expected malformed loader arguments to fail");
       expect(result.error.message).toContain(
@@ -156,4 +183,214 @@ describe("runtime collection configuration", () => {
       ).toBe(false);
     },
   );
+});
+
+describe("configuration failure diagnostics", () => {
+  it.each(["1", "900000", "2147483647"])(
+    "accepts Hopper startup deadline %s without changing Ghidra's deadline",
+    (value) => {
+      expect(
+        parseConfig({ REA_HOPPER_STARTUP_TIMEOUT_MS: value }),
+      ).toMatchObject({
+        ok: true,
+        value: {
+          hopperStartupTimeoutMs: Number(value),
+          ghidraStartupTimeoutMs: 330_000,
+        },
+      });
+    },
+  );
+
+  it.each(["", "0", "-1", "1.5", "1e3", "invalid", "2147483648"])(
+    "rejects malformed Hopper startup deadline %j with its setting",
+    (value) => {
+      const result = parseConfig({ REA_HOPPER_STARTUP_TIMEOUT_MS: value });
+      if (result.ok) throw new Error("Expected invalid startup deadline");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "configuration_invalid",
+        category: "invalid_input",
+        details: {
+          settings: [
+            {
+              setting: "REA_HOPPER_STARTUP_TIMEOUT_MS",
+              constraint: expect.any(String),
+            },
+          ],
+        },
+      });
+    },
+  );
+
+  it.each([
+    "",
+    " ",
+    "0",
+    "-5",
+    "abc",
+    "1.5",
+    "1e3",
+    "0x100",
+    "2147483648",
+    "9007199254740991",
+  ])(
+    "rejects malformed Ghidra startup deadline %j with its setting and constraint",
+    (value) => {
+      const result = parseConfig({ REA_GHIDRA_STARTUP_TIMEOUT_MS: value });
+      if (result.ok) throw new Error("Expected invalid startup deadline");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "configuration_invalid",
+        category: "invalid_input",
+        details: {
+          settings: [
+            {
+              setting: "REA_GHIDRA_STARTUP_TIMEOUT_MS",
+              constraint: expect.any(String),
+            },
+          ],
+        },
+      });
+    },
+  );
+
+  it.each(["1", "90000", "2147483647"])(
+    "accepts Swift compile deadline %s without changing Hopper's deadline",
+    (value) => {
+      expect(
+        parseConfig({ REA_SWIFTC_COMPILE_TIMEOUT_MS: value }),
+      ).toMatchObject({
+        ok: true,
+        value: {
+          hopperStartupTimeoutMs: 120_000,
+        },
+      });
+    },
+  );
+
+  it.each(["", "0", "-1", "1.5", "1e3", "invalid", "2147483648"])(
+    "rejects malformed Swift compile deadline %j with its setting",
+    (value) => {
+      const result = parseConfig({ REA_SWIFTC_COMPILE_TIMEOUT_MS: value });
+      if (result.ok) throw new Error("Expected invalid Swift compile deadline");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "configuration_invalid",
+        category: "invalid_input",
+        details: {
+          settings: [
+            {
+              setting: "REA_SWIFTC_COMPILE_TIMEOUT_MS",
+              constraint: expect.any(String),
+            },
+          ],
+        },
+      });
+    },
+  );
+
+  it.each([
+    ["GHIDRA_INSTALL_DIR", "./fixture"],
+    ["JAVA_HOME", "./jdk"],
+    ["REA_GHIDRA_NATIVEAOT_JAR", "./missing.jar"],
+  ])(
+    "names the rejected %s and its absolute-path constraint",
+    (setting, value) => {
+      const result = parseConfig({ [setting]: value });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      const constraint = `${setting} must be absolute`;
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "configuration_invalid",
+        category: "invalid_input",
+        message: `REA configuration is invalid: ${constraint}.`,
+        remediation: { action: expect.stringContaining(`Correct ${setting} `) },
+        details: { settings: [{ setting, constraint }] },
+      });
+      // The rejected value itself is not echoed.
+      expect(JSON.stringify(projectAnalysisError(result.error))).not.toContain(
+        value,
+      );
+    },
+  );
+
+  it("names settings rejected by their own parsers", () => {
+    const result = parseConfig({ HOPPER_LOADER_ARGS_JSON: "not-json" });
+    expect(result.ok).toBe(false);
+    if (!result.ok)
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        details: {
+          settings: [
+            {
+              setting: "HOPPER_LOADER_ARGS_JSON",
+              constraint: "HOPPER_LOADER_ARGS_JSON must be valid JSON",
+            },
+          ],
+        },
+      });
+  });
+});
+
+describe("default Linux Hopper launcher", () => {
+  const home = "/fixture/home";
+  const withExecutables =
+    (paths: readonly string[]) =>
+    (path: string): boolean =>
+      paths.includes(path);
+
+  it.each([["/opt/hopper-v4/bin/hopper"], ["/usr/bin/hopper"]])(
+    "selects an existing system launcher %s",
+    (path) => {
+      expect(
+        defaultHopperLauncherPath("linux", home, withExecutables([path])),
+      ).toBe(path);
+    },
+  );
+
+  it("prefers REA-managed and user-local launchers over system paths", () => {
+    expect(
+      defaultHopperLauncherPath(
+        "linux",
+        home,
+        withExecutables([
+          "/opt/hopper/bin/Hopper",
+          "/opt/hopper-v4/bin/hopper",
+          "/usr/bin/hopper",
+        ]),
+      ),
+    ).toBe("/opt/hopper/bin/Hopper");
+    expect(
+      defaultHopperLauncherPath(
+        "linux",
+        home,
+        withExecutables([
+          `${home}/.local/share/rea/hopper/bin/Hopper`,
+          "/usr/bin/hopper",
+        ]),
+      ),
+    ).toBe(`${home}/.local/share/rea/hopper/bin/Hopper`);
+  });
+});
+
+describe("default macOS Hopper launcher", () => {
+  it("selects the system path before the installer user path", () => {
+    const home = "/fixture/home";
+    const system =
+      "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const user =
+      "/fixture/home/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const executable = (path: string): boolean =>
+      path === system || path === user;
+
+    expect(defaultHopperLauncherPath("darwin", home, executable)).toBe(system);
+    expect(
+      defaultHopperLauncherPath("darwin", home, (path) => path === user),
+    ).toBe(user);
+  });
+
+  it("keeps an explicit launcher path unchanged", () => {
+    const configured = "/custom/../Hopper launcher";
+    const parsed = parseConfig({ HOPPER_LAUNCHER_PATH: configured });
+    expect(parsed).toMatchObject({
+      ok: true,
+      value: { hopperLauncherPath: configured },
+    });
+  });
 });

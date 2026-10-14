@@ -5,22 +5,42 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
-const environment = () => ({
-  PATH: process.env.PATH ?? "/usr/bin:/bin",
-  REA_LOG_LEVEL: "silent",
-  REA_ANALYSIS_PROVIDER: "auto",
-  // Artifact workflows have no deep-provider prerequisite or GUI authority.
-  HOPPER_LAUNCHER_PATH: "/rea-unconfigured-deep-provider/hopper",
-});
+const environment = () => {
+  const compileCache =
+    process.env.NODE_COMPILE_CACHE ??
+    process.env.REA_ARTIFACT_NODE_COMPILE_CACHE;
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    ...(compileCache &&
+    process.env.NODE_V8_COVERAGE === undefined &&
+    process.env.NODE_DISABLE_COMPILE_CACHE !== "1"
+      ? { NODE_COMPILE_CACHE: compileCache }
+      : {}),
+    REA_LOG_LEVEL: "silent",
+    REA_ANALYSIS_PROVIDER: "auto",
+    // Artifact workflows have no deep-provider prerequisite or GUI authority.
+    HOPPER_LAUNCHER_PATH: "/rea-unconfigured-deep-provider/hopper",
+  };
+};
 
 /** Execute the compiled CLI with production providers and no test adapters. */
-export async function artifactCli(command, target, arguments_ = []) {
-  return (await artifactCliEvidence(command, target, arguments_))
+export async function artifactCli(
+  command,
+  target,
+  arguments_ = [],
+  options = {},
+) {
+  return (await artifactCliEvidence(command, target, arguments_, options))
     .normalized_result;
 }
 
 /** Execute the compiled CLI and return its complete Evidence record. */
-export async function artifactCliEvidence(command, target, arguments_ = []) {
+export async function artifactCliEvidence(
+  command,
+  target,
+  arguments_ = [],
+  { timeoutMs = 60000 } = {},
+) {
   const { stdout } = await promisify(execFile)(
     process.execPath,
     [
@@ -30,7 +50,7 @@ export async function artifactCliEvidence(command, target, arguments_ = []) {
       ...arguments_,
       "--json",
     ],
-    { env: environment(), timeout: 60000, maxBuffer: 16 * 1024 * 1024 },
+    { env: environment(), timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
   );
   const evidence = JSON.parse(stdout);
   assert.equal(evidence.error, undefined, stdout);
@@ -65,6 +85,9 @@ export async function withArtifactMcp(target, verify) {
 export async function artifactMcpResult(client, name, arguments_ = {}) {
   const result = await client.callTool({ name, arguments: arguments_ });
   assert.notEqual(result.isError, true, JSON.stringify(result));
-  assert.ok(result.structuredContent?.result, "MCP omitted structured result");
-  return result.structuredContent.result;
+  assert.ok(
+    result.structuredContent?.normalized_result,
+    "MCP omitted structured result",
+  );
+  return result.structuredContent.normalized_result;
 }

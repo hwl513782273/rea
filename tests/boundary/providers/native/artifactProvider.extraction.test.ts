@@ -7,41 +7,33 @@ import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js
 
 import { ArtifactProvider } from "../../../../src/artifacts/ArtifactProvider.js";
 import { artifactExtractionExecutionSchema } from "../../../../src/contracts/artifactToolContracts.js";
-import { TOOL_EFFECTS } from "../../../../src/contracts/toolEffects.js";
 import {
   artifactExtractionResultSchema,
   artifactInventoryResultSchema,
 } from "../../../../src/domain/artifactGraph.js";
-import type { BinaryTarget } from "../../../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
 
 describe("artifact extraction", () => {
-  it("declares possible native mounts and fresh extraction directories", () => {
-    for (const platform of ["linux", "darwin"] as const) {
-      const provider = new ArtifactProvider(platform);
-      for (const operation of [
-        "inventory_artifact",
-        "inspect_artifact",
-        "extract_artifact",
-      ] as const) {
-        expect(
-          provider
-            .capabilities()
-            .find((capability) => capability.operation === operation)?.effects,
-        ).toMatchObject({ launchesProcess: true, mayWriteFilesystem: true });
-      }
-    }
-    expect(TOOL_EFFECTS.inspect_artifact).toMatchObject({
-      launchesProcess: true,
-      writesFilesystem: true,
-      mutatesTarget: false,
+  it("keeps committed files after the owning client closes", async () => {
+    const root = await createTestTempDirectory("rea-extract-client-close-");
+    const source = join(root, "source");
+    await mkdir(source);
+    await writeFile(join(source, "payload.txt"), "committed\n");
+    const output = join(root, "output");
+    const client = new ArtifactProvider(process.env).createClient(
+      target(source, "directory"),
+    );
+
+    const result = await client.execute("extract_artifact", {
+      output_root: output,
     });
-    expect(TOOL_EFFECTS.extract_artifact).toMatchObject({
-      launchesProcess: true,
-      writesFilesystem: true,
-      idempotent: false,
-      mutatesTarget: false,
-    });
+    if (!result.ok) throw result.error;
+    await client.close();
+    expect(await readFile(join(output, "payload.txt"), "utf8")).toBe(
+      "committed\n",
+    );
   });
+
   it("extracts all regular occurrences through an exclusively owned output tree", async () => {
     const root = await createTestTempDirectory("rea-extract-");
     const source = join(root, "source");
@@ -58,7 +50,7 @@ describe("artifact extraction", () => {
     const cancelledOutput = join(root, "cancelled-output");
     const controller = new AbortController();
     controller.abort();
-    const cancelled = await new ArtifactProvider()
+    const cancelled = await new ArtifactProvider(process.env)
       .createClient(targetValue)
       .execute(
         "extract_artifact",
@@ -73,7 +65,7 @@ describe("artifact extraction", () => {
     });
     await expect(access(cancelledOutput)).rejects.toThrow();
     const output = join(root, "output");
-    const result = await new ArtifactProvider()
+    const result = await new ArtifactProvider(process.env)
       .createClient(targetValue)
       .execute(
         "extract_artifact",
@@ -81,8 +73,7 @@ describe("artifact extraction", () => {
           output_root: output,
         }),
       );
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     const firstExtraction = artifactExtractionResultSchema.parse(
       result.value.result,
     );
@@ -94,6 +85,8 @@ describe("artifact extraction", () => {
       ]),
       extraction_manifest: { output_root_alias: "$OUTPUT_ROOT" },
     });
+    // artifacts names every extracted path; the Evidence does not repeat them.
+    expect(result.value.locations).toEqual([]);
     expect(await readFile(join(output, "assets", "selected.js"), "utf8")).toBe(
       "selected();\n",
     );
@@ -102,7 +95,7 @@ describe("artifact extraction", () => {
     );
 
     const relocatedOutput = join(root, "relocated-output");
-    const relocated = await new ArtifactProvider()
+    const relocated = await new ArtifactProvider(process.env)
       .createClient(targetValue)
       .execute(
         "extract_artifact",
@@ -110,14 +103,13 @@ describe("artifact extraction", () => {
           output_root: relocatedOutput,
         }),
       );
-    expect(relocated.ok).toBe(true);
-    if (!relocated.ok) return;
+    if (!relocated.ok) throw relocated.error;
     expect(
       artifactExtractionResultSchema.parse(relocated.value.result)
         .extraction_manifest,
     ).toEqual(firstExtraction.extraction_manifest);
 
-    const second = await new ArtifactProvider()
+    const second = await new ArtifactProvider(process.env)
       .createClient(targetValue)
       .execute(
         "extract_artifact",
@@ -137,7 +129,7 @@ describe("artifact extraction", () => {
   });
 });
 const inventory = async (targetValue: BinaryTarget) => {
-  const result = await new ArtifactProvider()
+  const result = await new ArtifactProvider(process.env)
     .createClient(targetValue)
     .execute("inventory_artifact", {});
   if (!result.ok) throw result.error;

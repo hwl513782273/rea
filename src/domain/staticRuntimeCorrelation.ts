@@ -5,18 +5,23 @@ import { z } from "zod";
 
 import { artifactComparisonResultSchema } from "./artifactComparison.js";
 import { uniqueSorted } from "./canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import {
+  comparisonSourceEvidenceIds,
+  assertComparisonFindingLinks,
+} from "./comparisonSourceEvidence.js";
 import { evidenceSchema, parseEvidence, type Evidence } from "./evidence.js";
-import { functionComparisonResultSchema } from "./functionComparison.js";
+import { functionComparisonResultSchema } from "./functionComparisonSchemas.js";
 import {
   PROCESS_PROVIDER,
   isProcessEvidenceProvider,
-} from "./processEvidenceProvider.js";
+} from "./process/processEvidenceProvider.js";
 import type { JsonValue } from "./jsonValue.js";
 import {
   comparisonStatusSchema,
   processCaptureComparisonSchema,
-} from "./processCapture.js";
-import { PROCESS_COMPARISON_DIMENSIONS } from "./processComparison.js";
+} from "./process/processComparison.js";
+import { PROCESS_COMPARISON_DIMENSIONS } from "./process/processComparison.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
@@ -174,7 +179,7 @@ export const correlateStaticAndRuntime = (
   const correlations = parsed.mappings
     .map((mapping) => correlate(mapping, staticById, runtimeById))
     .sort((left, right) =>
-      left.correlation_id.localeCompare(right.correlation_id, "en"),
+      compareUnicodeCodePoints(left.correlation_id, right.correlation_id),
     );
   if (
     new Set(correlations.map(({ correlation_id: id }) => id)).size !==
@@ -234,7 +239,10 @@ const correlate = (
     mapping.runtime.comparison_evidence_id,
     "runtime comparison",
   );
-  const selectedStatic = selectStatic(staticEvidence, mapping.static.selector);
+  const { limitations: selectedLimitations, ...selectedStatic } = selectStatic(
+    staticEvidence,
+    mapping.static.selector,
+  );
   const process = processCaptureComparisonSchema.parse(
     runtimeEvidence.normalized_result,
   );
@@ -268,6 +276,7 @@ const correlate = (
     ]),
     limitations: uniqueSorted([
       ...staticEvidence.limitations,
+      ...selectedLimitations,
       ...runtimeEvidence.limitations,
       ...process.limitations,
       "This correlation tests an explicit hypothesis and does not establish causality.",
@@ -279,7 +288,9 @@ const correlate = (
 const selectStatic = (
   evidence: Evidence,
   selector: z.infer<typeof staticSelectorSchema>,
-): Pick<CorrelationItem["static"], "status" | "conclusion_kind"> => {
+): Pick<CorrelationItem["static"], "status" | "conclusion_kind"> & {
+  readonly limitations: readonly string[];
+} => {
   if (selector.kind === "function") {
     if (evidence.operation !== "compare_functions")
       throw new TypeError(
@@ -297,6 +308,7 @@ const selectStatic = (
     return {
       status: match.status,
       conclusion_kind: match.conclusion_kind,
+      limitations: match.limitations,
     };
   }
   if (evidence.operation !== "compare_artifacts")
@@ -317,6 +329,7 @@ const selectStatic = (
   const status = match.classification;
   return {
     status,
+    limitations: [],
     conclusion_kind:
       status === "contradiction"
         ? "contradiction"
@@ -340,7 +353,7 @@ const parseStatic = (input: unknown): Evidence => {
     const result = artifactComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    assertNestedLinks(
+    assertComparisonFindingLinks(
       evidence,
       result.changes.flatMap(({ evidence_links: links }) => links),
     );
@@ -348,23 +361,12 @@ const parseStatic = (input: unknown): Evidence => {
     const result = functionComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    assertNestedLinks(
+    assertComparisonFindingLinks(
       evidence,
       result.dimensions.flatMap(({ evidence_links: links }) => links),
     );
   }
   return evidence;
-};
-
-const assertNestedLinks = (
-  evidence: Evidence,
-  nestedLinks: readonly string[],
-): void => {
-  const closure = new Set(evidence.evidence_links);
-  if (nestedLinks.some((evidenceId) => !closure.has(evidenceId)))
-    throw new TypeError(
-      "Comparison finding cites Evidence outside its top-level closure",
-    );
 };
 
 const parseRuntime = (input: unknown): Evidence => {
@@ -392,64 +394,20 @@ const assertComparisonIdentity = (evidence: Evidence): void => {
         evidence.provider.version !== "1") ||
     evidence.confidence !== "derived" ||
     evidence.authority !== "analyst-inference" ||
-    evidence.subject !== null ||
-    evidence.evidence_links.length < 2 ||
-    new Set(evidence.evidence_links).size !== evidence.evidence_links.length
+    evidence.subject !== null
   )
     throw new TypeError(
       "Comparison Evidence operation, predicate, provider, or citations disagree",
     );
-  const parameterLinks = comparisonParameterLinks(evidence);
-  if (!sameSet(parameterLinks, evidence.evidence_links))
+  const expectedLinks = comparisonSourceEvidenceIds(evidence);
+  const actualLinks = uniqueSorted(evidence.evidence_links);
+  if (
+    expectedLinks.length !== actualLinks.length ||
+    expectedLinks.some((id, index) => id !== actualLinks[index])
+  )
     throw new TypeError(
       "Comparison Evidence closure disagrees with its source parameters",
     );
-};
-
-const comparisonParameterLinks = (evidence: Evidence): string[] => {
-  if (evidence.operation === "compare_process_captures") {
-    const parameters = z
-      .object({
-        left_evidence_id: evidenceIdSchema,
-        right_evidence_id: evidenceIdSchema,
-      })
-      .passthrough()
-      .parse(evidence.parameters);
-    return [parameters.left_evidence_id, parameters.right_evidence_id];
-  }
-  const parameters = z
-    .object({
-      left_evidence_id: evidenceIdSchema.optional(),
-      right_evidence_id: evidenceIdSchema.optional(),
-      left_evidence_ids: z.array(evidenceIdSchema).min(1).optional(),
-      right_evidence_ids: z.array(evidenceIdSchema).min(1).optional(),
-    })
-    .passthrough()
-    .parse(evidence.parameters);
-  const left =
-    parameters.left_evidence_id === undefined
-      ? (parameters.left_evidence_ids ?? [])
-      : [parameters.left_evidence_id];
-  const right =
-    parameters.right_evidence_id === undefined
-      ? (parameters.right_evidence_ids ?? [])
-      : [parameters.right_evidence_id];
-  if (left.length === 0 || right.length === 0)
-    throw new TypeError("Comparison Evidence omitted its source parameters");
-  return [...left, ...right];
-};
-
-const sameSet = (
-  left: readonly string[],
-  right: readonly string[],
-): boolean => {
-  if (left.length !== right.length) return false;
-  const rightSet = new Set(right);
-  return (
-    rightSet.size === right.length &&
-    new Set(left).size === left.length &&
-    left.every((item) => rightSet.has(item))
-  );
 };
 
 const observedPattern = (

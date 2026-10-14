@@ -17,21 +17,21 @@ describe("JavaScript semantic analysis: dataflow 1", () => {
     `);
 
     expect(
-      ir.objectOperations.map(({ kind, propertyName, resolution }) => ({
+      ir.objectOperations.map(({ kind, propertyPath, resolution }) => ({
         kind,
-        propertyName,
+        propertyPath,
         resolution,
       })),
     ).toEqual(
       expect.arrayContaining([
         {
           kind: "destructure",
-          propertyName: "token",
+          propertyPath: ["token"],
           resolution: "complete",
         },
-        { kind: "spread", propertyName: null, resolution: "complete" },
-        { kind: "write", propertyName: "count", resolution: "complete" },
-        { kind: "read", propertyName: "token", resolution: "complete" },
+        { kind: "spread", propertyPath: [], resolution: "complete" },
+        { kind: "write", propertyPath: ["count"], resolution: "complete" },
+        { kind: "read", propertyPath: ["token"], resolution: "complete" },
       ]),
     );
   });
@@ -50,11 +50,11 @@ describe("JavaScript semantic analysis: dataflow 1", () => {
       ({ kind }) => kind === "destructure",
     );
 
-    expect(destructures.map(({ propertyName }) => propertyName)).toEqual([
-      "token",
-      "token",
-      "token",
-      "1",
+    expect(destructures.map(({ propertyPath }) => propertyPath)).toEqual([
+      ["token"],
+      ["token"],
+      ["token"],
+      ["1"],
     ]);
     expect(
       destructures.every(({ resolution }) => resolution === "complete"),
@@ -127,10 +127,19 @@ describe("JavaScript semantic analysis: dataflow 1", () => {
       unknownProperties: false,
       omittedProperties: 0,
       properties: expect.arrayContaining([
-        { name: "depth", value: { status: "literal", value: 1 } },
-        { name: "type", value: { status: "literal", value: "heading" } },
+        {
+          name: "depth",
+          presence: "present",
+          value: { status: "literal", value: 1 },
+        },
+        {
+          name: "type",
+          presence: "present",
+          value: { status: "literal", value: "heading" },
+        },
         {
           name: "text",
+          presence: "present",
           value: {
             status: "unknown",
             reason: "Unsupported CallExpression value.",
@@ -199,6 +208,106 @@ describe("JavaScript semantic analysis: read-modify-write", () => {
       "write",
       "read",
     ]);
+  });
+
+  it.each([
+    ["destructuring assignment", "[source.count] = [2];"],
+    ["destructuring assignment with default", "[source.count = 2] = [];"],
+    [
+      "nested destructuring assignment",
+      "({ value: { count: source.count } } = {});",
+    ],
+    ["rest destructuring assignment", "[...source.items] = [];"],
+    ["for-of head", "for (source.count of [4]) {}"],
+    ["for-in head", "for (source.count in { key: true }) {}"],
+    ["delete", "delete source.count;"],
+  ])("records a member target in %s as a write", (_name, statement) => {
+    const ir = analyzeJavaScriptSemantics(`
+      const source = { count: 1, items: [] };
+      ${statement}
+    `);
+    expect(ir.objectOperations.map(({ kind }) => kind)).toEqual(["write"]);
+  });
+
+  it.each([
+    ["non-null update", "source.count!++;"],
+    ["non-null compound assignment", "source.count! += 1;"],
+    ["cast compound assignment", "(source.count as number) += 1;"],
+    ["parenthesized update", "(source.count)++;"],
+  ])(
+    "retains the property read in a wrapped read-modify-write: %s",
+    (_name, statement) => {
+      const ir = analyzeJavaScriptSemantics(`
+        const source = { count: 1 };
+        ${statement}
+      `);
+      expect(ir.objectOperations.map(({ kind }) => kind)).toEqual([
+        "read",
+        "write",
+      ]);
+    },
+  );
+
+  it.each([
+    ["cast plain assignment", "(source.count as number) = 2;"],
+    ["non-null delete", "delete source.count!;"],
+  ])("keeps a wrapped %s write-only", (_name, statement) => {
+    const ir = analyzeJavaScriptSemantics(`
+      const source = { count: 1 };
+      ${statement}
+    `);
+    expect(ir.objectOperations.map(({ kind }) => kind)).toEqual(["write"]);
+  });
+
+  it("keeps a member in a destructuring default value a read", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      const source = { count: 1 };
+      let value;
+      [value = source.count] = [];
+    `);
+    expect(ir.objectOperations.map(({ kind }) => kind)).toEqual(["read"]);
+  });
+
+  it("does not model a compound binding write as a competing replacement", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      let count = 1;
+      count += 2;
+    `);
+
+    expect(topLevelBinding(ir, "count").value).toMatchObject({
+      status: "unknown",
+    });
+  });
+});
+
+describe("JavaScript semantic analysis: wrapped binding targets", () => {
+  it("records a wrapped identifier update as a read before a write", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      let count = 1;
+      count! += 1;
+      (count as number)++;
+      const copy = count!;
+    `);
+    expect(
+      ir.references
+        .filter(({ name }) => name === "count")
+        .map(({ role }) => role),
+    ).toEqual(["read", "write", "read", "write", "read"]);
+    expect(topLevelBinding(ir, "count").value).toMatchObject({
+      status: "unknown",
+    });
+  });
+
+  it("records a wrapped identifier assignment as a write of its value", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      let count = 1;
+      count! = 2;
+    `);
+    expect(
+      ir.references
+        .filter(({ name }) => name === "count")
+        .map(({ role }) => role),
+    ).toEqual(["write"]);
   });
 });
 
@@ -439,21 +548,36 @@ describe("nonfinite static values", () => {
 
 describe("binding write invalidation", () => {
   it.each([
-    "let value = 1; value++; const observed = value;",
-    "let value = 1; --value; const observed = value;",
-    'let value = "old"; [value] = ["new"]; const observed = value;',
-    'let value = "old"; ({key: value} = {key: "new"}); const observed = value;',
-    'let value = "old"; for (value of ["new"]) {} const observed = value;',
-    'let value = "old"; for (value in {new: true}) {} const observed = value;',
-  ])("does not retain an exact initializer across %s", (source) => {
-    const ir = analyzeJavaScriptSemantics(source);
-    expect(topLevelBinding(ir, "observed").value.status).toBe("ambiguous");
-    expect(
-      topLevelBinding(ir, "value").definitions.some(
-        ({ kind }) => kind === "assignment",
-      ),
-    ).toBe(true);
-  });
+    ["let value = 1; value++; const observed = value;", "unknown"],
+    ["let value = 1; --value; const observed = value;", "unknown"],
+    [
+      'let value = "old"; [value] = ["new"]; const observed = value;',
+      "ambiguous",
+    ],
+    [
+      'let value = "old"; ({key: value} = {key: "new"}); const observed = value;',
+      "ambiguous",
+    ],
+    [
+      'let value = "old"; for (value of ["new"]) {} const observed = value;',
+      "ambiguous",
+    ],
+    [
+      'let value = "old"; for (value in {new: true}) {} const observed = value;',
+      "ambiguous",
+    ],
+  ] as const)(
+    "does not retain an exact initializer across %s",
+    (source, status) => {
+      const ir = analyzeJavaScriptSemantics(source);
+      expect(topLevelBinding(ir, "observed").value.status).toBe(status);
+      expect(
+        topLevelBinding(ir, "value").definitions.some(
+          ({ kind }) => kind === "assignment",
+        ),
+      ).toBe(true);
+    },
+  );
 
   it("does not treat destructuring keys or member owners as assigned bindings", () => {
     const ir = analyzeJavaScriptSemantics(`

@@ -1,16 +1,22 @@
 import { describe, expect, it } from "vitest";
+import { TraceMap } from "@jridgewell/trace-mapping";
 
 import {
   createJavaScriptApplicationGraph,
   createJavaScriptApplicationNode,
 } from "./javascriptApplicationGraph.js";
+import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
 import { createHistoricalSourceGraph } from "../referenceSourceGraph.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import { compareSourceToBundle } from "./sourceToBundleComparison.js";
 import {
   SOURCE_TO_BUNDLE_SIGNAL_WEIGHTS,
   sourceToBundleComparisonResultSchema,
 } from "./sourceToBundleComparisonSchemas.js";
-import { artifactEvidence } from "./javascriptApplicationGraph.fixture.js";
+import {
+  artifactEvidence,
+  sourceMapReference,
+} from "./javascriptApplicationGraph.fixture.js";
 
 const HASH = {
   artifact: "1".repeat(64),
@@ -40,9 +46,6 @@ describe("historical source to bundle comparison", () => {
     const second = compareSourceToBundle(input);
 
     expect(first).toEqual(second);
-    expect(() =>
-      sourceToBundleComparisonResultSchema.parse(first),
-    ).not.toThrow();
     expect(first.summary).toEqual({
       unchanged: 1,
       modified: 0,
@@ -136,51 +139,204 @@ describe("historical source to bundle comparison", () => {
   });
 });
 
-describe("source to bundle path syntax", () => {
-  it.each(["src/modified#part.ts", "src/modified?part.ts"])(
-    "preserves literal filesystem punctuation in %s",
-    (path) => {
-      const node = moduleNode("punctuated", { path });
-      const graph = createJavaScriptApplicationGraph({
-        schema: "JavaScriptApplicationGraph",
-        root_node_ids: [node.node_id],
-        nodes: [node],
-        edges: [],
-        coverage: {
-          status: "complete",
-          truncated: false,
-          omitted_count: 0,
-          limits: [],
+describe("source to bundle digest changes", () => {
+  it("reports a located source with a different digest as modified", () => {
+    const node = createJavaScriptApplicationNode({
+      kind: "source-module",
+      identity: {
+        strategy: "source-map-original",
+        source_root: null,
+        stability: "source-map-exact",
+        source_map_sha256: HASH.artifact,
+        original_source: "webpack://fixture/./src/modified.ts",
+        source_sha256: HASH.unchanged,
+      },
+      observations: [
+        {
+          label: "display label",
+          source_map_reference: sourceMapReference(
+            "webpack://fixture/./src/modified.ts",
+            null,
+            "dist/main.js.map",
+          ),
+          properties: {
+            content_available: true,
+            content_sha256: HASH.unchanged,
+            source: "src/removed.ts",
+          },
+          evidence: artifactEvidence(HASH.artifact, "dist/main.js.map"),
         },
-        limitations: [],
-      });
-      const result = compareSourceToBundle({
-        reference: historicalGraph("complete", [path]),
-        application: {
-          evidenceId: EVIDENCE_ID,
-          rootArtifactSha256: HASH.artifact,
-          graph,
-        },
-      });
-      expect(item(result, path)).toMatchObject({
-        status: "unknown",
-        current_node_ids: [node.node_id],
-        candidates: [
-          expect.objectContaining({
-            signals: expect.arrayContaining([
-              expect.objectContaining({ kind: "current-path-exact" }),
-            ]),
-          }),
-        ],
-      });
-    },
-  );
+      ],
+    });
+    const graph = createJavaScriptApplicationGraph({
+      schema: "JavaScriptApplicationGraph",
+      root_node_ids: [node.node_id],
+      nodes: [node],
+      edges: [],
+      coverage: {
+        status: "complete",
+        truncated: false,
+        omitted_count: 0,
+        limits: [],
+      },
+      limitations: [],
+    });
+    const result = compareSourceToBundle({
+      reference: historicalGraph("complete", [
+        "src/modified.ts",
+        "src/removed.ts",
+      ]),
+      application: {
+        evidenceId: EVIDENCE_ID,
+        rootArtifactSha256: HASH.artifact,
+        graph,
+      },
+    });
 
+    expect(result.summary).toMatchObject({ modified: 1, unknown: 0 });
+    expect(item(result, "src/removed.ts").candidates).toEqual([]);
+    expect(item(result, "src/modified.ts")).toMatchObject({
+      status: "modified",
+      confidence: "high",
+      current_node_ids: [node.node_id],
+    });
+  });
+});
+
+describe("source to bundle Unicode path collisions", () => {
+  it("keeps colliding canonical-equivalent current paths ambiguous", () => {
+    const historicalPath = "src/a\u0301\u0323.ts";
+    const currentPaths = ["src/a\u0323\u0301.ts", "src/\u1ea1\u0301.ts"];
+    const nodes = currentPaths.map((path, index) =>
+      moduleNode(`unicode-${index}`, { path }),
+    );
+    const result = comparePathToNodes(historicalPath, nodes);
+    const mapping = item(result, historicalPath);
+
+    expect(mapping).toMatchObject({
+      status: "unknown",
+      confidence: "unknown",
+      current_node_ids: [],
+      candidates: [
+        expect.objectContaining({
+          signals: expect.arrayContaining([
+            expect.objectContaining({ kind: "unicode-equivalent-path" }),
+          ]),
+        }),
+        expect.objectContaining({
+          signals: expect.arrayContaining([
+            expect.objectContaining({ kind: "unicode-equivalent-path" }),
+          ]),
+        }),
+      ],
+      limitations: [
+        expect.stringContaining(
+          "filesystem paths with distinct Unicode spellings",
+        ),
+      ],
+    });
+  });
+
+  it("prefers a raw source-map path over canonically equivalent alternatives", () => {
+    const historicalPath = "src/cafe\u0301.ts";
+    const exact = sourceMapNode(
+      "exact",
+      "cafe\u0301.ts",
+      "../src/",
+      HASH.modified,
+    );
+    const equivalent = sourceMapNode(
+      "equivalent",
+      "caf\u00e9.ts",
+      "../src/",
+      HASH.removed,
+    );
+    const result = comparePathToNodes(historicalPath, [exact, equivalent]);
+
+    expect(item(result, historicalPath)).toMatchObject({
+      status: "modified",
+      current_node_ids: [exact.node_id],
+    });
+  });
+
+  it("finds Unicode-equivalent suffixes of absolute source-map URLs", () => {
+    const historicalPath = "src/caf\u00e9.ts";
+    const node = sourceMapNode(
+      "remote",
+      "cafe\u0301.ts",
+      "https://cdn.example/src/",
+      HASH.modified,
+    );
+    const result = comparePathToNodes(historicalPath, [node]);
+
+    expect(item(result, historicalPath)).toMatchObject({
+      status: "unknown",
+      current_node_ids: [],
+      candidates: [
+        expect.objectContaining({
+          current_node_id: node.node_id,
+          signals: expect.arrayContaining([
+            expect.objectContaining({
+              kind: "unicode-equivalent-path",
+              current_values: ["cdn.example/src/cafe\u0301.ts"],
+            }),
+          ]),
+        }),
+      ],
+    });
+  });
+});
+
+describe("source to bundle path syntax", () => {
   it.each([
-    "https://example.test/src/modified.ts?revision=2#section",
-    "webpack://fixture/./src/modified.ts?revision=2#section",
-  ])("still strips URL query and fragment from %s", (path) => {
-    const node = moduleNode("url", { path });
+    "src/modified#part.ts",
+    "src/modified?part.ts",
+    "pkg:app/src/modified#part.ts",
+    "pkg:app/src/modified?part.ts",
+    "data:/src/modified.ts",
+  ])("preserves literal filesystem punctuation in %s", (path) => {
+    const node = moduleNode("punctuated", { path });
+    const graph = createJavaScriptApplicationGraph({
+      schema: "JavaScriptApplicationGraph",
+      root_node_ids: [node.node_id],
+      nodes: [node],
+      edges: [],
+      coverage: {
+        status: "complete",
+        truncated: false,
+        omitted_count: 0,
+        limits: [],
+      },
+      limitations: [],
+    });
+    const result = compareSourceToBundle({
+      reference: historicalGraph("complete", [path]),
+      application: {
+        evidenceId: EVIDENCE_ID,
+        rootArtifactSha256: HASH.artifact,
+        graph,
+      },
+    });
+    expect(item(result, path)).toMatchObject({
+      status: "unknown",
+      current_node_ids: [node.node_id],
+      candidates: [
+        expect.objectContaining({
+          signals: expect.arrayContaining([
+            expect.objectContaining({ kind: "current-path-exact" }),
+          ]),
+        }),
+      ],
+    });
+  });
+
+  it.each(
+    [
+      "https://example.test/src/modified.ts?revision=2#section",
+      "webpack://fixture/./src/modified.ts?revision=2#section",
+    ].flatMap((path) => ["path", "module_path"].map((key) => ({ key, path }))),
+  )("still strips URL query and fragment from $key $path", ({ key, path }) => {
+    const node = moduleNode("url", { [key]: path });
     const graph = createJavaScriptApplicationGraph({
       schema: "JavaScriptApplicationGraph",
       root_node_ids: [node.node_id],
@@ -213,7 +369,58 @@ describe("source to bundle path syntax", () => {
         }),
       ],
     });
+    expect(
+      item(result, "src/modified.ts").candidates.flatMap(
+        ({ signals }) => signals,
+      ),
+    ).not.toContainEqual(
+      expect.objectContaining({ kind: "unicode-equivalent-path" }),
+    );
   });
+});
+
+describe("source-map resolver equivalence", () => {
+  it.each([
+    {
+      sourceRoot: "https://cdn.example/src/",
+      expectedSource: "https://cdn.example/src/a.js",
+      expectedResolution: { kind: "suffix", path: "cdn.example/src/a.js" },
+    },
+    {
+      sourceRoot: "https://cdn.example/src//",
+      expectedSource: "https://cdn.example/src/a.js",
+      expectedResolution: { kind: "suffix", path: "cdn.example/src/a.js" },
+    },
+    {
+      sourceRoot: "webpack://",
+      expectedSource: "webpack:///a.js",
+      expectedResolution: { kind: "suffix", path: "a.js" },
+    },
+  ])(
+    "matches TraceMap for sourceRoot $sourceRoot",
+    ({ sourceRoot, expectedSource, expectedResolution }) => {
+      const producerSource = new TraceMap(
+        {
+          version: 3,
+          file: "main.js",
+          sourceRoot,
+          sources: ["a.js"],
+          names: [],
+          mappings: "",
+        },
+        "file:///artifact/dist/main.js.map",
+      ).resolvedSources[0];
+      const reference = sourceMapReference(
+        "a.js",
+        sourceRoot,
+        "dist/main.js.map",
+      );
+
+      expect(producerSource).toBe(expectedSource);
+      expect(reference.source_root).toBe(sourceRoot);
+      expect(reference.resolution).toEqual(expectedResolution);
+    },
+  );
 });
 
 describe("source to bundle complete metadata", () => {
@@ -259,6 +466,61 @@ describe("source to bundle complete metadata", () => {
   });
 });
 
+const sourceMapNode = (
+  key: string,
+  sourceName: string,
+  sourceRoot: string,
+  digest: string,
+) =>
+  createJavaScriptApplicationNode({
+    kind: "source-module",
+    identity: {
+      strategy: "source-map-original",
+      source_root: sourceRoot,
+      stability: "source-map-exact",
+      source_map_sha256: HASH.artifact,
+      original_source: sourceName,
+      source_sha256: digest,
+    },
+    observations: [
+      {
+        label: `${key} source-map spelling`,
+        source_map_reference: sourceMapReference(
+          sourceName,
+          sourceRoot,
+          `dist/${key}.map`,
+        ),
+        properties: { content_available: true, content_sha256: digest },
+        evidence: artifactEvidence(HASH.artifact, `dist/${key}.map`),
+      },
+    ],
+  });
+
+const comparePathToNodes = (
+  sourcePath: string,
+  nodes: readonly ApplicationNode[],
+) =>
+  compareSourceToBundle({
+    reference: historicalGraph("complete", [sourcePath]),
+    application: {
+      evidenceId: EVIDENCE_ID,
+      rootArtifactSha256: HASH.artifact,
+      graph: createJavaScriptApplicationGraph({
+        schema: "JavaScriptApplicationGraph",
+        root_node_ids: nodes.map(({ node_id: nodeId }) => nodeId),
+        nodes,
+        edges: [],
+        coverage: {
+          status: "complete",
+          truncated: false,
+          omitted_count: 0,
+          limits: [],
+        },
+        limitations: [],
+      }),
+    },
+  });
+
 const historicalGraph = (
   inventoryState: "complete" | "partial",
   paths = [
@@ -297,7 +559,7 @@ const historicalGraph = (
         content_state: "hashed" as const,
         limitations: [],
       })),
-    ],
+    ].sort((left, right) => compareUnicodeCodePoints(left.path, right.path)),
     relationships: [],
     parse_failures: [],
     exclusions: [],

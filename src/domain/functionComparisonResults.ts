@@ -1,4 +1,4 @@
-import { canonicalDigest } from "./comparisonSemantics.js";
+import { digestCanonicalValue } from "./canonicalDigest.js";
 import type {
   DimensionName,
   FunctionComparisonResult,
@@ -48,14 +48,13 @@ export const dimensionResult = (
 
 export const unresolvedDimension = (input: {
   readonly dimension: DimensionName;
-  readonly status: "truncated" | "unknown";
   readonly links: readonly string[];
   readonly leftCount: number | null;
   readonly rightCount: number | null;
   readonly limitations: readonly string[];
 }): FunctionDimension => ({
   dimension: input.dimension,
-  status: input.status,
+  status: "unknown",
   left_digest: null,
   right_digest: null,
   left_count: input.leftCount,
@@ -70,25 +69,18 @@ export const overallStatus = (
   dimensions: readonly FunctionDimension[],
   match: FunctionComparisonResult["function_match"]["status"],
 ): FunctionComparisonResult["status"] => {
-  if (dimensions.some(({ status }) => status === "truncated"))
-    return "truncated";
-  if (
-    match === "ambiguous" ||
-    dimensions.some(({ status }) => status === "unknown")
-  )
-    return "unknown";
   if (match === "mismatched") return "changed";
-  return dimensions.some(({ status }) => status === "changed")
-    ? "changed"
-    : "unchanged";
+  if (match === "ambiguous") return "unknown";
+  if (dimensions.some(({ status }) => status === "changed")) return "changed";
+  if (dimensions.some(({ status }) => status === "unknown")) return "unknown";
+  return "unchanged";
 };
 
 export const summarize = (dimensions: readonly FunctionDimension[]) => ({
   unchanged: dimensions.filter(({ status }) => status === "unchanged").length,
   changed: dimensions.filter(({ status }) => status === "changed").length,
-  truncated: dimensions.filter(({ status }) => status === "truncated").length,
   unknown: dimensions.filter(({ status }) => status === "unknown").length,
 });
 
 const digest = (value: unknown): string =>
-  canonicalDigest(value, "Function comparison");
+  digestCanonicalValue(value, "Function comparison");

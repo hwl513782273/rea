@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import canonicalize from "canonicalize";
 
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+
 export interface WebInventoryResourceInput {
   readonly url: string;
   readonly origin: string | null;
@@ -12,9 +14,9 @@ export interface WebInventoryResourceInput {
 
 export interface WebInventoryScriptInput {
   readonly url: string;
-  readonly cdp_hash: string;
-  readonly length: number;
-  readonly is_module: boolean;
+  readonly cdp_hash: string | null;
+  readonly length: number | null;
+  readonly is_module: boolean | null;
   readonly language: string | null;
   readonly source_map_url: string | null;
 }
@@ -42,8 +44,8 @@ export const stableWebResources = (
     ).values(),
   ].sort(
     (left, right) =>
-      left.resource_key.localeCompare(right.resource_key) ||
-      left.url.localeCompare(right.url),
+      compareUnicodeCodePoints(left.resource_key, right.resource_key) ||
+      compareUnicodeCodePoints(left.url, right.url),
   );
 };
 

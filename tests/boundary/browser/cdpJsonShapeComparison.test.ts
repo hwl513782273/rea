@@ -4,13 +4,13 @@ import { compareWebCaptureEvidence } from "../../../src/application/BrowserObser
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
 import { CdpCaptureEvents } from "../../../src/browser/CdpCaptureEvents.js";
 import { browserCaptureComparisonInputSchema } from "../../../src/domain/browserCaptureComparison.js";
+import { inspectWebPageInputSchema } from "../../../src/domain/browserObservation.js";
 import {
-  inspectWebPageInputSchema,
   webPageInspectionSchema,
   type WebPageInspection,
-} from "../../../src/domain/browserObservation.js";
+} from "../../../src/domain/browserObservationSchemas.js";
 import { parseEvidence } from "../../../src/domain/evidence.js";
-import { webCaptureDiffSchema } from "../../../src/domain/webCaptureDiff.js";
+import { webCaptureDiffSchema } from "../../../src/domain/webCaptureDiffSchemas.js";
 
 const ORIGIN = "https://example.test";
 const CAPTURE_TIME = "2026-01-01T00:00:00.000Z";
@@ -39,6 +39,68 @@ const equivalentBodies = [
   },
 ];
 
+it("captures all repeated array rows and empty arrays without retaining payload values", async () => {
+  const count = 6_000;
+  const body = JSON.stringify(
+    Array.from({ length: count }, (_, index) => ({
+      value: index % 2 === 0 ? index : "payload-value-excluded",
+      nested: index % 2 === 0 ? [] : [true, null],
+      empty: [],
+      "*": { "": "payload-value-excluded" },
+    })),
+  );
+  const before = captureBody("base64 response", body);
+  const shape = before.network.requests[0]?.body_shapes.response;
+  const element = { kind: "array-element" };
+  const property = (name: string) => ({ kind: "property", name });
+  expect(shape).toMatchObject({
+    root_type: "array",
+    node_count: count * 7 + 1,
+    max_depth_observed: 3,
+    properties: [
+      { path: [element], types: ["object"], observations: count },
+      {
+        path: [element, property("*")],
+        types: ["object"],
+        observations: count,
+      },
+      {
+        path: [element, property("*"), property("")],
+        types: ["string"],
+        observations: count,
+      },
+      {
+        path: [element, property("empty")],
+        types: ["array"],
+        observations: count,
+      },
+      {
+        path: [element, property("nested")],
+        types: ["array"],
+        observations: count,
+      },
+      {
+        path: [element, property("nested"), element],
+        types: ["boolean", "null"],
+        observations: count,
+      },
+      {
+        path: [element, property("value")],
+        types: ["number", "string"],
+        observations: count,
+      },
+    ],
+  });
+  expect(JSON.stringify(shape)).not.toContain("payload-value-excluded");
+  const after = captureBody("base64 response", body);
+  expect(
+    (await compareCaptures(before, after)).dimensions.network,
+  ).toMatchObject({
+    status: "unknown",
+    total_changes: 0,
+  });
+});
+
 describe.each<BodySource>(["request", "response", "base64 response"])(
   "CDP %s JSON shape comparison",
   (source) => {
@@ -62,6 +124,32 @@ describe.each<BodySource>(["request", "response", "base64 response"])(
         expect(before.network).toEqual(after.network);
       },
     );
+
+    it.each([
+      { name: "scalar array types", before: "[123]", after: '["a"]' },
+      { name: "mixed array types", before: '[1,"a"]', after: "[1,true]" },
+      { name: "nested arrays", before: "[[1],null]", after: '[["a"],null]' },
+      {
+        name: "literal star properties",
+        before: '{"items":[{"*":1},[true]]}',
+        after: '{"items":[{"*":true},[1]]}',
+      },
+    ])("compares $name without retaining values", async ({ before, after }) => {
+      const length = Math.max(
+        Buffer.byteLength(before),
+        Buffer.byteLength(after),
+      );
+      const captures = comparableCaptures(
+        source,
+        before + " ".repeat(length - Buffer.byteLength(before)),
+        after + " ".repeat(length - Buffer.byteLength(after)),
+      );
+      const result = await compareCaptures(...captures);
+      expect(result.dimensions.network).toMatchObject({
+        status: "changed",
+        total_changes: 1,
+      });
+    });
 
     it.each([
       { name: "a type change", after: '{"é":null,"e\u0301":null}' },
@@ -93,6 +181,63 @@ describe.each<BodySource>(["request", "response", "base64 response"])(
     });
   },
 );
+
+describe("selected JSON body-shape coverage", () => {
+  it.each(["unavailable", "partial", "truncated"] as const)(
+    "keeps %s coverage unknown without reporting an availability change",
+    async (coverage) => {
+      const before = captureBody("request", "[123]");
+      const after = structuredClone(before);
+      for (const capture of [before, after])
+        capture.completeness.attach_limited_sections = [];
+      const request = after.network.requests[0];
+      if (request === undefined) throw new Error("Expected request");
+      if (coverage === "truncated")
+        after.completeness.truncated_sections.push("json_body_shapes");
+      else {
+        request.body_shapes.status = coverage;
+        request.body_shapes.response = null;
+        if (coverage === "unavailable") request.body_shapes.request = null;
+        after.completeness.unavailable_sections.push("json_body_shapes");
+      }
+      expect(
+        (await compareCaptures(before, after)).dimensions.network,
+      ).toMatchObject({ status: "unknown", total_changes: 0 });
+      expect(
+        (await compareCaptures(after, after)).dimensions.network.status,
+      ).toBe("unknown");
+      request.status = 503;
+      expect(
+        (await compareCaptures(before, after)).dimensions.network.status,
+      ).toBe("changed");
+    },
+  );
+
+  it("ignores shapes when either capture did not request them", async () => {
+    const before = captureBody("request", "[123]");
+    const after = structuredClone(before);
+    for (const capture of [before, after])
+      capture.completeness.attach_limited_sections = [];
+    after.completeness.excluded.push({
+      section: "json_body_shapes",
+      reason: "not_approved",
+      count: null,
+    });
+    after.completeness.policy_filtered_sections.push("json_body_shapes");
+    for (const request of after.network.requests)
+      request.body_shapes = {
+        status: "not_approved",
+        request: null,
+        response: null,
+      };
+    expect(
+      (await compareCaptures(before, after)).dimensions.network,
+    ).toMatchObject({ status: "unchanged", total_changes: 0 });
+    expect(
+      (await compareCaptures(after, after)).dimensions.network.status,
+    ).toBe("unchanged");
+  });
+});
 
 const comparableCaptures = (
   source: BodySource,
@@ -171,6 +316,7 @@ const captureBody = (source: BodySource, body: string): WebPageInspection => {
         headers: { "Content-Type": "application/json" },
         postData: source === "request" ? body : "{}",
       },
+      initiator: { type: "script" },
     },
   });
   const responseBody = source === "request" ? "{}" : body;
@@ -193,8 +339,10 @@ const captureBody = (source: BodySource, body: string): WebPageInspection => {
       encodedDataLength: Buffer.byteLength(responseBody),
     },
   });
-  expect(events.responseBodyRequestIds()).toEqual(["request-1"]);
-  events.ingestResponseBody("request-1", {
+  const candidate = events.responseBodyRequests()[0];
+  expect(candidate?.requestId).toBe("request-1");
+  expect(candidate).toBeDefined();
+  events.ingestResponseBody(candidate!, {
     body:
       source === "base64 response"
         ? Buffer.from(responseBody).toString("base64")
@@ -240,7 +388,7 @@ const captureBody = (source: BodySource, body: string): WebPageInspection => {
     resources: [],
     network: {
       requests: [...events.network.values()],
-      websocket_events: events.websockets,
+      websocket_connections: [...events.webSocketConnectionsById.values()],
       coverage_started_at: CAPTURE_TIME,
       prior_activity_available: false,
     },

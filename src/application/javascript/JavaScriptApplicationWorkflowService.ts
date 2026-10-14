@@ -1,22 +1,29 @@
 import { z } from "zod";
 
-import {
-  AnalysisInputError,
-  AnalysisProtocolError,
-} from "../../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisProtocolError } from "../../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { Evidence } from "../../domain/evidence.js";
-import { projectInputIssues } from "../../domain/inputIssueProjection.js";
+import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { compareJavaScriptApplicationVersions } from "../../domain/javascript/javascriptApplicationVersionComparison.js";
-import { compareApplicationVersionsInputSchema } from "../../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
+import {
+  compareApplicationVersionsInputSchema,
+  applicationVersionIdentitiesSchema,
+} from "../../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
 import { compareJavaScriptExportShapes } from "../../domain/javascript/javascriptExportShapeComparison.js";
-import { compareJavaScriptExportShapesInputSchema } from "../../domain/javascript/javascriptExportShapeComparisonSchemas.js";
+import {
+  compareJavaScriptExportShapesInputSchema,
+  javaScriptExportShapeIdentitiesSchema,
+} from "../../domain/javascript/javascriptExportShapeComparisonSchemas.js";
 import { traceApplicationFeature } from "../../domain/javascript/javascriptFeatureTrace.js";
-import { traceApplicationFeatureInputSchema } from "../../domain/javascript/javascriptFeatureTraceSchemas.js";
+import {
+  traceApplicationFeatureInputSchema,
+  applicationTraceIdentitiesSchema,
+} from "../../domain/javascript/javascriptFeatureTraceSchemas.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { compareSourceToBundle } from "../../domain/javascript/sourceToBundleComparison.js";
 import { compareSourceToBundleInputSchema } from "../../domain/javascript/sourceToBundleComparisonSchemas.js";
 import {
+  applicationGraphEvidenceInputError,
   parseApplicationGraphEvidence,
   parseNativeApplicationEvidence,
 } from "./JavaScriptApplicationEvidenceGraph.js";
@@ -35,11 +42,7 @@ export const traceApplicationFeatureEvidence = (
   const parsed = traceApplicationFeatureInputSchema.safeParse(rawInput);
   if (!parsed.success)
     return err(
-      new AnalysisInputError(
-        operation,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      analysisInputErrorFromIssues(operation, parsed.error.issues, rawInput),
     );
   return traceApplicationFeatureEvidenceValidated(parsed.data);
 };
@@ -49,11 +52,29 @@ export const traceApplicationFeatureEvidenceValidated = (
   input: z.output<typeof traceApplicationFeatureInputSchema>,
 ): Result<Evidence, AnalysisError> => {
   const operation = "trace_application_feature";
-  try {
-    const source = parseApplicationGraphEvidence(input.application);
-    const nativeEvidence = parseNativeApplicationEvidence(
-      input.native_observations,
+  const identities = applicationTraceIdentitiesSchema.safeParse(input);
+  if (!identities.success)
+    return err(
+      analysisInputErrorFromIssues(operation, identities.error.issues, input),
     );
+  const sourceResult = parseApplicationGraphEvidence(input.application, [
+    "application",
+  ]);
+  if (!sourceResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, sourceResult.error),
+    );
+  const nativeResult = parseNativeApplicationEvidence(
+    input.native_observations,
+    ["native_observations"],
+  );
+  if (!nativeResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, nativeResult.error),
+    );
+  try {
+    const source = sourceResult.value;
+    const nativeEvidence = nativeResult.value;
     const result = traceApplicationFeature({
       sourceEvidenceId: source.evidence.evidence_id,
       graph: source.graph,
@@ -73,7 +94,7 @@ export const traceApplicationFeatureEvidenceValidated = (
       ),
     );
   } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
+    return workflowFailure(operation, cause);
   }
 };
 
@@ -85,11 +106,7 @@ export const compareApplicationVersionsEvidence = (
   const parsed = compareApplicationVersionsInputSchema.safeParse(rawInput);
   if (!parsed.success)
     return err(
-      new AnalysisInputError(
-        operation,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      analysisInputErrorFromIssues(operation, parsed.error.issues, rawInput),
     );
   return compareApplicationVersionsEvidenceValidated(parsed.data);
 };
@@ -99,15 +116,40 @@ export const compareApplicationVersionsEvidenceValidated = (
   input: z.output<typeof compareApplicationVersionsInputSchema>,
 ): Result<Evidence, AnalysisError> => {
   const operation = "compare_application_versions";
+  const identities = applicationVersionIdentitiesSchema.safeParse(input);
+  if (!identities.success)
+    return err(
+      analysisInputErrorFromIssues(operation, identities.error.issues, input),
+    );
+  const leftResult = parseApplicationGraphEvidence(input.left, ["left"]);
+  if (!leftResult.ok)
+    return err(applicationGraphEvidenceInputError(operation, leftResult.error));
+  const rightResult = parseApplicationGraphEvidence(input.right, ["right"]);
+  if (!rightResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, rightResult.error),
+    );
+  const leftNativeResult = parseNativeApplicationEvidence(
+    input.left_native_observations,
+    ["left_native_observations"],
+  );
+  if (!leftNativeResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, leftNativeResult.error),
+    );
+  const rightNativeResult = parseNativeApplicationEvidence(
+    input.right_native_observations,
+    ["right_native_observations"],
+  );
+  if (!rightNativeResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, rightNativeResult.error),
+    );
   try {
-    const left = parseApplicationGraphEvidence(input.left);
-    const right = parseApplicationGraphEvidence(input.right);
-    const leftNative = parseNativeApplicationEvidence(
-      input.left_native_observations,
-    );
-    const rightNative = parseNativeApplicationEvidence(
-      input.right_native_observations,
-    );
+    const left = leftResult.value;
+    const right = rightResult.value;
+    const leftNative = leftNativeResult.value;
+    const rightNative = rightNativeResult.value;
     const result = compareJavaScriptApplicationVersions({
       left: {
         evidenceId: left.evidence.evidence_id,
@@ -136,7 +178,7 @@ export const compareApplicationVersionsEvidenceValidated = (
       ),
     );
   } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
+    return workflowFailure(operation, cause);
   }
 };
 
@@ -145,8 +187,15 @@ export const compareSourceToBundleEvidenceValidated = (
   input: z.output<typeof compareSourceToBundleInputSchema>,
 ): Result<Evidence, AnalysisError> => {
   const operation = "compare_source_to_bundle";
+  const applicationResult = parseApplicationGraphEvidence(input.application, [
+    "application",
+  ]);
+  if (!applicationResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, applicationResult.error),
+    );
   try {
-    const application = parseApplicationGraphEvidence(input.application);
+    const application = applicationResult.value;
     const result = compareSourceToBundle({
       reference: input.reference,
       application: {
@@ -165,7 +214,7 @@ export const compareSourceToBundleEvidenceValidated = (
       ),
     );
   } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
+    return workflowFailure(operation, cause);
   }
 };
 
@@ -180,11 +229,7 @@ export const compareJavaScriptExportShapesEvidence = (
   const parsed = compareJavaScriptExportShapesInputSchema.safeParse(rawInput);
   if (!parsed.success)
     return err(
-      new AnalysisInputError(
-        operation,
-        undefined,
-        projectInputIssues(parsed.error.issues, rawInput),
-      ),
+      analysisInputErrorFromIssues(operation, parsed.error.issues, rawInput),
     );
   return compareJavaScriptExportShapesEvidenceValidated(parsed.data);
 };
@@ -194,9 +239,22 @@ export const compareJavaScriptExportShapesEvidenceValidated = (
   input: z.output<typeof compareJavaScriptExportShapesInputSchema>,
 ): Result<Evidence, AnalysisError> => {
   const operation = "compare_javascript_export_shapes";
+  const identities = javaScriptExportShapeIdentitiesSchema.safeParse(input);
+  if (!identities.success)
+    return err(
+      analysisInputErrorFromIssues(operation, identities.error.issues, input),
+    );
+  const leftResult = parseApplicationGraphEvidence(input.left, ["left"]);
+  if (!leftResult.ok)
+    return err(applicationGraphEvidenceInputError(operation, leftResult.error));
+  const rightResult = parseApplicationGraphEvidence(input.right, ["right"]);
+  if (!rightResult.ok)
+    return err(
+      applicationGraphEvidenceInputError(operation, rightResult.error),
+    );
   try {
-    const left = parseApplicationGraphEvidence(input.left);
-    const right = parseApplicationGraphEvidence(input.right);
+    const left = leftResult.value;
+    const right = rightResult.value;
     const result = compareJavaScriptExportShapes({
       left: {
         evidenceId: left.evidence.evidence_id,
@@ -225,56 +283,17 @@ export const compareJavaScriptExportShapesEvidenceValidated = (
       ),
     );
   } catch (cause: unknown) {
-    return workflowFailure(operation, cause, input);
+    return workflowFailure(operation, cause);
   }
 };
 
 const workflowFailure = (
   operation: string,
   cause: unknown,
-  input: unknown,
 ): Result<never, AnalysisError> =>
-  cause instanceof z.ZodError
-    ? err(
-        new AnalysisInputError(
-          operation,
-          undefined,
-          projectInputIssues(cause.issues, input),
-        ),
-      )
-    : cause instanceof TypeError &&
-        SAFE_APPLICATION_INPUT_CONSTRAINTS.has(cause.message)
-      ? err(
-          new AnalysisInputError(operation, undefined, [
-            { path: [], reason: "invalid_value", message: cause.message },
-          ]),
-        )
-      : err(
-          new AnalysisProtocolError(
-            "JavaScript application workflow produced an invalid result",
-            { cause },
-          ),
-        );
-
-const SAFE_APPLICATION_INPUT_CONSTRAINTS = new Set([
-  "Evidence semantic identifier does not match its record",
-  "Application workflow requires authenticated analyze_javascript_application, reconcile_javascript_runtime, or project_managed_application_graph Evidence",
-  "JavaScript application Evidence authority or confidence is invalid",
-  "JavaScript application Evidence predicate does not match its result shape",
-  "JavaScript application Evidence subject does not match its result",
-  "Runtime reconciliation Evidence authority or confidence is invalid",
-  "Runtime reconciliation result references Evidence outside its envelope",
-  "Runtime reconciliation application layer is missing",
-  "Managed application graph Evidence authority or confidence is invalid",
-  "Managed application graph result references Evidence outside its envelope",
-  "Native handoff Evidence requires an artifact subject",
-  "Native handoff Evidence must be unique",
-  ...[
-    "analyze_javascript_application",
-    "reconcile_javascript_runtime",
-    "project_managed_application_graph",
-  ].map(
-    (operation) =>
-      `Evidence does not match the supported ${operation} contract`,
-  ),
-]);
+  err(
+    new AnalysisProtocolError(
+      `JavaScript application workflow failed while producing ${operation}`,
+      { cause },
+    ),
+  );

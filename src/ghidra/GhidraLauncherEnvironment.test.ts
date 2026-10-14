@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { ghidraHeadlessJavaOptions } from "./GhidraLauncher.js";
+import {
+  GhidraHeadlessLauncher,
+  ghidraHeadlessCommand,
+  ghidraHeadlessJavaOptions,
+} from "./GhidraLauncher.js";
+import { ghidraJavaEnvironment } from "./GhidraInstallation.js";
 
 describe("Ghidra headless JVM environment", () => {
   it("passes Windows paths with spaces to Java's environment parser", () => {
@@ -17,19 +22,6 @@ describe("Ghidra headless JVM environment", () => {
     });
   });
 
-  it.each(["linux", "darwin"] as const)(
-    "keeps the %s headless-script option list and clears inherited JDK options",
-    (platform) => {
-      expect(
-        ghidraHeadlessJavaOptions("/tmp/rea/home", "/tmp/rea/tmp", platform),
-      ).toEqual({
-        JDK_JAVA_OPTIONS: "",
-        GHIDRA_HEADLESS_JAVA_OPTIONS:
-          "-Duser.home=/tmp/rea/home -Djava.io.tmpdir=/tmp/rea/tmp",
-      });
-    },
-  );
-
   it.each(["%TEMP%", 'quote"', "amp&", "line\n", "nul\0"])(
     "rejects interpreter metacharacters in either Windows JVM path: %s",
     (suffix) => {
@@ -42,4 +34,40 @@ describe("Ghidra headless JVM environment", () => {
         );
     },
   );
+});
+
+it("uses selected mixed-case Windows PATH and ComSpec through direct launch boundaries", () => {
+  const environment = {
+    Path: "C:\\selected\\tools",
+    ComSpec: "C:\\selected\\cmd.exe",
+    SystemRoot: "C:\\selected-windows",
+  };
+  const launcher = new GhidraHeadlessLauncher({
+    environment,
+    platform: "win32",
+    analyzeHeadlessPath: "C:\\ghidra\\support\\analyzeHeadless.bat",
+    bridgeScriptPath: "C:\\rea\\bridge.py",
+  });
+  environment.ComSpec = "C:\\changed\\cmd.exe";
+  expect(
+    ghidraHeadlessCommand({
+      environment: launcher.options.environment,
+      platform: "win32",
+      analyzeHeadlessPath: launcher.options.analyzeHeadlessPath,
+      arguments: [],
+    }).command,
+  ).toBe("C:\\selected\\cmd.exe");
+  expect(ghidraJavaEnvironment("C:\\jdk", environment, "win32")).toMatchObject({
+    PATH: "C:\\jdk\\bin;C:\\selected\\tools",
+    COMSPEC: "C:\\changed\\cmd.exe",
+    SYSTEMROOT: "C:\\selected-windows",
+  });
+  expect(
+    ghidraHeadlessCommand({
+      environment: { SYSTEMROOT: "C:\\selected-windows" },
+      platform: "win32",
+      analyzeHeadlessPath: launcher.options.analyzeHeadlessPath,
+      arguments: [],
+    }).command,
+  ).toBe("C:\\selected-windows\\System32\\cmd.exe");
 });

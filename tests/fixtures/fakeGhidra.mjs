@@ -31,7 +31,18 @@ if (mode === "exit") process.exit(73);
 if (mode === "silent") setInterval(() => undefined, 1_000);
 else {
   await rm(endpointPath, { force: true });
+  const sockets = new Set();
+  let rejectedConnections = 0;
   const server = createServer((socket) => {
+    if (
+      mode === "reject_all_connections" ||
+      (mode === "reject_first_connection" && rejectedConnections++ === 0)
+    ) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
     socket.setEncoding("utf8");
     const state = {
       buffer: { value: "" },
@@ -44,6 +55,11 @@ else {
       targetSha256,
     };
     socket.on("data", (chunk) => onSocketData(socket, server, chunk, state));
+  });
+  process.on("message", (message) => {
+    if (message !== "disconnect") return;
+    for (const socket of sockets) socket.destroy();
+    process.send?.({ event: "disconnected" });
   });
   if (transport === "unix-socket") server.listen(endpointPath);
   else {
@@ -108,11 +124,22 @@ const handleRequest = (socket, server, request, state) => {
   if (state.mode === "exit_tools" && request.method !== "shutdown")
     process.exit(74);
   if (state.mode === "hang_tools" && request.method !== "shutdown") return;
-  const inventory = inventoryResultFor(request.method);
+  const inventory =
+    request.method === "list_strings" && state.mode === "fragmented"
+      ? [stringItem("0x2000", "fixture 雪🦊")]
+      : request.method === "list_strings" && state.mode === "oversized_result"
+        ? [stringItem("0x2000", "x".repeat(64 * 1024 * 1024 + 1))]
+        : inventoryResultFor(request.method, request.params);
   if (inventory !== undefined) {
-    socket.write(
-      `${JSON.stringify({ id: request.id, ok: true, result: inventory })}\n`,
-    );
+    const response = `${JSON.stringify({ id: request.id, ok: true, result: inventory })}\n`;
+    if (state.mode === "fragmented") {
+      const bytes = Buffer.from(response, "utf8");
+      const unicodeOffset = bytes.indexOf(Buffer.from("雪", "utf8"));
+      const midpoint =
+        unicodeOffset >= 0 ? unicodeOffset + 1 : Math.floor(bytes.length / 2);
+      socket.write(bytes.subarray(0, midpoint));
+      setTimeout(() => socket.write(bytes.subarray(midpoint)), 5);
+    } else socket.write(response);
     return;
   }
   if (request.method === "shutdown") {
@@ -142,6 +169,16 @@ const handleRequest = (socket, server, request, state) => {
 
 const handlePing = (socket, request, state) => {
   state.pings.value += 1;
+  if (state.mode === "diagnostic_output" && state.pings.value === 1) {
+    const retainedTokenPrefixBytes = Math.floor(state.token.length / 2);
+    const preservedMarker = "source=/tmp/local-evidence.bin?cursor=keep&";
+    const fillLength = 8 * 1024 * 1024 - retainedTokenPrefixBytes;
+    const fill = "x".repeat(fillLength - Buffer.byteLength(preservedMarker));
+    process.stderr.write(`${fill}${preservedMarker}`);
+    setImmediate(() => {
+      process.stderr.write(state.token);
+    });
+  }
   if (state.mode === "malformed") {
     socket.write("{invalid\n");
     return;
@@ -199,6 +236,7 @@ const sessionInfo = ({
     "shutdown",
     "inspect_native_load_image",
     "read_bytes",
+    "search_bytes",
     "address_to_file_offset",
     "address_name",
     "list_documents",
@@ -210,6 +248,8 @@ const sessionInfo = ({
     "resolve_containing_procedure",
     "search_procedures",
     "search_strings",
+    "set_address_name",
+    "set_addresses_names",
     "annotate_native_function",
     "inspect_native_data_type",
     "inspect_native_instruction",
@@ -225,7 +265,12 @@ const sessionInfo = ({
     "xrefs",
   ].filter(
     (value) =>
-      transport === "unix-socket" || value !== "annotate_native_function",
+      transport === "unix-socket" ||
+      ![
+        "annotate_native_function",
+        "set_address_name",
+        "set_addresses_names",
+      ].includes(value),
   ),
   target: {
     name: "fixture",
@@ -237,8 +282,42 @@ const sessionInfo = ({
   },
 });
 
-const inventoryResultFor = (method) => {
+const inventoryResultFor = (method, params) => {
   switch (method) {
+    case "search_bytes": {
+      const continued = params.cursor === "fixture-second-page";
+      const paged = params.limit === 1 && !continued;
+      const addresses = continued
+        ? ["0x1005"]
+        : paged
+          ? ["0x1000"]
+          : ["0x1000", "0x1005"];
+      return {
+        matches: addresses.map((address) => ({
+          address,
+          segment: ".text",
+          file_offset: address === "0x1000" ? 0 : 5,
+          procedure: { address: "0x1000", name: "fixture_main" },
+        })),
+        searched: {
+          blocks: [
+            {
+              segment: ".text",
+              start: continued ? "0x1005" : "0x1000",
+              end: "0x1009",
+              bytes: continued ? 5 : 10,
+            },
+          ],
+          bytes: continued ? 5 : 10,
+          skipped_uninitialized: [
+            { segment: ".bss", start: "0x2000", end: "0x200f", bytes: 16 },
+          ],
+          skipped_not_loaded: [],
+        },
+        complete: !paged,
+        next_cursor: paged ? "fixture-second-page" : null,
+      };
+    }
     case "address_name":
       return "fixture_main";
     case "list_documents":
@@ -304,7 +383,7 @@ const stringItem = (address, value) => ({
   string: {
     encoding: "UTF-8",
     termination: "present_or_not_required",
-    byte_length: value.length + 1,
+    byte_length: Buffer.byteLength(value, "utf8") + 1,
   },
 });
 

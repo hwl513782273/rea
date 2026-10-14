@@ -1,7 +1,9 @@
+import { dirname } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
-import { parseConfig } from "../config.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import { parseConfig } from "../config/parseConfig.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { silentLogger } from "../logger.js";
 import { HopperProvider } from "./HopperProvider.js";
 
@@ -30,8 +32,21 @@ describe("Hopper provider discovery", () => {
     });
   });
 
+  it("reports a directory launcher path as missing", () => {
+    const directory = dirname(process.execPath);
+    expect(provider(directory).inspectAvailability()).toEqual({
+      status: "unavailable",
+      code: "executable_missing",
+      reason: `Hopper launcher is missing or not executable: ${directory}`,
+      diagnostics: {
+        launcher_path: directory,
+        platform: process.platform,
+      },
+    });
+  });
+
   it("separates target kind, format, and architecture support", () => {
-    const hopper = provider(process.execPath);
+    const hopper = provider(process.execPath, "linux");
     expect(hopper.inspectTargetSupport(databaseTarget())).toMatchObject({
       status: "supported",
     });
@@ -44,12 +59,31 @@ describe("Hopper provider discovery", () => {
       diagnostics: { target_kind: "archive", target_format: "asar" },
     });
   });
+
+  it("fails closed for saved Hopper databases on macOS without a bridge launch route", () => {
+    expect(
+      provider(process.execPath, "darwin").inspectTargetSupport(
+        databaseTarget(),
+      ),
+    ).toMatchObject({
+      status: "unsupported",
+      code: "target_kind_unsupported",
+      reason: expect.stringContaining("cannot start REA's analysis bridge"),
+      diagnostics: {
+        target_kind: "database",
+        target_format: "analysis-database",
+      },
+    });
+  });
 });
 
-const provider = (launcherPath: string): HopperProvider => {
+const provider = (
+  launcherPath: string,
+  platform: NodeJS.Platform = process.platform,
+): HopperProvider => {
   const config = parseConfig({ HOPPER_LAUNCHER_PATH: launcherPath });
   if (!config.ok) throw config.error;
-  return new HopperProvider(config.value, silentLogger);
+  return new HopperProvider(config.value, silentLogger, {}, platform);
 };
 
 const databaseTarget = (): BinaryTarget => ({

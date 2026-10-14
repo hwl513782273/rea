@@ -1,13 +1,11 @@
-import { compareFunctions } from "../domain/functionComparison.js";
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import {
-  compareProcessCaptures,
-  parseProcessCapture,
-} from "../domain/processCapture.js";
+import { compareProcessCaptures } from "../domain/process/processComparison.js";
+import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
 import { FUNCTION_COMPARISON_EXAMPLE } from "./functionComparisonExample.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "./processCaptureExample.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../domain/process/processCaptureExample.js";
 
+import { compareFunctions } from "../domain/functionComparison.js";
 const comparison = compareFunctions(
   FUNCTION_COMPARISON_EXAMPLE.left,
   FUNCTION_COMPARISON_EXAMPLE.right,
@@ -30,6 +28,7 @@ export const FUNCTION_COMPARISON_EVIDENCE = createEvidence(
     result: jsonValueSchema.parse(comparison),
     confidence: "derived",
     authority: "analyst-inference",
+    limitations: comparison.limitations,
     evidenceLinks: [
       FUNCTION_COMPARISON_EXAMPLE.left.evidence_id,
       FUNCTION_COMPARISON_EXAMPLE.right.evidence_id,

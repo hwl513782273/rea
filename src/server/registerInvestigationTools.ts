@@ -1,12 +1,11 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
-import type { BinarySessionPort } from "../application/binary/BinarySession.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import { toolContract } from "../contracts/toolContracts.js";
 import { buildCallPath } from "../domain/callPath.js";
 import { findChangedBehavior } from "../domain/changedBehavior.js";
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import { verifyReconstruction } from "../domain/reconstructionVerification.js";
 import { correlateStaticAndRuntime } from "../domain/staticRuntimeCorrelation.js";
 import {
   comparisonClosure,
@@ -21,13 +20,16 @@ import {
   CHANGED_BEHAVIOR_PROVIDER,
   RECONSTRUCTION_PROVIDER,
   STATIC_RUNTIME_PROVIDER,
-} from "./sessionToolPolicies.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { toCallToolResult } from "./toolResult.js";
+} from "../application/InvestigationProviders.js";
+import {
+  applicationValidatedInputSchema,
+  toolRegistrationOptions,
+} from "./toolRegistrationOptions.js";
 
+import { verifyReconstruction } from "../domain/reconstructionVerification.js";
 /** Register Evidence-composed differential investigation workflows. */
 export const registerInvestigationTools = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
 ): void => {
   registerChangedBehavior(
@@ -49,32 +51,33 @@ export const registerInvestigationTools = (
 };
 
 const registerChangedBehavior = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
   contract: ReturnType<typeof toolContract<"find_changed_behavior">>,
 ): void => {
+  const registration = toolRegistrationOptions(contract);
   server.registerTool(
     contract.name,
-    toolRegistrationOptions(contract),
+    {
+      ...registration,
+      inputSchema: applicationValidatedInputSchema(registration.inputSchema),
+    },
     async (input, context) => {
-      const closure = evidenceClosure(
-        session,
-        comparisonClosure(input.comparisons),
-      );
-      if (!closure.ok) return toCallToolResult(closure, contract);
-      const links = closure.value;
       const computed = await runDerivedOperation(context, contract.name, () =>
-        findChangedBehavior(input.comparisons),
+        findChangedBehavior(input),
       );
-      if (!computed.ok) return toCallToolResult(computed, contract);
-      const result = computed.value;
+      if (!computed.ok)
+        return server.delivery.toCallToolResult(computed, contract);
+      const { result, comparisonEvidenceIds } = computed.value;
+      const closure = evidenceClosure(session, result.evidence_links);
+      if (!closure.ok)
+        return server.delivery.toCallToolResult(closure, contract);
+      const links = closure.value;
       const evidence = createEvidence(undefined, CHANGED_BEHAVIOR_PROVIDER, {
         predicateType: "rea.changed-behavior",
         operation: contract.name,
         parameters: {
-          comparison_evidence_ids: input.comparisons.map(
-            ({ evidence_id: id }) => id,
-          ),
+          comparison_evidence_ids: [...comparisonEvidenceIds],
         },
         result: jsonValueSchema.parse(result),
         confidence: "derived",
@@ -101,13 +104,13 @@ const registerChangedBehavior = (
           ],
         },
       );
-      return toCallToolResult(recorded, contract);
+      return server.delivery.toEvidenceToolResult(evidence, contract, recorded);
     },
   );
 };
 
 const registerCallPath = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
   contract: ReturnType<typeof toolContract<"build_call_path">>,
 ): void => {
@@ -119,12 +122,14 @@ const registerCallPath = (
         session,
         functionEvidenceIds(input.functions),
       );
-      if (!closure.ok) return toCallToolResult(closure, contract);
+      if (!closure.ok)
+        return server.delivery.toCallToolResult(closure, contract);
       const links = closure.value;
       const computed = await runDerivedOperation(context, contract.name, () =>
         buildCallPath(input),
       );
-      if (!computed.ok) return toCallToolResult(computed, contract);
+      if (!computed.ok)
+        return server.delivery.toCallToolResult(computed, contract);
       const result = computed.value;
       const evidence = createEvidence(undefined, CALL_PATH_PROVIDER, {
         predicateType: "rea.call-path",
@@ -158,13 +163,13 @@ const registerCallPath = (
           ],
         },
       );
-      return toCallToolResult(recorded, contract);
+      return server.delivery.toEvidenceToolResult(evidence, contract, recorded);
     },
   );
 };
 
 const registerStaticRuntime = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
   contract: ReturnType<typeof toolContract<"correlate_static_and_runtime">>,
 ): void => {
@@ -179,12 +184,14 @@ const registerStaticRuntime = (
           ...input.runtime_comparisons,
         ]),
       );
-      if (!closure.ok) return toCallToolResult(closure, contract);
+      if (!closure.ok)
+        return server.delivery.toCallToolResult(closure, contract);
       const links = closure.value;
       const computed = await runDerivedOperation(context, contract.name, () =>
         correlateStaticAndRuntime(input),
       );
-      if (!computed.ok) return toCallToolResult(computed, contract);
+      if (!computed.ok)
+        return server.delivery.toCallToolResult(computed, contract);
       const result = computed.value;
       const evidence = createEvidence(undefined, STATIC_RUNTIME_PROVIDER, {
         predicateType: "rea.static-runtime-correlation",
@@ -198,7 +205,9 @@ const registerStaticRuntime = (
         limitations: result.limitations,
         evidenceLinks: links,
       });
-      return toCallToolResult(
+      return server.delivery.toEvidenceToolResult(
+        evidence,
+        contract,
         recordWorkflowEvidence(
           session,
           evidence,
@@ -218,14 +227,13 @@ const registerStaticRuntime = (
             ],
           },
         ),
-        contract,
       );
     },
   );
 };
 
 const registerReconstruction = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
   contract: ReturnType<typeof toolContract<"verify_reconstruction">>,
 ): void => {
@@ -237,10 +245,12 @@ const registerReconstruction = (
       const computed = await runDerivedOperation(context, contract.name, () =>
         verifyReconstruction(input.specification, owned),
       );
-      if (!computed.ok) return toCallToolResult(computed, contract);
+      if (!computed.ok)
+        return server.delivery.toCallToolResult(computed, contract);
       const result = computed.value;
       const closure = evidenceClosure(session, result.evidence_links);
-      if (!closure.ok) return toCallToolResult(closure, contract);
+      if (!closure.ok)
+        return server.delivery.toCallToolResult(closure, contract);
       const links = closure.value;
       const evidence = createEvidence(undefined, RECONSTRUCTION_PROVIDER, {
         predicateType: "rea.reconstruction-verification",
@@ -255,7 +265,9 @@ const registerReconstruction = (
         limitations: result.limitations,
         evidenceLinks: links,
       });
-      return toCallToolResult(
+      return server.delivery.toEvidenceToolResult(
+        evidence,
+        contract,
         recordWorkflowEvidence(session, evidence, result.status === "unknown", {
           question: "Does the reconstruction satisfy every declared claim?",
           domain: "reconstruction-verification",
@@ -266,7 +278,6 @@ const registerReconstruction = (
             rationale,
           })),
         }),
-        contract,
       );
     },
   );

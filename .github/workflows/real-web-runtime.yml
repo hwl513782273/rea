@@ -1,40 +1,15 @@
 name: Real website runtime attribution
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/real-web-runtime.yml"
-      - "scripts/verify-browser-runtime.mjs"
-      - "scripts/lib/browser-runtime-*.mjs"
-      - "src/process/ProviderProcess.ts"
-      - "src/process/ProcessOwnership*.ts"
-      - "scripts/fixtures/browser-runtime-site.mjs"
-      - "src/browser/execution/**"
-      - "src/browser/CdpConnection.ts"
-      - "src/browser/CdpEndpoint.ts"
-      - "src/browser/CdpTarget*.ts"
-      - "src/browser/CdpCaptureValues.ts"
-      - "src/browser/CdpAuthorized*.ts"
-      - "src/domain/webRuntime.ts"
-      - "src/domain/webExecution.ts"
-      - "src/domain/webEventListeners.ts"
-      - "src/domain/browserObservationError*.ts"
-      - "src/application/WebRuntime*.ts"
-      - "src/composition/webRuntime.ts"
-      - "src/contracts/webRuntimeToolContracts.ts"
-      - "src/contracts/toolEffects.ts"
-      - "src/server/registerWebRuntimeTools.ts"
-      - "src/server/createServer.ts"
-      - "src/cli/webRuntimeCommands.ts"
-      - "src/cli/commandCancellation.ts"
-      - "src/cli.ts"
-      - "package.json"
-      - "package-lock.json"
+  workflow_call:
+    inputs:
+      build_cache_artifact:
+        description: Portable build cache artifact from the calling CI run.
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: real-web-runtime-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   HUSKY: "0"
 jobs:
@@ -42,13 +17,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
-          cache: npm
+          node-version-file: .nvmrc
+      - name: Cache npm package downloads
+        id: npm-cache
+        uses: ./.github/actions/npm-cache
       - run: npm ci
-      - run: npm run verify:browser:runtime
+      - uses: ./.github/actions/portable-build-cache
+        with:
+          build_cache_artifact: ${{ inputs.build_cache_artifact }}
+      - run: env -u DBUS_SESSION_BUS_ADDRESS npm run verify:browser:runtime
         env:
           REA_BROWSER_EXECUTABLE: /usr/bin/google-chrome
           REA_BROWSER_NO_SANDBOX: "true"

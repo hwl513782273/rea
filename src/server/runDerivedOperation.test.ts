@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { runDerivedOperation } from "./runDerivedOperation.js";
+import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
 
 const context = (
   controller: AbortController,
@@ -66,8 +67,10 @@ describe("derived MCP operation boundary", () => {
     );
 
     expect(result).toEqual({ ok: true, value: "complete" });
-    expect(notifications.map(({ params }) => params?.progress)).toEqual([0, 2]);
-    expect(notifications.every(({ params }) => params?.total === 2)).toBe(true);
+    expect(notifications.map(({ params }) => params?.progress)).toEqual([1, 2]);
+    expect(
+      notifications.every(({ params }) => params?.total === undefined),
+    ).toBe(true);
   });
 
   it("projects synchronous computation failures into a typed result", async () => {
@@ -84,7 +87,28 @@ describe("derived MCP operation boundary", () => {
       error: {
         _tag: "AnalysisInputError",
         operation: "compare_artifacts",
+        issues: [
+          {
+            path: [],
+            reason: "invalid_value",
+            message: "malformed comparison evidence",
+          },
+        ],
       },
     });
+  });
+
+  it("preserves a tagged integrity failure instead of replacing it with invalid input", async () => {
+    const failure = new EvidenceIntegrityError(
+      "Source Evidence does not match its digest",
+    );
+    const result = await runDerivedOperation(
+      context(new AbortController()),
+      "compare_artifacts",
+      () => {
+        throw failure;
+      },
+    );
+    expect(result).toEqual({ ok: false, error: failure });
   });
 });

@@ -1,6 +1,12 @@
 import { z } from "zod";
+import { isAbsolute } from "node:path";
 
-const pathInputSchema = z.string().trim().min(1);
+import { localPathStringSchema } from "../localPath.js";
+
+const pathInputSchema = localPathStringSchema.refine(isAbsolute, {
+  message:
+    "Electron executable, application, and root paths must be absolute local filesystem paths (for example /Applications/Electron.app/Contents/MacOS/Electron)",
+});
 const absolutePathSchema = z
   .string()
   .min(1)
@@ -60,68 +66,34 @@ const actionSchema = z.discriminatedUnion("kind", [
 
 /** Input for one explicit, provider-owned Electron runtime experiment. */
 export const electronActiveObservationInputSchema = z.strictObject({
-  executable_path: pathInputSchema,
-  application_path: pathInputSchema,
-  application_root: pathInputSchema.optional(),
-  args: z.array(z.string()).default([]),
+  executable_path: pathInputSchema.describe(
+    "Absolute local filesystem path for the Electron executable; relative paths are rejected.",
+  ),
+  application_path: pathInputSchema.describe(
+    "Absolute local filesystem path for the Electron application; relative paths are rejected.",
+  ),
+  application_root: pathInputSchema
+    .optional()
+    .describe(
+      "Absolute local filesystem root for application-relative paths; omit to derive it from the application path. Relative paths are rejected.",
+    ),
+  args: z
+    .array(
+      z
+        .string()
+        .regex(/^[^\x00]*$/u, "Electron arguments must not contain NUL"),
+    )
+    .default([]),
   actions: z.array(actionSchema).default([]),
 });
 export type ElectronActiveObservationInput = z.infer<
   typeof electronActiveObservationInputSchema
 >;
 
-const ipcEventSchema = z.strictObject({
+/** Canonical active Electron event shared by the hook boundary and public timeline. */
+export const electronActiveTimelineEventSchema = z.strictObject({
   sequence: z.number().int().min(1),
-  correlation_id: z.string().nullable().default(null),
-  kind: z.enum([
-    "main-handler-invocation",
-    "main-event-invocation",
-    "utility-process-fork",
-    "utility-process-message",
-    "ipc-main-to-renderer",
-    "ipc-utility-to-main",
-    "ipc-renderer-send",
-    "ipc-renderer-invoke",
-    "ipc-renderer-post-message",
-  ]),
-  event: z.string().nullable().optional(),
-  phase: z
-    .enum(["attempted", "completed", "blocked", "failed", "observed"])
-    .nullable()
-    .optional(),
-  channel: z.string().nullable(),
-  direction: z
-    .enum([
-      "renderer-to-main",
-      "main-to-renderer",
-      "main-to-utility",
-      "utility-to-main",
-    ])
-    .nullable()
-    .optional(),
-  sender: z.string().nullable().optional(),
-  receiver: z.string().nullable().optional(),
-  frame: z.string().nullable().default(null),
-  target: z.string().nullable().optional(),
-  argument_shapes: z.array(z.string()),
-  result_shape: z.string().nullable(),
-  process_type: z.string().nullable(),
-  source: z.string().default("electron-active-hook"),
-  capture_method: z
-    .enum(["api-wrapper", "event-emitter", "process-hook"])
-    .default("api-wrapper"),
-  artifact_path: z.string().nullable().default(null),
-  artifact_sha256: z
-    .string()
-    .regex(/^[a-f0-9]{64}$/u)
-    .nullable()
-    .default(null),
-  error: z.boolean(),
-});
-
-const timelineEventSchema = z.strictObject({
-  sequence: z.number().int().min(1),
-  correlation_id: z.string().nullable().default(null),
+  correlation_id: z.string().nullable(),
   kind: z.enum([
     "main-handler-invocation",
     "main-event-invocation",
@@ -173,6 +145,20 @@ const timelineEventSchema = z.strictObject({
     .regex(/^[a-f0-9]{64}$/u)
     .nullable(),
   error: z.boolean(),
+});
+
+const ipcEventSchema = electronActiveTimelineEventSchema.extend({
+  kind: z.enum([
+    "main-handler-invocation",
+    "main-event-invocation",
+    "utility-process-fork",
+    "utility-process-message",
+    "ipc-main-to-renderer",
+    "ipc-utility-to-main",
+    "ipc-renderer-send",
+    "ipc-renderer-invoke",
+    "ipc-renderer-post-message",
+  ]),
 });
 
 const processMetricSchema = z.strictObject({
@@ -249,22 +235,52 @@ export const electronActiveObservationResultSchema = z.strictObject({
   ipc: z.strictObject({
     events: z.array(ipcEventSchema),
     observed: z.number().int().min(0),
+    dropped: z.number().int().min(0),
   }),
-  timeline: z
-    .strictObject({
-      events: z.array(timelineEventSchema),
-      observed: z.number().int().min(0),
-    })
-    .default({ events: [], observed: 0 }),
-  coverage: coverageSchema.default({
-    status: "partial_attach",
-    observed_event_families: [],
-    unavailable_event_families: [],
-    observed_roles: [],
-    pre_capture_activity: "unavailable",
+  timeline: z.strictObject({
+    events: z.array(electronActiveTimelineEventSchema),
+    observed: z.number().int().min(0),
+    dropped: z.number().int().min(0),
   }),
+  retention: z.strictObject({
+    budget_bytes: z.number().int().min(0),
+    estimated_retained_bytes: z.number().int().min(0),
+    event_serialized_byte_upper_bound: z.number().int().min(0),
+    retained: z.number().int().min(0),
+    dropped: z.number().int().min(0),
+    dropped_event_families: z.array(
+      z.strictObject({
+        family: z.string().min(1),
+        count: z.number().int().min(1),
+      }),
+    ),
+    dropped_event_roles: z.array(
+      z.strictObject({
+        role: z.string().min(1),
+        count: z.number().int().min(1),
+      }),
+    ),
+    observed_ipc: z.number().int().min(0),
+    dropped_ipc: z.number().int().min(0),
+    observed_runtime: z.number().int().min(0),
+    dropped_runtime: z.number().int().min(0),
+  }),
+  coverage: coverageSchema,
   limitations: z.array(z.string()),
 });
 export type ElectronActiveObservationResult = z.infer<
   typeof electronActiveObservationResultSchema
 >;
+
+/** Observations collected before an Electron capture failed its cleanup boundary. */
+export interface ElectronActivePartialObservation {
+  readonly kind: "electron-active-observation";
+  readonly capture: Omit<ElectronActiveObservationResult, "application"> & {
+    readonly application: Omit<
+      ElectronActiveObservationResult["application"],
+      "cleanup"
+    > & {
+      readonly cleanup: "unverified" | "terminated-owned-process";
+    };
+  };
+}

@@ -1,6 +1,13 @@
 import { z } from "zod";
 
 import type { ToolContract } from "./toolContractTypes.js";
+import { advertisedInputExamples } from "./advertisedInputExamples.js";
+import {
+  advertisedReferenceExpansionBudget,
+  inputSchemaWithinReferenceExpansionBudget,
+  presentInputJsonSchema,
+} from "./inputSchemaPresentation.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 
 const PROPERTY_DESCRIPTIONS: Readonly<Record<string, string>> = {
   addresses: "Ordered provider-normalized procedure addresses to analyze.",
@@ -47,69 +54,195 @@ const PROPERTY_DESCRIPTIONS: Readonly<Record<string, string>> = {
   unknown_id: "Exact residual-unknown identifier.",
 };
 
+type JsonSchemaProjection = z.ZodType["~standard"]["jsonSchema"]["input"];
+
 /** Attach caller guidance to a canonical schema for the SDK wire projection. */
 export const toolInputSchemaWithMetadata = <Contract extends ToolContract>(
   contract: Contract,
-): Contract["inputSchema"] => {
-  const schema = contract.inputSchema.meta(
-    z.globalRegistry.get(contract.inputSchema) ?? {},
+): Contract["inputSchema"] =>
+  withAdvertisedJsonSchema(
+    contract.inputSchema,
+    "input",
+    (project) => (options) => {
+      const shared = project({
+        ...options,
+        libraryOptions: { reused: "ref", ...options.libraryOptions },
+      });
+      const examples = advertisedInputExamples(contract);
+      return {
+        // Sharing definitions only helps clients that resolve them. A client
+        // rendering declarations from a shared expansion budget degrades
+        // every reference past it to `unknown`, so an input whose shared form
+        // exceeds the budget is re-projected without shared definitions.
+        ...inputSchemaWithinReferenceExpansionBudget(
+          presentInputJsonSchema(shared, fallbackPropertyDescription),
+          () =>
+            presentInputJsonSchema(
+              project({
+                ...options,
+                libraryOptions: {
+                  ...options.libraryOptions,
+                  reused: "inline",
+                },
+              }),
+              fallbackPropertyDescription,
+            ),
+          advertisedReferenceExpansionBudget,
+        ),
+        ...(examples.length === 0 ? {} : { examples }),
+      };
+    },
   );
-  const standard = schema["~standard"];
-  const inputJsonSchema = standard.jsonSchema?.input;
-  if (inputJsonSchema === undefined)
-    throw new TypeError(
-      "Tool input schema does not expose Standard JSON Schema",
-    );
 
+/** Return the same complete input JSON Schema projection registered on MCP. */
+export const advertisedInputJsonSchema = <Contract extends ToolContract>(
+  contract: Contract,
+): Record<string, unknown> =>
+  toolInputSchemaWithMetadata(contract)["~standard"].jsonSchema.input({
+    target: "draft-2020-12",
+  }) as Record<string, unknown>;
+
+/** Share output definitions and content-bound validator identities on the wire. */
+export const toolOutputSchemaWithMetadata = <Contract extends ToolContract>(
+  contract: Contract,
+): Contract["outputSchema"] =>
+  withAdvertisedJsonSchema(
+    contract.outputSchema,
+    "output",
+    (project) => (options) => {
+      const shared = project({
+        ...options,
+        libraryOptions: { reused: "ref", ...options.libraryOptions },
+      });
+      // An explicit ID owns the reference base. Relative external references
+      // also depend on that base, so leave those projections unchanged.
+      if ("$id" in shared || hasRelativeSchemaReference(shared)) return shared;
+      return {
+        ...shared,
+        $id: `urn:rea:tool-output:sha256:${digestCanonicalValue(
+          { target: options.target, schema: shared },
+          "Tool output schema",
+        )}`,
+      };
+    },
+  );
+
+/**
+ * Apply a wire-presentation transform to one schema's advertised input
+ * projection. The wrapper preserves the schema's own parser and standard
+ * metadata, so both Zod registrations and plain standard schemas keep their
+ * canonical validation while only the advertised JSON changes.
+ */
+export const transformAdvertisedInputJsonSchema = <Schema>(
+  schema: Schema,
+  transform: (projected: Record<string, unknown>) => Record<string, unknown>,
+): Schema => {
+  const standard = Reflect.get(schema as object, "~standard");
+  if (!isSchemaRecord(standard)) return schema;
+  const jsonSchema = Reflect.get(standard, "jsonSchema");
+  if (!isSchemaRecord(jsonSchema)) return schema;
+  const project = Reflect.get(jsonSchema, "input");
+  if (typeof project !== "function") return schema;
+  const byTarget = new Map<string, Record<string, unknown>>();
+  const transformedInput = (options: unknown): unknown => {
+    const target = Reflect.get(options as object, "target");
+    if (typeof target === "string") {
+      const cached = byTarget.get(target);
+      if (cached !== undefined) return cached;
+    }
+    const projected = (project as (options: unknown) => unknown)(options);
+    const transformed = isSchemaRecord(projected)
+      ? transform(projected)
+      : projected;
+    if (typeof target === "string" && isSchemaRecord(transformed))
+      byTarget.set(target, transformed);
+    return transformed;
+  };
+  return {
+    ...(schema as object),
+    "~standard": {
+      ...standard,
+      jsonSchema: { ...jsonSchema, input: transformedInput },
+    },
+  } as Schema;
+};
+
+const hasRelativeSchemaReference = (
+  schema: Record<string, unknown>,
+): boolean => {
+  const pending: unknown[] = [schema];
+  const visited = new WeakSet<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === null || typeof current !== "object" || visited.has(current))
+      continue;
+    visited.add(current);
+    for (const [key, value] of Object.entries(current)) {
+      if (
+        ["$id", "$ref", "$dynamicRef", "$recursiveRef"].includes(key) &&
+        typeof value === "string" &&
+        !value.startsWith("#") &&
+        !URL.canParse(value)
+      )
+        return true;
+      if (value !== null && typeof value === "object") pending.push(value);
+    }
+  }
+  return false;
+};
+
+const withAdvertisedJsonSchema = <Schema extends z.ZodType>(
+  canonical: Schema,
+  io: "input" | "output",
+  advertise: (project: JsonSchemaProjection) => JsonSchemaProjection = (
+    project,
+  ) => project,
+): Schema => {
   // Zod's input projection drops root metadata when a descendant transforms.
   // Preserve the parser and let the SDK own conversion of everything else.
+  const schema = canonical.meta(z.globalRegistry.get(canonical) ?? {});
+  const standard = schema["~standard"];
+  const project = standard.jsonSchema?.[io];
+  if (project === undefined)
+    throw new TypeError(
+      `Tool ${io} schema does not expose Standard JSON Schema`,
+    );
   Object.defineProperty(schema, "~standard", {
     value: {
       ...standard,
       jsonSchema: {
         ...standard.jsonSchema,
-        input: (options: Parameters<typeof inputJsonSchema>[0]) => ({
-          ...describeProperties(inputJsonSchema(options)),
-          examples: contract.examples.map(({ input }) => input),
-        }),
+        [io]: memoizeByTarget(advertise(project)),
       },
     },
   });
   return schema;
 };
 
-const describeProperties = (
-  value: Readonly<Record<string, unknown>>,
-): Record<string, unknown> =>
-  Object.fromEntries(
-    Object.entries(value).map(([key, child]) => {
-      if (key !== "properties" || !isObject(child))
-        return [key, describeValue(child)];
-      return [
-        key,
-        Object.fromEntries(
-          Object.entries(child).map(([property, propertySchema]) => [
-            property,
-            isObject(propertySchema) &&
-            typeof propertySchema.description !== "string"
-              ? {
-                  ...describeProperties(propertySchema),
-                  description: fallbackPropertyDescription(property),
-                }
-              : describeValue(propertySchema),
-          ]),
-        ),
-      ];
-    }),
-  );
-
-const describeValue = (value: unknown): unknown => {
-  if (Array.isArray(value)) return value.map(describeValue);
-  return isObject(value) ? describeProperties(value) : value;
+// The SDK reconverts every registered schema on each `tools/list`, although a
+// registered contract cannot change. Like the SDK's own memoized output
+// projection, the advertised value is shared and treated as read-only.
+const memoizeByTarget = (
+  project: JsonSchemaProjection,
+): JsonSchemaProjection => {
+  const byTarget = new Map<string, Record<string, unknown>>();
+  return (options) => {
+    if (options.libraryOptions !== undefined) return project(options);
+    const cached = byTarget.get(options.target);
+    if (cached !== undefined) return cached;
+    const projected = project(options);
+    byTarget.set(options.target, projected);
+    return projected;
+  };
 };
 
-const fallbackPropertyDescription = (property: string): string => {
-  const explicit = PROPERTY_DESCRIPTIONS[property];
+const isSchemaRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const fallbackPropertyDescription = (property: string): string | undefined => {
+  const explicit = Object.hasOwn(PROPERTY_DESCRIPTIONS, property)
+    ? PROPERTY_DESCRIPTIONS[property]
+    : undefined;
   if (explicit !== undefined) return explicit;
   const words = property.replaceAll("_", " ");
   if (property.startsWith("max_"))
@@ -134,8 +267,6 @@ const fallbackPropertyDescription = (property: string): string => {
     return `Local filesystem ${words} selected for this operation.`;
   if (property.startsWith("is_") || property.startsWith("has_"))
     return `Whether ${words}.`;
-  return `Value for ${words}.`;
+  // A generic sentence would only restate the property name in every schema.
+  return undefined;
 };
-
-const isObject = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);

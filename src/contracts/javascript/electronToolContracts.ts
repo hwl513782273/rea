@@ -1,6 +1,8 @@
-import type { ToolContract } from "../toolContracts.js";
+import type { ToolContract } from "../toolContractTypes.js";
 import { toolContractMetadata } from "../toolEffects.js";
-import { evidenceResultOf } from "../toolOutputSchemas.js";
+import { electronFuseOutputSchemas } from "../toolOutputSchemaGroups.js";
+import { evidenceResultOf } from "../toolOutputSchemaPrimitives.js";
+import { inspectElectronFusesInputSchema } from "../../domain/electron/electronFuses.js";
 import {
   electronPageInspectionSchema,
   electronTargetListSchema,
@@ -11,6 +13,11 @@ import {
   electronActiveObservationInputSchema,
   electronActiveObservationResultSchema,
 } from "../../domain/javascript/electronActiveObservation.js";
+import { javascriptApplicationSummaryViewResultSchema } from "../../domain/analysisView/analysisView.js";
+import {
+  analysisDetailOutputSchemaOf,
+  analysisDetailSchema,
+} from "../analysisDetail.js";
 import {
   analyzeJavaScriptApplicationInputSchema,
   javascriptApplicationAnalysisResultSchema,
@@ -23,8 +30,14 @@ import { JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE } from "./javascriptRuntimeRe
 
 const listOutputSchema = evidenceResultOf(electronTargetListSchema);
 const inspectionOutputSchema = evidenceResultOf(electronPageInspectionSchema);
-const applicationOutputSchema = evidenceResultOf(
+/** Caller-selected delivery of a completed JavaScript application analysis. */
+export const analyzeJavaScriptApplicationRequestSchema =
+  analyzeJavaScriptApplicationInputSchema.extend({
+    detail: analysisDetailSchema,
+  });
+const applicationOutputSchema = analysisDetailOutputSchemaOf(
   javascriptApplicationAnalysisResultSchema,
+  javascriptApplicationSummaryViewResultSchema,
 );
 const reconciliationOutputSchema = evidenceResultOf(
   javascriptRuntimeReconciliationResultSchema,
@@ -79,9 +92,9 @@ export const ELECTRON_TOOL_CONTRACTS = [
     name: "analyze_javascript_application",
     ...toolContractMetadata("analyze_javascript_application"),
     description:
-      "Reconstruct one local ASAR or extracted JavaScript application as an inline application graph without executing it. Returns all recovered graph nodes, edges, semantic relations, limitations, and coverage.",
+      "Reconstruct one local ASAR or extracted JavaScript application as an inline application graph without executing it. Returns recovered graph nodes, edges, semantic relations, integrity contradictions, limitations, and coverage. Select source_paths to acquire and analyze only exact inventoried file paths; the complete artifact inventory and identity remain intact, and unselected sources remain explicit unknowns. Dependencies are not implicitly analyzed. Select detail summary to retain the complete analysis Evidence in this session and receive only its summary view, then inspect selected modules or pages with inspect_analysis_view. Summary detail reduces delivery, whereas source_paths bounds source analysis. Integrity mismatches fail by default; record-and-continue retains observed bytes as untrusted and marks graph coverage partial.",
     kind: "electron-provider",
-    inputSchema: analyzeJavaScriptApplicationInputSchema,
+    inputSchema: analyzeJavaScriptApplicationRequestSchema,
     outputSchema: applicationOutputSchema,
     examples: [
       {
@@ -89,6 +102,22 @@ export const ELECTRON_TOOL_CONTRACTS = [
         input: {
           input_path: "/Applications/Example.app/Contents/Resources/app.asar",
           format: "auto",
+          integrity_policy: "fail",
+        },
+      },
+      {
+        title: "Analyze selected entry sources before unrelated vendor files",
+        input: {
+          input_path: "/Applications/Example.app/Contents/Resources/app.asar",
+          source_paths: ["package.json", "main.js", "preload.js"],
+          detail: "summary",
+        },
+      },
+      {
+        title: "Retain the complete analysis and return its summary view",
+        input: {
+          input_path: "/Applications/Example.app/Contents/Resources/app.asar",
+          detail: "summary",
         },
       },
     ],
@@ -112,12 +141,27 @@ export const ELECTRON_TOOL_CONTRACTS = [
     name: "capture_electron_scenario",
     ...toolContractMetadata("capture_electron_scenario"),
     description:
-      "Use this for a provider-owned Electron run when passive CDP or Inspector observation cannot exercise application behavior. REA owns startup and teardown, accepts caller-defined click/wait actions plus window-targeted renderer reload/crash and synthetic open-url/second-instance delivery, and returns correlated window/WebContents/process/preload/session/navigation/shell/IPC evidence without retaining payload values. Results identify observed and unavailable event families, coverage status, action targets, and truncation. External shell, navigation, permission, download, popup, updater, and OS-integration effects are blocked and recorded. Use passive Electron tools for observation-only work.",
+      "Use this for a provider-owned Electron run when passive CDP or Inspector observation cannot exercise application behavior. REA owns startup and teardown, accepts caller-defined click/wait actions plus window-targeted renderer reload/crash and synthetic open-url/second-instance delivery, and returns correlated window/WebContents/process/preload/session/navigation/shell/IPC evidence without retaining payload values. Actions wait for completion or request cancellation; a missing click target can keep the request pending. Results identify observed and unavailable event families, coverage status, action targets, and truncation. Cleanup failures retain collected observations with explicit cleanup uncertainty. External shell, navigation, permission, download, popup, updater, and OS-integration effects are blocked and recorded. Use passive Electron tools for observation-only work.",
     kind: "electron-provider",
     inputSchema: electronActiveObservationInputSchema,
     outputSchema: evidenceResultOf(electronActiveObservationResultSchema),
     examples: [
       { title: "Exercise an owned Electron application", input: activeExample },
+    ],
+  },
+  {
+    name: "inspect_electron_fuses",
+    ...toolContractMetadata("inspect_electron_fuses"),
+    kind: "artifact-provider",
+    description:
+      "Inspect packaged Electron fuse bytes in one local macOS app bundle, Electron Framework binary, Windows PE executable, or Linux ELF executable. Returns the artifact digest, per-slice wire version, fuse index, version-1 name, state, and raw byte, plus derived implications for Inspector flags, ELECTRON_RUN_AS_NODE, embedded ASAR integrity, and app.asar-only loading. A missing sentinel is unknown fuse state. Reads artifact bytes only and does not modify the selected file or open a runtime target.",
+    inputSchema: inspectElectronFusesInputSchema,
+    outputSchema: electronFuseOutputSchemas.inspect_electron_fuses,
+    examples: [
+      {
+        title: "Read packaged Electron fuse state",
+        input: { path: "/Applications/Example.app" },
+      },
     ],
   },
 ] as const satisfies readonly ToolContract[];

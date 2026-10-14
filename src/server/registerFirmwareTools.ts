@@ -1,35 +1,27 @@
-import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
-import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import type { FirmwareAnalysisService } from "../application/firmware/FirmwareAnalysisService.js";
 import { toolContract } from "../contracts/toolContracts.js";
-import type { ToolContract } from "../contracts/toolContractTypes.js";
-import type { FirmwareOperation } from "../domain/firmware/firmwareAnalysis.js";
-import type { Logger } from "../logger.js";
-import { logToolExecution } from "./toolLogging.js";
+import type { Logger } from "pino";
+import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
+import { createContractToolHandler } from "./contractToolHandler.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { toCallToolResult } from "./toolResult.js";
 
 /** Bind firmware handlers to their exact named schemas. */
 export const registerFirmwareTools = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   service: FirmwareAnalysisService,
   logger: Logger,
   recordEvidence?: EvidenceWriter["recordEvidence"],
+  withAdmittedAnalysis?: WithAdmittedAnalysis,
 ): void => {
-  const handler =
-    (contract: ToolContract<FirmwareOperation>) =>
-    async (input: unknown, context: ServerContext) => {
-      const result = await logToolExecution(logger, contract.name, () =>
-        service.execute(contract.name, input, {
-          signal: context.mcpReq.signal,
-        }),
-      );
-      if (!result.ok) return toCallToolResult(result, contract);
-      const recorded = recordEvidence?.(result.value);
-      return recorded !== undefined && !recorded.ok
-        ? toCallToolResult(recorded, contract)
-        : toCallToolResult(result, contract);
-    };
+  const handler = createContractToolHandler(
+    server,
+    service,
+    logger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
   const inspect = toolContract("inspect_firmware_regions");
   server.registerTool(
     inspect.name,

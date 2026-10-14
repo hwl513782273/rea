@@ -1,13 +1,19 @@
 import type {
-  BrowserScenarioCapture,
   BrowserScenarioCompleteness,
   BrowserScenarioCompletenessSection,
   BrowserScenarioStep,
   BrowserStepArtifacts,
-} from "./browserScenarioCapture.js";
+} from "./browserScenarioCaptureValues.js";
+import type { BrowserScenarioCapture } from "./browserScenarioCapture.js";
+import {
+  fingerprintScenarioNetworkTransactions,
+  scenarioNetworkTransactions,
+  scenarioNetworkCoverageReason,
+} from "./browserScenarioNetworkComparison.js";
 import type {
   BrowserScenarioArtifactKind,
   BrowserScenarioEvidenceState,
+  BrowserScenarioNormalizationRule,
 } from "./browserScenarioDiffValues.js";
 
 /** Capture-state input consumed by browser scenario artifact comparison. */
@@ -94,26 +100,48 @@ export const actionState = (step: BrowserScenarioStep) => ({
   error: step.error,
 });
 
-/** Select events attributed to one scenario step without sequence metadata. */
-export const eventsFor = (
+/** One step's ordered events and a single indexed network graph. */
+export interface ScenarioStepEvents {
+  readonly events: readonly unknown[];
+  readonly network_transactions: readonly string[];
+}
+
+/** Build one graph and fingerprint index per capture, then select in linear total work. */
+export const prepareScenarioEvents = (
   capture: BrowserScenarioCapture,
-  stepIndex: number,
-): readonly unknown[] => {
-  const sourceSteps = new Map(
-    capture.events.items.map(({ sequence, step_index }) => [
-      sequence,
-      step_index,
-    ]),
-  );
-  return capture.events.items.flatMap<unknown>(
-    ({ sequence: _sequence, step_index: eventStepIndex, ...event }) => {
-      if (event.kind === "network-content") {
-        const { source_event_sequence: sourceSequence, ...content } = event;
-        return sourceSteps.get(sourceSequence) === stepIndex ? [content] : [];
-      }
-      return eventStepIndex === stepIndex ? [event] : [];
-    },
-  );
+  rules: readonly BrowserScenarioNormalizationRule[],
+): {
+  readonly coverageReason: string | undefined;
+  readonly forStep: (stepIndex: number) => ScenarioStepEvents;
+} => {
+  const eventsByStep = new Map<number, unknown[]>();
+  for (const { sequence: _sequence, step_index, ...event } of capture.events
+    .items) {
+    if ("transaction_id" in event) continue;
+    const events = eventsByStep.get(step_index) ?? [];
+    events.push(event);
+    eventsByStep.set(step_index, events);
+  }
+  const nodes = scenarioNetworkTransactions(capture);
+  const fingerprints = fingerprintScenarioNetworkTransactions(nodes, rules);
+  const networkByStep = new Map<number, string[]>();
+  for (const [index, node] of nodes.entries()) {
+    const step = networkByStep.get(node.step_index) ?? [];
+    const fingerprint = fingerprints[index];
+    if (fingerprint === undefined)
+      throw new Error("Network comparison node has no fingerprint");
+    step.push(fingerprint);
+    networkByStep.set(node.step_index, step);
+  }
+  for (const fingerprintsForStep of networkByStep.values())
+    fingerprintsForStep.sort();
+  return {
+    coverageReason: scenarioNetworkCoverageReason(capture, nodes),
+    forStep: (stepIndex) => ({
+      events: eventsByStep.get(stepIndex) ?? [],
+      network_transactions: networkByStep.get(stepIndex) ?? [],
+    }),
+  };
 };
 
 /** Different content selection is missing comparability, not an observed website change. */
@@ -123,29 +151,32 @@ export const networkContentCoverageReason = (
 ): string | undefined => {
   const left = before.scenario.network_content;
   const right = after.scenario.network_content;
-  if (left === undefined || right === undefined) {
-    const events = [...before.events.items, ...after.events.items];
-    if (
-      events.some((event) => event.kind === "network-content") ||
-      ((left === undefined) !== (right === undefined) &&
-        events.some(
-          (event) =>
-            event.kind === "request" ||
-            event.kind === "response" ||
-            event.kind === "request-failed" ||
-            event.kind === "request-finished" ||
-            event.kind === "request-unfinished",
-        ))
-    )
-      return "Network content selection is unknown in a legacy capture; capture both sides with matching content selection.";
-    return undefined;
-  }
   return left.request_body !== right.request_body ||
     left.response_body !== right.response_body ||
     left.header_values !== right.header_values
     ? "Network content selections differ; capture both sides with matching content selection before comparing network evidence."
     : undefined;
 };
+
+/** Different or unrecorded event-family selection is missing comparability, not an observed website change. */
+export const eventFamilyCoverageReason = (
+  before: BrowserScenarioCapture,
+  after: BrowserScenarioCapture,
+): string | undefined => {
+  const left = before.scenario.event_families;
+  const right = after.scenario.event_families;
+  if (left === undefined || right === undefined)
+    return "Event family selection is unknown in a legacy capture; capture both sides with matching event families before comparing event evidence.";
+  const leftFamilies = new Set(left);
+  const rightFamilies = new Set(right);
+  return leftFamilies.size === rightFamilies.size &&
+    [...leftFamilies].every((family) => rightFamilies.has(family))
+    ? undefined
+    : `Event family selections differ (${familyList(leftFamilies)} before, ${familyList(rightFamilies)} after); capture both sides with matching event families before comparing event evidence.`;
+};
+
+const familyList = (families: ReadonlySet<string>): string =>
+  families.size === 0 ? "none" : [...families].sort().join(", ");
 
 /** Wrap one value as captured comparison evidence. */
 export const captured = <Value>(value: Value): CaptureState<Value> => ({

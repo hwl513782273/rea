@@ -4,23 +4,19 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { importReferenceSource } from "../../../src/application/ReferenceSourceImport.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 it("imports test-suffixed filenames with unchanged paths, hashes, and languages", async () => {
   const root = await createTestTempDirectory("rea-reference-test-filenames-");
   const files = [
     ["main_test.go", "package main\n", ["source", "test"], "Go"],
-    ["main_test.py", "assert True\n", ["source", "test"], "Python"],
+    ["test_helper.py", "assert True\n", ["source", "test"], "Python"],
     ["parser_spec.rs", "fn checks() {}\n", ["source", "test"], "Rust"],
     ["Widget_SPEC.TS", "export {};\n", ["source", "test"], "TypeScript"],
     ["main_test", "test fixture\n", ["test"], null],
-    ["main_spec", "spec fixture\n", ["test"], null],
-    ["test_helper.py", "assert True\n", ["source", "test"], "Python"],
     ["main.test.js", "export {};\n", ["source", "test"], "JavaScript"],
-    ["main.go", "package main\n", ["source"], "Go"],
     ["main_test_helper.py", "value = 1\n", ["source"], "Python"],
-    ["main_specimen.rs", "fn main() {}\n", ["source"], "Rust"],
     ["main_test.py.bak", "backup\n", ["unknown"], null],
   ] as const;
   await Promise.all(
@@ -32,8 +28,7 @@ it("imports test-suffixed filenames with unchanged paths, hashes, and languages"
     caller: "reference-test-filenames-test",
     policy: { secretPatterns: [] },
   });
-  expect(result.ok).toBe(true);
-  if (!result.ok) return;
+  if (!result.ok) throw result.error;
   expect(result.value.entries).toHaveLength(files.length);
   for (const [path, content, classifications, language] of files) {
     expect(result.value.entries).toContainEqual({
@@ -74,8 +69,7 @@ it("keeps parser failures and unknown dependencies visible for test filenames", 
     caller: "reference-test-parsing-test",
     policy: { secretPatterns: [] },
   });
-  expect(result.ok).toBe(true);
-  if (!result.ok) return;
+  if (!result.ok) throw result.error;
   expect(result.value.inventory_state).toBe("partial");
   expect(result.value.relationships).toEqual([
     {

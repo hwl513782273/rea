@@ -1,6 +1,14 @@
 import * as t from "@babel/types";
+import { collectElectronWrappedCallPaths } from "./electronWrappedCallPaths.js";
+import {
+  ELECTRON_IDENTITY_LIMITATION,
+  ELECTRON_MODULE,
+} from "./javascriptElectronMemberWrites.js";
 
-import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
+import {
+  completeSemanticSteps,
+  traverseJavaScriptAstSteps,
+} from "./javascriptSemanticTraversal.js";
 
 import { inspectElectronStaticNode } from "./electronStaticAnalysis.js";
 import {
@@ -16,21 +24,41 @@ import {
   inspectCall,
   inspectRouteProperty,
   inspectRoleProperty,
+  inspectRpcNode,
+  indexVitePreloadDependencyTable,
 } from "./javascriptStaticAnalysisCalls.js";
 import {
   inspectBundlerRegistration,
+  inspectBundlerBootstrap,
   inspectEsbuildWrapper,
 } from "./javascriptStaticAnalysisBundler.js";
 import { finalizeLocatedFindings } from "./javascriptStaticAnalysisFindings.js";
 import {
   createJavaScriptAnalysisAccumulator,
   type JavaScriptAnalysisAccumulator as AnalysisAccumulator,
+  type JavaScriptFindingContext,
 } from "./javascriptStaticAnalysisState.js";
 import type { JavaScriptStaticAnalysis } from "./javascriptStaticAnalysisTypes.js";
+import type { JavaScriptSemanticAnalysisState } from "./javascriptSemanticState.js";
+import {
+  indexJavaScriptElectronIdentitySteps,
+  indexJavaScriptBindingsSteps,
+  classifyParsedJavaScriptRpcClientRootsSteps,
+  classifyParsedJavaScriptOpenReceivers,
+  type JavaScriptOpenReceiverFact,
+} from "./javascriptSemanticAnalysis.js";
 import {
   parseJavaScriptSource,
   type ParsedJavaScriptSource,
 } from "./javascriptSourceParser.js";
+
+import { createJavaScriptRpcScan } from "./javascriptRpcEndpoints.js";
+import { semanticImportEqualsSpecifier } from "./javascriptSemanticProjection.js";
+import {
+  hasUncertainTypeOnlyModuleSideEffect,
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyImportDeclaration,
+} from "./javascriptModuleDeclaration.js";
 
 /** Parse one JavaScript artifact and recover static structure only. */
 export const analyzeJavaScriptStaticSource = (
@@ -39,33 +67,72 @@ export const analyzeJavaScriptStaticSource = (
   const file = parseJavaScriptSource(source);
   return file === null
     ? failedJavaScriptStaticAnalysis()
-    : analyzeParsedJavaScriptStaticSource(source, file);
+    : analyzeParsedJavaScriptStaticSource(
+        source,
+        file,
+        classifyParsedJavaScriptOpenReceivers(file),
+      );
 };
 
 /** Recover static structure from an already parsed JavaScript artifact. */
 export const analyzeParsedJavaScriptStaticSource = (
   source: string,
   file: ParsedJavaScriptSource,
-): JavaScriptStaticAnalysis => {
-  const accumulator = createJavaScriptAnalysisAccumulator();
-  traverseStaticSource(source, file, accumulator);
-  addSourceMapDirectives(source, file.comments ?? [], accumulator);
-  return finalizeStaticAnalysis(source, file, accumulator);
-};
+  openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
+): JavaScriptStaticAnalysis =>
+  completeSemanticSteps(
+    analyzeParsedJavaScriptStaticSourceSteps(source, file, openReceiverFacts),
+  );
 
-const traverseStaticSource = (
+/** Static analysis that yields during its source traversal; results are unchanged. */
+export function* analyzeParsedJavaScriptStaticSourceSteps(
   source: string,
   file: ParsedJavaScriptSource,
-  accumulator: AnalysisAccumulator,
-): void => {
-  traverseJavaScriptAst(file, {
+  openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
+): Generator<void, JavaScriptStaticAnalysis> {
+  const accumulator = createJavaScriptAnalysisAccumulator(source.length);
+  const bindings = yield* indexJavaScriptBindingsSteps(file.program);
+  const electronIdentity = yield* indexJavaScriptElectronIdentitySteps(
+    file.program,
+    bindings,
+  );
+  const clientRoots = yield* classifyParsedJavaScriptRpcClientRootsSteps(file);
+  yield* traverseStaticSourceSteps(
+    file,
+    {
+      source,
+      accumulator,
+      vitePreloadDependencyTable: indexVitePreloadDependencyTable(file.program),
+      ...(openReceiverFacts === undefined ? {} : { openReceiverFacts }),
+      electronBindings: electronIdentity.bindings,
+      rpcScan: createJavaScriptRpcScan(source, clientRoots),
+    },
+    bindings,
+  );
+  accumulator.electronCallPaths = collectElectronWrappedCallPaths(
+    file.program,
+    bindings,
+    source,
+    accumulator,
+    electronIdentity,
+  );
+  addSourceMapDirectives(source, file.comments ?? [], accumulator);
+  return finalizeStaticAnalysis(source, file, accumulator);
+}
+
+function* traverseStaticSourceSteps(
+  file: ParsedJavaScriptSource,
+  findings: JavaScriptFindingContext,
+  bindings: JavaScriptSemanticAnalysisState,
+): Generator<void, void> {
+  yield* traverseJavaScriptAstSteps(file, {
     enter: (node) => {
-      accumulator.visitedNodes += 1;
-      inspectNode(source, node, accumulator);
+      findings.accumulator.visitedNodes += 1;
+      inspectNode(node, findings, bindings);
       return undefined;
     },
   });
-};
+}
 
 const finalizeStaticAnalysis = (
   source: string,
@@ -74,6 +141,16 @@ const finalizeStaticAnalysis = (
 ): JavaScriptStaticAnalysis => {
   const parserErrors = file.errors.length;
   const limitations = [
+    ...(accumulator.electronCallPaths?.length
+      ? [
+          "Bundled Electron call paths use static argument and closure substitutions. Conditions, ambient helper overrides, runtime reachability and arbitrary side effects remain unproven.",
+        ]
+      : []),
+    ...(accumulator.electronCallPathLimitReached
+      ? [
+          "Electron wrapper expansion reached its resource budget (1000000 visits/substitutions or depth 128); additional paths remain unknown.",
+        ]
+      : []),
     ...(parserErrors === 0
       ? []
       : [
@@ -84,6 +161,17 @@ const finalizeStaticAnalysis = (
       : [
           "One or more static keys, expressions, or Electron boundary values were dynamic and remain unknown.",
         ]),
+    ...(hasUncertainTypeOnlyModuleSideEffect(file.program)
+      ? [
+          "Compiler options are unavailable; inline type-only imports or re-exports may preserve a module side-effect dependency.",
+        ]
+      : []),
+    ...(accumulator.references.some(
+      ({ value }) =>
+        value.specifier !== null && ELECTRON_MODULE.test(value.specifier),
+    )
+      ? [ELECTRON_IDENTITY_LIMITATION]
+      : []),
     "JavaScript syntax was parsed as data and was never evaluated.",
   ];
   return {
@@ -95,41 +183,53 @@ const finalizeStaticAnalysis = (
     visited_ast_nodes: accumulator.visitedNodes,
     references: finalizeLocatedFindings(
       accumulator.references,
-      accumulator.modules,
+      accumulator.moduleRangeIndex,
     ),
     endpoints: finalizeLocatedFindings(
       accumulator.endpoints,
-      accumulator.modules,
+      accumulator.moduleRangeIndex,
     ),
-    storage: finalizeLocatedFindings(accumulator.storage, accumulator.modules),
+    storage: finalizeLocatedFindings(
+      accumulator.storage,
+      accumulator.moduleRangeIndex,
+    ),
     bundler_registrations: sortedUnique(
       accumulator.registrations,
       registrationKey,
     ),
-    role_paths: finalizeLocatedFindings(accumulator.roles, accumulator.modules),
+    role_paths: finalizeLocatedFindings(
+      accumulator.roles,
+      accumulator.moduleRangeIndex,
+    ),
     source_map_urls: accumulator.sourceMaps,
     vendors: detectVendors(source),
     electron: {
+      ...(accumulator.electronCallPaths?.length
+        ? { call_paths: accumulator.electronCallPaths }
+        : {}),
       browser_windows: finalizeLocatedFindings(
         accumulator.browserWindows,
-        accumulator.modules,
+        accumulator.moduleRangeIndex,
       ),
       context_bridge_apis: finalizeLocatedFindings(
         accumulator.contextBridgeApis,
-        accumulator.modules,
+        accumulator.moduleRangeIndex,
       ),
-      ipc: finalizeLocatedFindings(accumulator.ipc, accumulator.modules),
+      ipc: finalizeLocatedFindings(
+        accumulator.ipc,
+        accumulator.moduleRangeIndex,
+      ),
       sender_validations: finalizeLocatedFindings(
         accumulator.senderValidations,
-        accumulator.modules,
+        accumulator.moduleRangeIndex,
       ),
       utility_processes: finalizeLocatedFindings(
         accumulator.utilityProcesses,
-        accumulator.modules,
+        accumulator.moduleRangeIndex,
       ),
       native_addon_bindings: finalizeLocatedFindings(
         accumulator.nativeAddonBindings,
-        accumulator.modules,
+        accumulator.moduleRangeIndex,
       ),
     },
     limitations,
@@ -137,30 +237,41 @@ const finalizeStaticAnalysis = (
 };
 
 const inspectNode = (
-  source: string,
   node: t.Node,
-  accumulator: AnalysisAccumulator,
+  findings: JavaScriptFindingContext,
+  bindings: JavaScriptSemanticAnalysisState,
 ): void => {
-  const findings = {
-    source,
-    accumulator,
-  };
+  const { source, accumulator } = findings;
   inspectElectronStaticNode(node, findings);
   if (t.isCallExpression(node)) {
-    inspectBundlerRegistration(source, node, accumulator);
-    inspectEsbuildWrapper(source, node, accumulator);
-    inspectCall(source, node, findings);
-  } else if (t.isNewExpression(node)) inspectCall(source, node, findings);
-  if (
+    inspectBundlerBootstrap(source, node, accumulator, bindings);
+    inspectBundlerRegistration(source, node, accumulator, bindings);
+    inspectEsbuildWrapper(source, node, accumulator, bindings);
+    inspectCall(source, node, findings, bindings);
+  } else if (t.isOptionalCallExpression(node)) {
+    inspectCall(source, node, findings, bindings);
+  } else if (t.isNewExpression(node))
+    inspectCall(source, node, findings, bindings);
+  if (t.isTSImportEqualsDeclaration(node)) {
+    const specifier = semanticImportEqualsSpecifier(node);
+    if (specifier !== null)
+      addReference(findings, { node, kind: "require", specifier });
+  } else if (
     (t.isImportDeclaration(node) || t.isExportAllDeclaration(node)) &&
-    node.source !== undefined
+    node.source !== undefined &&
+    !(t.isImportDeclaration(node) && isTypeOnlyImportDeclaration(node)) &&
+    !(t.isExportAllDeclaration(node) && isTypeOnlyExportDeclaration(node))
   )
     addReference(findings, {
       node,
       kind: "static-import",
       specifier: node.source.value,
     });
-  else if (t.isExportNamedDeclaration(node) && node.source != null)
+  else if (
+    t.isExportNamedDeclaration(node) &&
+    node.source != null &&
+    !isTypeOnlyExportDeclaration(node)
+  )
     addReference(findings, {
       node,
       kind: "static-import",
@@ -176,4 +287,5 @@ const inspectNode = (
     inspectRouteProperty(node, findings);
     inspectRoleProperty(node, findings);
   }
+  inspectRpcNode(node, findings);
 };

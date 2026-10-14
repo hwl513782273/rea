@@ -1,17 +1,23 @@
 import { z } from "zod";
 import { digestSchema } from "../digests.js";
 import { analyzeJavaScriptApplicationInputSchema } from "./javascriptApplicationAnalysis.js";
+import { localPathStringSchema } from "../localPath.js";
 
-/** Recover derived readable modules from one explicitly selected local script. */
+/** Recover derived readable modules from explicitly selected local scripts. */
 export const javascriptRecoveryInputSchema = z.strictObject({
-  path: z
-    .string()
-    .min(1)
-    .describe("Absolute path to a UTF-8 JavaScript file; never executed"),
-  output_directory: z
-    .string()
-    .min(1)
-    .describe("Absolute absent output directory; parent must exist"),
+  path: localPathStringSchema.describe(
+    "Absolute path to a UTF-8 JavaScript file; never executed",
+  ),
+  additional_paths: z
+    .array(localPathStringSchema)
+    .max(16)
+    .optional()
+    .describe(
+      "Additional absolute UTF-8 JavaScript files recovered together with path; each is snapshotted separately so imports can resolve across related chunks. All inputs share a 64 MiB total budget",
+    ),
+  output_directory: localPathStringSchema.describe(
+    "Absolute absent output directory; parent must exist",
+  ),
   extraction_mode: z
     .enum(["structural", "heuristic", "inspection"])
     .default("structural")
@@ -37,12 +43,15 @@ const rangeSchema = z.strictObject({
   end: z.number().int().nonnegative(),
 });
 
+const sourceSchema = fileSchema.extend({
+  snapshot_path: z.string().min(1),
+  published_copy: fileSchema,
+});
+
 /** Complete published artifacts and exact producer provenance for source recovery. */
 export const javascriptRecoveryResultSchema = z.strictObject({
-  source: fileSchema.extend({
-    snapshot_path: z.string().min(1),
-    published_copy: fileSchema,
-  }),
+  source: sourceSchema,
+  additional_sources: z.array(sourceSchema).optional(),
   engine: z.strictObject({
     id: z.string().min(1),
     version: z.string().min(1),
@@ -107,3 +116,9 @@ export type JavaScriptRecoveryInput = z.output<
 export type JavaScriptRecoveryResult = z.output<
   typeof javascriptRecoveryResultSchema
 >;
+
+/** Completed publication retained when cleanup fails after durable commit. */
+export interface JavaScriptRecoveryPartialObservation {
+  readonly kind: "javascript-recovery";
+  readonly result: JavaScriptRecoveryResult;
+}

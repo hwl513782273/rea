@@ -22,6 +22,12 @@ import {
 import { parse as parseJsonc } from "jsonc-parser";
 import { skillReferenceIssues } from "./lib/docs-facts.mjs";
 
+export const terminalModesRestored = (termios) => {
+  if (typeof termios !== "string") return false;
+  const modes = new Set(termios.trim().split(/\s+/u));
+  return modes.has("icanon") && modes.has("echo");
+};
+
 const OPENCODE_ORIGINAL = `{
   // OpenCode preferences must survive setup.
   "model": "provider/model",
@@ -30,6 +36,14 @@ const OPENCODE_ORIGINAL = `{
     "other": { "type": "local", "command": ["node", "other.js"] },
   },
 }\n`;
+
+const CODEX_ORIGINAL = [
+  "# Keep Codex preferences and their spelling.",
+  'model = "gpt-5"',
+  'notify = ["a", "b"]',
+  "literal = 'C:\\demo\\path'",
+  "",
+].join("\n");
 
 const verifyMcpAdd = async ({ cli, environment, npxLog }) => {
   await run(cli, ["mcp", "add"], environment);
@@ -123,8 +137,7 @@ const verifyInteractiveSetup = async ({
         childResult?.status !== 0 ||
         !output.includes("\u001b[?25h") ||
         (process.platform !== "win32" &&
-          (!childResult.termios?.includes("icanon") ||
-            !childResult.termios?.includes("echo"))) ||
+          !terminalModesRestored(childResult.termios)) ||
         !output.includes("No changes were made.")
       ) {
         finish(
@@ -248,7 +261,7 @@ const verifySetupPlan = async ({
       !planned.plannedActions.some(({ kind }) => kind === "configure_client") ||
       !planned.plannedActions.some(({ kind }) => kind === "install_skill") ||
       plannedClaudeConfig !== '{"existing":true}\n' ||
-      plannedCodexConfig !== 'model = "gpt-5"\n' ||
+      plannedCodexConfig !== CODEX_ORIGINAL ||
       plannedCursorConfig !== '{"existing":true}\n' ||
       plannedOpenCodeConfig !== opencodeOriginal
     )
@@ -348,9 +361,8 @@ const verifySetupApply = async ({
   hopperSetupSupported,
 }) => {
   const status = "ready";
-  const hopperStatus = hopperSetupSupported
-    ? "needs_confirmation"
-    : "needs_human";
+  const hopperStatus =
+    hopperSetupSupported === true ? "needs_confirmation" : "needs_human";
   const firstExecution = await runWithStatus(
     cli,
     ["setup", "--yes", "--all-detected", "--json"],
@@ -407,7 +419,8 @@ const verifySetupApply = async ({
   };
 };
 
-const assertClientConfig = async (cli, configPath) => {
+/** Verify the live registration and exact pre-setup backup bytes. */
+export const assertClientConfig = async (cli, configPath, original) => {
   const config = json(await readFile(configPath, "utf8"));
   if (
     config.existing !== true ||
@@ -415,9 +428,7 @@ const assertClientConfig = async (cli, configPath) => {
     JSON.stringify(config.mcpServers?.rea?.args) !== JSON.stringify(["mcp"])
   )
     throw new Error("packaged client readback failed");
-  if (
-    !(await readFile(`${configPath}.rea.backup`, "utf8")).includes("existing")
-  )
+  if (!(await readFile(`${configPath}.rea.backup`)).equals(original))
     throw new Error("packaged client backup failed");
 };
 
@@ -459,10 +470,8 @@ const assertCodexSymlink = async ({
     !codex.includes("[mcp_servers.rea]") ||
     !codex.includes(`command = "${cli}"`) ||
     !codex.includes("startup_timeout_sec = 30") ||
-    (await readFile(`${codexConfig}.rea.backup`, "utf8")) !==
-      'model = "gpt-5"\n' ||
-    (await readFile(`${cursorConfig}.rea.backup`, "utf8")) !==
-      '{"existing":true}\n'
+    !codex.startsWith(CODEX_ORIGINAL) ||
+    (await readFile(`${codexConfig}.rea.backup`, "utf8")) !== CODEX_ORIGINAL
   )
     throw new Error("packaged setup did not preserve config symlinks");
 };
@@ -527,9 +536,11 @@ const verifyConfigReadback = async ({
   siblingSkillPath,
   opencodeConfig,
   opencodeOriginal,
+  claudeOriginal,
+  cursorOriginal,
 }) => {
-  await assertClientConfig(cli, claudeConfig);
-  await assertClientConfig(cli, cursorConfig);
+  await assertClientConfig(cli, claudeConfig, claudeOriginal);
+  await assertClientConfig(cli, cursorConfig, cursorOriginal);
   await assertCodexSymlink({
     cli,
     codexConfig,
@@ -631,7 +642,6 @@ const verifyUninstall = async ({
   codexTarget,
   opencodeConfig,
 }) => {
-  const openCodeBeforeUninstall = await readFile(opencodeConfig, "utf8");
   const uninstallExecution = await runWithStatus(
     cli,
     ["uninstall", "--json"],
@@ -657,7 +667,7 @@ const verifyUninstall = async ({
     !(await lstat(codexConfig)).isSymbolicLink() ||
     cursorAfterUninstall.existing !== true ||
     cursorAfterUninstall.mcpServers?.rea !== undefined ||
-    !codexAfterUninstall.includes('model = "gpt-5"') ||
+    codexAfterUninstall !== CODEX_ORIGINAL ||
     codexAfterUninstall.includes("mcp_servers.rea") ||
     openCodeErrors.length !== 0 ||
     openCodeAfterUninstall?.model !== "provider/model" ||
@@ -670,11 +680,10 @@ const verifyUninstall = async ({
       "Keep this independently managed server",
     ) ||
     (await readFile(`${opencodeConfig}.rea.backup`, "utf8")) !==
-      openCodeBeforeUninstall ||
-    !(await readFile(`${cursorConfig}.rea.backup`, "utf8")).includes('"rea"') ||
-    !(await readFile(`${codexConfig}.rea.backup`, "utf8")).includes(
-      "[mcp_servers.rea]",
-    )
+      OPENCODE_ORIGINAL ||
+    (await readFile(`${cursorConfig}.rea.backup`, "utf8")) !==
+      '{"existing":true}\n' ||
+    (await readFile(`${codexConfig}.rea.backup`, "utf8")) !== CODEX_ORIGINAL
   )
     throw new Error(
       `packaged uninstall did not preserve config symlinks: ${JSON.stringify(uninstall)}`,
@@ -704,6 +713,7 @@ export async function verifyPackageSetup({
   );
   const siblingSkillPath = join(home, ".agents/skills/unrelated/SKILL.md");
   if (supportedSetupHost) {
+    await writeFile(codexTarget, CODEX_ORIGINAL);
     await mkdir(join(home, ".agents/skills/unrelated"), { recursive: true });
     await writeFile(siblingSkillPath, "unrelated skill\n");
   }
@@ -723,6 +733,9 @@ export async function verifyPackageSetup({
     opencodeConfig,
     skillPath,
   ];
+  const [claudeOriginal, cursorOriginal] = supportedSetupHost
+    ? await Promise.all([readFile(claudeConfig), readFile(cursorConfig)])
+    : [];
   await verifyInteractiveSetup({
     command: packageRunnerCli,
     environment,
@@ -766,6 +779,8 @@ export async function verifyPackageSetup({
       siblingSkillPath,
       opencodeConfig,
       opencodeOriginal: OPENCODE_ORIGINAL,
+      claudeOriginal,
+      cursorOriginal,
     });
     await verifySetupFailureRecovery({
       cli,

@@ -3,13 +3,15 @@ import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
 import { z } from "zod";
 
-import { evidenceSchema, parseEvidence, type Evidence } from "../evidence.js";
+import { evidenceSchema, type Evidence } from "../evidence.js";
 import {
   createJavaScriptApplicationGraph,
   javascriptApplicationGraphSchema,
-  type ApplicationEdge,
-  type ApplicationNode,
 } from "../javascript/javascriptApplicationGraph.js";
+import type {
+  ApplicationEdge,
+  ApplicationNode,
+} from "../javascript/javascriptApplicationGraphSchemas.js";
 import {
   managedArtifactInspectionSchema,
   managedMemberInspectionSchema,
@@ -32,6 +34,7 @@ import {
 } from "./managedApplicationGraphNodes.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
+import { parseManagedInspectionEvidence } from "./managedInspectionEvidence.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
 const textSchema = z.string().min(1);
@@ -131,6 +134,7 @@ export const projectManagedApplicationGraph = (
   const parsed = parseManagedInputs(input);
   const artifactIdentity = chooseArtifact(parsed);
   assertSameArtifact(parsed, artifactIdentity.sha256);
+  assertConsistentModuleIdentity(parsed);
   const evidenceLinks = [
     parsed.artifact?.evidence.evidence_id,
     parsed.members?.evidence.evidence_id,
@@ -148,8 +152,8 @@ export const projectManagedApplicationGraph = (
   };
   const artifactNode = addArtifactNode(state);
   addArtifactIdentityNodes(state, artifactNode, parsed);
-  const memberCounts = addMemberNodes(state, artifactNode, parsed);
-  const boundaryCounts = addBoundaryNodes(state, artifactNode, parsed);
+  addMemberNodes(state, artifactNode, parsed);
+  addBoundaryNodes(state, artifactNode, parsed);
   const omissions = omittedCounts(parsed);
   const limitations = projectionLimitations(parsed, omissions);
   const graph = createJavaScriptApplicationGraph({
@@ -172,10 +176,16 @@ export const projectManagedApplicationGraph = (
     summary: {
       graph_nodes: graph.nodes.length,
       graph_edges: graph.edges.length,
-      assemblies: parsed.artifact?.result.assembly === null ? 0 : 1,
-      modules: parsed.artifact?.result.module === null ? 0 : 1,
-      ...memberCounts,
-      ...boundaryCounts,
+      assemblies: countNodes(graph.nodes, "managed-assembly"),
+      modules: countNodes(graph.nodes, "managed-module"),
+      types: countNodes(graph.nodes, "managed-type"),
+      methods: countNodes(graph.nodes, "managed-method"),
+      fields: countNodes(graph.nodes, "managed-field"),
+      pinvoke_imports: countNodes(graph.nodes, "managed-pinvoke-import"),
+      native_implementations: countNodes(
+        graph.nodes,
+        "managed-native-implementation",
+      ),
     },
     graph,
     coverage: managedGraphResultCoverage(omissions),
@@ -188,13 +198,18 @@ export const projectManagedApplicationGraph = (
   });
 };
 
+const countNodes = (
+  nodes: readonly ApplicationNode[],
+  kind: ApplicationNode["kind"],
+): number => nodes.filter((node) => node.kind === kind).length;
+
 const parseManagedInputs = (
   input: ProjectManagedApplicationGraphInput,
 ): ParsedManagedGraphInput => ({
   artifact:
     input.managed_artifact === undefined
       ? null
-      : parseManagedEvidence(
+      : parseManagedInspectionEvidence(
           input.managed_artifact,
           "inspect_managed_artifact",
           managedArtifactInspectionSchema,
@@ -202,7 +217,7 @@ const parseManagedInputs = (
   members:
     input.managed_members === undefined
       ? null
-      : parseManagedEvidence(
+      : parseManagedInspectionEvidence(
           input.managed_members,
           "inspect_managed_members",
           managedMemberInspectionSchema,
@@ -210,23 +225,12 @@ const parseManagedInputs = (
   boundaries:
     input.managed_native_boundaries === undefined
       ? null
-      : parseManagedEvidence(
+      : parseManagedInspectionEvidence(
           input.managed_native_boundaries,
           "inspect_managed_native_boundaries",
           managedNativeBoundaryInspectionSchema,
         ),
 });
-
-const parseManagedEvidence = <Result>(
-  rawEvidence: unknown,
-  operation: string,
-  schema: z.ZodType<Result>,
-): { readonly evidence: Evidence; readonly result: Result } => {
-  const evidence = parseEvidence(rawEvidence);
-  if (evidence.operation !== operation)
-    throw new TypeError(`Evidence operation is not ${operation}`);
-  return { evidence, result: schema.parse(evidence.normalized_result) };
-};
 
 const chooseArtifact = (
   parsed: ParsedManagedGraphInput,
@@ -255,6 +259,52 @@ const assertSameArtifact = (
       );
 };
 
+/** Reject contradictory known module identities while leaving null fields unknown. */
+const assertConsistentModuleIdentity = (
+  parsed: ParsedManagedGraphInput,
+): void => {
+  const mvidClaims = [
+    parsed.artifact?.result.module?.mvid,
+    parsed.members?.result.module?.mvid,
+    parsed.members?.result.identity_scope.requires_mvid,
+    parsed.boundaries?.result.module?.mvid,
+    parsed.boundaries?.result.identity_scope.requires_mvid,
+  ]
+    .filter((mvid): mvid is string => mvid !== undefined && mvid !== null)
+    .map((mvid) => mvid.toLowerCase());
+  if (new Set(mvidClaims).size > 1)
+    throw new TypeError(
+      "Managed graph inputs report conflicting known module MVIDs or token scopes",
+    );
+
+  const modules = [
+    parsed.artifact?.result.module,
+    parsed.members?.result.module,
+    parsed.boundaries?.result.module,
+  ].filter(
+    (module): module is NonNullable<ManagedArtifactInspection["module"]> =>
+      module !== undefined && module !== null,
+  );
+  for (const field of ["name", "generation", "token", "row_offset"] as const) {
+    const values = new Set(modules.map((module) => module[field]));
+    if (values.size > 1)
+      throw new TypeError(
+        `Managed graph inputs report conflicting module ${field} values`,
+      );
+  }
+  for (const field of ["enc_id", "enc_base_id"] as const) {
+    const values = new Set(
+      modules
+        .map((module) => module[field]?.toLowerCase())
+        .filter((value): value is string => value !== undefined),
+    );
+    if (values.size > 1)
+      throw new TypeError(
+        `Managed graph inputs report conflicting module ${field} values`,
+      );
+  }
+};
+
 const omittedCounts = (parsed: ParsedManagedGraphInput) =>
   assessManagedGraphOmissions({
     artifact: parsed.artifact?.result ?? null,
@@ -272,6 +322,11 @@ const projectionLimitations = (
         "Managed member Evidence was not supplied; type, method, and field nodes are absent.",
       ]
     : []),
+  ...(parsed.artifact === null
+    ? [
+        "Managed artifact Evidence was not supplied; assembly identity observations are absent.",
+      ]
+    : []),
   ...(parsed.boundaries === null
     ? [
         "Managed native-boundary Evidence was not supplied; P/Invoke and native-implementation nodes are absent.",
@@ -279,5 +334,15 @@ const projectionLimitations = (
     : []),
   ...(omissions.partialInput
     ? ["At least one supplied managed Evidence record has partial coverage."]
+    : []),
+  ...(omissions.selectedTypes === null
+    ? []
+    : [
+        `Managed member Evidence selected only these declaring types: ${omissions.selectedTypes.join(", ")}; type, method, and field nodes of other types are omitted, not absent.`,
+      ]),
+  ...(omissions.unscopedTokenRelationships
+    ? [
+        "Managed boundary tokens were not linked to member nodes because matching module MVID scope was not established.",
+      ]
     : []),
 ];

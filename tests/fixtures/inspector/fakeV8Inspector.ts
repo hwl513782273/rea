@@ -10,10 +10,21 @@ interface InspectorCommand {
 
 interface FakeV8InspectorOptions {
   readonly targetUrl: string;
+  readonly attached?: boolean | null;
   readonly targetType?: "node" | "page";
   readonly runtimeProduct?: string;
   readonly scriptUrls?: readonly string[];
   readonly scriptHashes?: readonly string[];
+  readonly oversizedEventBytes?: number;
+  readonly contextTransitionCount?: number;
+  readonly runtimeEvents?: readonly {
+    readonly method: string;
+    readonly params: unknown;
+  }[];
+  readonly scriptEvents?: readonly {
+    readonly method: string;
+    readonly params: unknown;
+  }[];
   readonly additionalTargetUrl?: string;
   readonly additionalTargetCount?: number;
   readonly closeOnMethod?: string;
@@ -50,21 +61,19 @@ export const startFakeV8Inspector = async (
     if (request.url === "/json/list") {
       response.end(
         JSON.stringify([
-          target(
-            targetId,
-            options.targetUrl,
-            options.targetType ?? "node",
+          target(targetId, options.targetUrl, {
+            type: options.targetType ?? "node",
             port,
-          ),
+            attached: options.attached,
+          }),
           ...(options.additionalTargetUrl === undefined
             ? []
             : [
-                target(
-                  otherTargetId,
-                  options.additionalTargetUrl,
-                  options.targetType ?? "node",
+                target(otherTargetId, options.additionalTargetUrl, {
+                  type: options.targetType ?? "node",
                   port,
-                ),
+                  attached: options.attached,
+                }),
               ]),
           ...Array.from(
             { length: options.additionalTargetCount ?? 0 },
@@ -72,8 +81,11 @@ export const startFakeV8Inspector = async (
               target(
                 `00000000-0000-4000-8000-${String(index + 3).padStart(12, "0")}`,
                 options.targetUrl,
-                options.targetType ?? "node",
-                port,
+                {
+                  type: options.targetType ?? "node",
+                  port,
+                  attached: options.attached,
+                },
               ),
           ),
         ]),
@@ -94,47 +106,7 @@ export const startFakeV8Inspector = async (
     );
   });
   webSockets.on("connection", (socket: WebSocket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    socket.on("message", (raw) => {
-      const command = parseCommand(raw.toString());
-      commands.push(command);
-      if (options.closeOnMethod === command.method) {
-        socket.close();
-        return;
-      }
-      socket.send(JSON.stringify({ id: command.id, result: {} }));
-      if (command.method === "Runtime.enable")
-        socket.send(
-          JSON.stringify({
-            method: "Runtime.executionContextCreated",
-            params: {
-              context: {
-                id: 1,
-                origin: "",
-                name: "node[fixture]",
-              },
-            },
-          }),
-        );
-      if (command.method === "Debugger.enable")
-        for (const [index, url] of (
-          options.scriptUrls ?? [options.targetUrl]
-        ).entries())
-          socket.send(
-            JSON.stringify({
-              method: "Debugger.scriptParsed",
-              params: {
-                scriptId: String(index + 1),
-                url,
-                executionContextId: 1,
-                hash: options.scriptHashes?.[index] ?? `hash-${String(index)}`,
-                length: 100 + index,
-                isModule: index % 2 === 0,
-              },
-            }),
-          );
-    });
+    registerInspectorSocket(socket, options, commands, sockets);
   });
   await new Promise<void>((resolve, reject) => {
     http.once("error", reject);
@@ -160,18 +132,108 @@ export const startFakeV8Inspector = async (
   };
 };
 
+const registerInspectorSocket = (
+  socket: WebSocket,
+  options: FakeV8InspectorOptions,
+  commands: InspectorCommand[],
+  sockets: Set<WebSocket>,
+): void => {
+  sockets.add(socket);
+  socket.on("close", () => sockets.delete(socket));
+  socket.on("message", (raw) => {
+    const command = parseCommand(raw.toString());
+    commands.push(command);
+    if (options.closeOnMethod === command.method) {
+      socket.close();
+      return;
+    }
+    respondToInspectorCommand(socket, command, options);
+    socket.send(JSON.stringify({ id: command.id, result: {} }));
+  });
+};
+
+const respondToInspectorCommand = (
+  socket: WebSocket,
+  command: InspectorCommand,
+  options: FakeV8InspectorOptions,
+): void => {
+  if (command.method === "Runtime.enable") sendRuntimeEvents(socket, options);
+  if (command.method === "Debugger.enable") sendScriptEvents(socket, options);
+};
+
+const sendRuntimeEvents = (
+  socket: WebSocket,
+  options: FakeV8InspectorOptions,
+): void => {
+  if (options.runtimeEvents !== undefined) {
+    for (const event of options.runtimeEvents)
+      socket.send(JSON.stringify(event));
+    return;
+  }
+  socket.send(
+    JSON.stringify({
+      method: "Runtime.executionContextCreated",
+      params: { context: { id: 1, origin: "", name: "node[fixture]" } },
+    }),
+  );
+  for (let index = 0; index < (options.contextTransitionCount ?? 0); index += 1)
+    socket.send(
+      JSON.stringify({
+        method: "Runtime.executionContextDestroyed",
+        params: { executionContextId: 1 },
+      }),
+    );
+  if (options.oversizedEventBytes !== undefined)
+    socket.send(
+      JSON.stringify({
+        method: "Runtime.noisyFixtureEvent",
+        params: { padding: "x".repeat(options.oversizedEventBytes) },
+      }),
+    );
+};
+
+const sendScriptEvents = (
+  socket: WebSocket,
+  options: FakeV8InspectorOptions,
+): void => {
+  if (options.scriptEvents !== undefined) {
+    for (const event of options.scriptEvents)
+      socket.send(JSON.stringify(event));
+    return;
+  }
+  for (const [index, url] of (
+    options.scriptUrls ?? [options.targetUrl]
+  ).entries())
+    socket.send(
+      JSON.stringify({
+        method: "Debugger.scriptParsed",
+        params: {
+          scriptId: String(index + 1),
+          url,
+          executionContextId: 1,
+          hash: options.scriptHashes?.[index] ?? `hash-${String(index)}`,
+          length: 100 + index,
+          isModule: index % 2 === 0,
+        },
+      }),
+    );
+};
+
 const target = (
   id: string,
   url: string,
-  type: "node" | "page",
-  port: number,
+  options: {
+    readonly type: "node" | "page";
+    readonly port: number;
+    readonly attached: boolean | null | undefined;
+  },
 ) => ({
   id,
-  type,
+  type: options.type,
   title: "redacted-by-provider",
   url,
-  attached: false,
-  webSocketDebuggerUrl: `ws://localhost:${String(port)}/${id}`,
+  ...(options.attached === undefined ? {} : { attached: options.attached }),
+  webSocketDebuggerUrl: `ws://localhost:${String(options.port)}/${id}`,
 });
 
 const parseCommand = (raw: string): InspectorCommand => {

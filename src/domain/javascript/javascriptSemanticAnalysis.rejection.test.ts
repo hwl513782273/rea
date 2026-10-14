@@ -12,7 +12,7 @@ import {
   collectJavaScriptExports,
   fingerprintJavaScriptAst,
 } from "./javascriptAstFingerprint.js";
-import type { JavaScriptSemanticValue } from "./javascriptSemanticIr.js";
+import type { JavaScriptSemanticValue } from "./javascriptSemanticValueTypes.js";
 import {
   onlyCallable,
   topLevelBinding,
@@ -144,7 +144,11 @@ describe("JavaScript semantic analysis: rejection 1", () => {
     expect(recovered.returnSites[0]?.value).toMatchObject({
       status: "object",
       properties: expect.arrayContaining([
-        { name: "type", value: { status: "literal", value: "item" } },
+        {
+          name: "type",
+          presence: "present",
+          value: { status: "literal", value: "item" },
+        },
         expect.objectContaining({
           name: "text",
           value: expect.objectContaining({ status: "unknown" }),

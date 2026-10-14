@@ -149,7 +149,7 @@ describe("target-bound provider routing", () => {
     });
   });
 
-  it("cancels a provider switch, closes its old client, and restores the binding", async () => {
+  it("preserves the active client when a provider switch is cancelled while draining", async () => {
     const target = await databaseTarget();
     const alpha = deepProvider("alpha");
     const beta = deepProvider("beta");
@@ -176,18 +176,50 @@ describe("target-bound provider routing", () => {
       ok: false,
       error: new AnalysisCancelledError("open_binary"),
     });
-    expect(alpha.clients[0]?.closed).toBe(true);
+    expect(alpha.clients[0]?.closed).toBe(false);
     expect(beta.clients).toHaveLength(0);
     expect(bindingStatus(session)).toMatchObject({
       analysis_provider_binding: { provider: { id: "alpha" } },
     });
 
     alpha.pending = undefined;
-    const restored = await session.execute("address_name", { address: "0x2" });
-    expect(restored.ok && restored.value.provider.id).toBe("alpha");
-    expect(alpha.clients).toHaveLength(2);
+    const retained = await session.execute("address_name", { address: "0x2" });
+    expect(retained.ok && retained.value.provider.id).toBe("alpha");
+    expect(alpha.clients).toHaveLength(1);
     await session.close();
-    expect(alpha.clients[1]?.closed).toBe(true);
+    expect(alpha.clients[0]?.closed).toBe(true);
+  });
+});
+
+describe("selected provider capability provenance", () => {
+  it("labels selected-provider capabilities with the resolved identity", async () => {
+    const target = await databaseTarget();
+    const alpha = deepProvider("alpha");
+    const session = selectableSession([alpha.provider], auxiliaryProvider());
+
+    expect((await session.open(target, { providerId: "alpha" })).ok).toBe(true);
+    const resolved = { id: "alpha", name: "alpha provider", version: "1" };
+    const status = bindingStatus(session);
+    expect(status).toMatchObject({
+      analysis_provider_binding: { provider: resolved },
+      analysis_provider_candidates: [
+        {
+          provider: resolved,
+          selected: true,
+          capabilities: [{ provider: resolved }],
+        },
+      ],
+    });
+    expect(
+      z
+        .object({ capabilities: z.array(z.object({ provider: z.unknown() })) })
+        .parse(status)
+        .capabilities.map(({ provider }) => provider),
+    ).toEqual([
+      { id: "alpha", name: "alpha provider", version: "1" },
+      { id: "auxiliary", name: "auxiliary provider", version: "1" },
+    ]);
+    await session.close();
   });
 });
 
@@ -249,7 +281,6 @@ const deepProvider = (id: string): DeepProviderFixture => {
             { id, name: identity.name, version: "1" },
             { provider: id },
           ),
-          compatibility: {},
         }),
       );
     },
@@ -258,6 +289,8 @@ const deepProvider = (id: string): DeepProviderFixture => {
       fixture.clients.push(state);
       return {
         execute: (operation) => {
+          if (operation === "health")
+            return Promise.resolve(successfulExecution(id, profile?.provider));
           state.calls.push(operation);
           if (fixture.fail)
             return Promise.resolve(
@@ -268,7 +301,7 @@ const deepProvider = (id: string): DeepProviderFixture => {
         },
         close: () => {
           state.closed = true;
-          return Promise.resolve();
+          return Promise.resolve(ok(null));
         },
       };
     },
@@ -317,7 +350,7 @@ const auxiliaryProvider = (
             ),
           ),
         ),
-      close: () => Promise.resolve(),
+      close: () => Promise.resolve(ok(null)),
     }),
   };
 };

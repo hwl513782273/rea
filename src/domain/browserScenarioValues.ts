@@ -1,17 +1,23 @@
 import { z } from "zod";
+import { isAbsolute } from "node:path";
 
+import { IDENTIFIER_PATTERN } from "./stringPatterns.js";
+
+import { localPathStringSchema } from "./localPath.js";
 import { browserNetworkContentSelectionSchema } from "./browserNetworkEvidence.js";
+import { browserScenarioEventFamilySchema } from "./browserScenarioCaptureValues.js";
 
 import {
   browserEndpointSchema,
   browserOriginSchema,
 } from "./browserObservation.js";
 
-export const scenarioIdentifierSchema = z
-  .string()
-  .regex(/^[A-Za-z][A-Za-z0-9._-]*$/u);
+export const scenarioIdentifierSchema = z.string().regex(IDENTIFIER_PATTERN);
 
-const browserExecutablePathSchema = z.string().trim().min(1);
+const browserExecutablePathSchema = localPathStringSchema.refine(isAbsolute, {
+  message:
+    "executable_path must be an absolute local filesystem path (for example /opt/chromium/chrome or C:\\chromium\\chrome.exe)",
+});
 
 const browserScenarioBaseUrlSchema = z
   .string()
@@ -67,7 +73,9 @@ export type BrowserScenarioUrl = z.infer<typeof browserScenarioUrlSchema>;
 export const browserScenarioBrowserSchema = z.discriminatedUnion("mode", [
   z.strictObject({
     mode: z.literal("launch"),
-    executable_path: browserExecutablePathSchema,
+    executable_path: browserExecutablePathSchema.describe(
+      "Absolute local filesystem path for the browser executable; relative paths are rejected.",
+    ),
     headless: z
       .boolean()
       .default(true)
@@ -99,7 +107,7 @@ export const browserScenarioEnvironmentSchema = z
     timezone: z
       .string()
       .min(1)
-      .regex(/^[A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*$/u)
+      .regex(/^[A-Za-z0-9_+\x2d]+(?:\x2f[A-Za-z0-9_+\x2d]+)*$/u)
       .default("UTC"),
     color_scheme: z.enum(["light", "dark", "no-preference"]).default("light"),
     reduced_motion: z.enum(["reduce", "no-preference"]).default("reduce"),
@@ -282,20 +290,7 @@ export const browserScenarioCaptureSchema = z
   .strictObject({
     after_each_step: z.array(snapshotKindSchema).default([]),
     at_end: z.array(snapshotKindSchema).default(["url"]),
-    events: z
-      .array(
-        z.enum([
-          "console",
-          "page-errors",
-          "network",
-          "websockets",
-          "frames",
-          "workers",
-          "popups",
-          "downloads",
-        ]),
-      )
-      .default([]),
+    events: z.array(browserScenarioEventFamilySchema).default([]),
     network: browserNetworkContentSelectionSchema,
   })
   .default({

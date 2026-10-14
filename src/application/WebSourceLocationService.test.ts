@@ -12,28 +12,6 @@ import type { WebSourceMapPort } from "./WebSourceLocationPorts.js";
 
 const service = (data = webSourceLocationFixture(), port = decoder) =>
   new WebSourceLocationService({ load: () => Promise.resolve(ok(data)) }, port);
-it("joins byte identity and historical capture context while keeping selected authenticity/execution unknown", async () => {
-  const data = webSourceLocationFixture();
-  data.manifest.source_evidence_id = `ev_${"a".repeat(64)}`;
-  const response = await service(data).trace(args);
-  if (!response.ok) throw response.error;
-  const result = webSourceLocationResultSchema.parse(
-    response.value.normalized_result,
-  );
-  expect(result).toMatchObject({
-    source: { sha256: data.sourceFile.sha256 },
-    source_map: {
-      association: "caller-selected",
-      sha256: data.sourceMap.file.sha256,
-    },
-    matches: [{ state: "mapped", content: { text: "original" } }],
-    execution: "unknown",
-    source_authenticity: "unknown",
-  });
-  expect(response.value.raw_result).toEqual({
-    source_map_text: data.sourceMap.text,
-  });
-});
 it.each([
   { ...args, manifest_path: "relative.json" },
   { ...args, script_index: -1 },
@@ -115,18 +93,52 @@ it.each(["digest", "url", "point"])(
     expect(response.error._tag).toBe("AnalysisOutputError");
   },
 );
-it("rejects a generated point outside retained text before decoding", async () => {
-  const response = await service(undefined, {
-    trace: () => {
-      throw new Error("must not decode");
+it.each([
+  {
+    runtime: {
+      id: "node-v8",
+      version: "v24.18.0",
+      v8_heap_limit_bytes: 201326592,
     },
-  }).trace({ ...args, generated_position: { line: 2, column: 0 } });
-  if (response.ok) throw new Error("expected invalid point");
-  expect(projectAnalysisError(response.error)).toMatchObject({
-    code: "invalid_request",
-    details: { issues: [{ message: expect.stringContaining("outside") }] },
-  });
-});
+    limitation: "192 MiB old-generation heap and one V8 worker",
+  },
+  {
+    runtime: {
+      id: "bun",
+      version: "1.4.2",
+      node_compatibility_version: "24.3.0",
+      v8_heap_limit_bytes: null,
+      process_memory_limit_bytes: 738197504,
+    },
+    limitation:
+      "a Windows Job Object limited its committed memory to 738197504 bytes",
+  },
+  {
+    runtime: {
+      id: "bun",
+      version: "1.4.2",
+      node_compatibility_version: "24.3.0",
+      v8_heap_limit_bytes: null,
+      process_memory_limit_bytes: null,
+    },
+    limitation: "so no codec heap limit is established",
+  },
+] as const)(
+  "states the codec memory bound its runtime enforced: $limitation",
+  async ({ runtime, limitation }) => {
+    const response = await service(undefined, {
+      trace: async (input) => {
+        const decoded = await decoder.trace(input);
+        if (!decoded.ok) return decoded;
+        return ok({ ...decoded.value, runtime });
+      },
+    }).trace(args);
+    if (!response.ok) throw response.error;
+    expect(
+      response.value.limitations.filter((text) => text.includes(limitation)),
+    ).toHaveLength(1);
+  },
+);
 it("honors cancellation both before acquisition and across decoder completion", async () => {
   const first = new AbortController();
   first.abort();

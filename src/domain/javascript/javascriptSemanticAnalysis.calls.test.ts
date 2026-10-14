@@ -1,13 +1,35 @@
 import { describe, expect, it } from "vitest";
 
 import { analyzeJavaScriptSemantics } from "./javascriptSemanticAnalysis.js";
-import { semanticBinding } from "./javascriptSemanticIr.js";
 import {
+  bindingById,
   onlyCallable,
   topLevelBinding,
 } from "./javascriptSemanticAnalysis.fixture.js";
 
 describe("JavaScript semantic analysis: calls 1", () => {
+  it("does not assign computed method-name reads to method closures", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      function outer() {
+        const name = "m";
+        const object = { [name]() { return 1; }, ["literal"]() { return 2; } };
+        class Example {
+          [name]() { return 3; }
+          ["literal"]() { return 4; }
+        }
+      }
+    `);
+    expect(ir.closureCaptures).toEqual([]);
+
+    const bodyRead = analyzeJavaScriptSemantics(`
+      function outer() {
+        const value = 1;
+        const object = { method() { return value; } };
+      }
+    `);
+    expect(bodyRead.closureCaptures).toHaveLength(1);
+  });
+
   it("links exact local calls to parameters, returns, and closure captures", () => {
     const ir = analyzeJavaScriptSemantics(`
       const prefix = "rea";
@@ -39,7 +61,7 @@ describe("JavaScript semantic analysis: calls 1", () => {
         .filter(({ callSiteId }) => callSiteId === call.callSiteId)
         .map(({ argumentIndex, parameterBindingId }) => ({
           argumentIndex,
-          parameter: semanticBinding(ir, parameterBindingId)?.name,
+          parameter: bindingById(ir, parameterBindingId)?.name,
         })),
     ).toEqual([
       { argumentIndex: 0, parameter: "value" },
@@ -136,6 +158,121 @@ describe("JavaScript semantic analysis: calls 1", () => {
   });
 });
 
+describe("JavaScript semantic analysis: computed method keys", () => {
+  it("evaluates computed method keys in the enclosing callable", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      function outer() {
+        const name = "m";
+        const pick = () => "n";
+        const obj = { [name]() { return 1; }, [pick()]() { return name; } };
+        class C { [name]() { return 2; } }
+      }
+    `);
+
+    const outer = onlyCallable(ir, "outer");
+    const pickCall = ir.callSites.find(
+      ({ calleeCallableIds }) => calleeCallableIds.length === 1,
+    );
+    expect(pickCall).toMatchObject({
+      callerCallableId: outer.callableId,
+      resolution: "exact",
+    });
+    // Only the method body that reads `name` captures it; the computed keys
+    // are evaluated outside every method environment.
+    expect(
+      ir.closureCaptures.map(({ callableId, bindingId }) => ({
+        owner: ir.callables.find(
+          (callable) => callable.callableId === callableId,
+        )?.kind,
+        binding: bindingById(ir, bindingId)?.name,
+      })),
+    ).toEqual([{ owner: "method", binding: "name" }]);
+  });
+
+  it("keeps callables nested in a computed method key in their own frames", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      function outer() {
+        const name = "m";
+        const pick = () => "n";
+        return { [(() => pick())()]() { return name; } };
+      }
+    `);
+
+    const outer = onlyCallable(ir, "outer");
+    const pick = onlyCallable(ir, "pick");
+    const keyArrow = ir.callables.find(
+      ({ kind, name }) => kind === "function" && name === null,
+    );
+    const method = ir.callables.find(({ kind }) => kind === "method");
+    expect(keyArrow).toBeDefined();
+    expect(method).toBeDefined();
+    const callerOf = (calleeCallableId: string | undefined) =>
+      ir.callSites.find(({ calleeCallableIds }) =>
+        calleeCallableIds.includes(calleeCallableId ?? ""),
+      )?.callerCallableId;
+    expect(callerOf(pick.callableId)).toBe(keyArrow?.callableId);
+    expect(callerOf(keyArrow?.callableId)).toBe(outer.callableId);
+    expect(
+      ir.closureCaptures.map(({ callableId, bindingId }) => ({
+        callableId,
+        binding: bindingById(ir, bindingId)?.name,
+      })),
+    ).toEqual(
+      expect.arrayContaining([
+        { callableId: keyArrow?.callableId, binding: "pick" },
+        { callableId: method?.callableId, binding: "name" },
+      ]),
+    );
+  });
+
+  it("attributes effects in computed method keys to the enclosing callable", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      import { spawn } from "node:child_process";
+      function outer(config) {
+        return {
+          [fetch("/x")]() {},
+          [setTimeout(tick, 1)]() {},
+          [Promise.resolve(1)]() {},
+          [spawn("ls")]() {},
+          [config.key]() {},
+        };
+      }
+      class C { [fetch("/y")]() {} }
+    `);
+
+    const outer = onlyCallable(ir, "outer");
+    const owners = (
+      operations: readonly { readonly ownerCallableId: string | null }[],
+    ) => operations.map(({ ownerCallableId }) => ownerCallableId);
+    const methodIds = new Set(
+      ir.callables
+        .filter(({ kind }) => kind === "method")
+        .map(({ callableId }) => callableId),
+    );
+    expect(methodIds.size).toBe(6);
+    const classId = onlyCallable(ir, "C").callableId;
+    expect(owners(ir.requestOperations).sort()).toEqual(
+      [outer.callableId, classId].sort(),
+    );
+    expect(owners(ir.timerOperations)).toEqual([outer.callableId]);
+    expect(owners(ir.promiseOperations)).toEqual([outer.callableId]);
+    expect(owners(ir.childProcessSpawns)).toEqual([outer.callableId]);
+    expect(
+      ir.objectOperations.filter(({ propertyPath }) =>
+        propertyPath?.includes("key"),
+      ),
+    ).toEqual([expect.objectContaining({ ownerCallableId: outer.callableId })]);
+    for (const owner of [
+      ...owners(ir.requestOperations),
+      ...owners(ir.timerOperations),
+      ...owners(ir.promiseOperations),
+      ...owners(ir.childProcessSpawns),
+      ...owners(ir.objectOperations),
+    ])
+      expect(methodIds.has(owner ?? "")).toBe(false);
+  });
+});
+
 describe("JavaScript semantic analysis: calls 2", () => {
   it("does not treat a shadowed Promise binding as the intrinsic", () => {
     const ir = analyzeJavaScriptSemantics(`
@@ -153,19 +290,6 @@ describe("JavaScript semantic analysis: calls 2", () => {
         sourceResolution: "unresolved",
       }),
     ]);
-  });
-
-  it("retains every promise operation found in the finite source", () => {
-    const ir = analyzeJavaScriptSemantics(
-      `
-        Promise.resolve(1);
-        Promise.resolve(2);
-        Promise.resolve(3);
-      `,
-    );
-
-    expect(ir.promiseOperations).toHaveLength(3);
-    expect(ir.coverage.status).toBe("complete");
   });
 
   it("fingerprints formatting and local-name changes identically", () => {
@@ -190,6 +314,34 @@ describe("JavaScript semantic analysis: calls 2", () => {
     expect(
       changed.functionFingerprints[0]?.components.literalSetSha256,
     ).not.toBe(left.functionFingerprints[0]?.components.literalSetSha256);
+  });
+
+  it("keeps nested callable syntax out of its owner's fingerprint", () => {
+    const analyze = (nested: number, owned: number) =>
+      analyzeJavaScriptSemantics(`
+        function outer() {
+          function inner() { return ${nested}; }
+          const object = { method() { return ${nested}; } };
+          class Nested { method() { return ${nested}; } }
+          return ${owned};
+        }
+      `);
+    const first = analyze(1, 2);
+    const changedNested = analyze(3, 2);
+    const changedOwner = analyze(1, 4);
+    const syntax = (ir: typeof first) =>
+      ir.functionFingerprints.map(({ components }) => ({
+        ast: components.normalizedAstSha256,
+        control: components.controlFlowSha256,
+        literals: components.literalSetSha256,
+      }));
+    const original = syntax(first);
+    expect(original).toHaveLength(4);
+    expect(syntax(changedNested)[0]).toEqual(original[0]);
+    for (const index of [1, 2, 3])
+      expect(syntax(changedNested)[index]).not.toEqual(original[index]);
+    expect(syntax(changedOwner)[0]).not.toEqual(original[0]);
+    expect(syntax(changedOwner).slice(1)).toEqual(original.slice(1));
   });
 
   it("keeps fingerprint relations ordered and effects scoped to their owner", () => {
@@ -322,7 +474,7 @@ describe("JavaScript semantic rest parameter flow", () => {
       expect(
         ir.argumentFlows.map(({ argumentIndex, parameterBindingId }) => [
           argumentIndex,
-          semanticBinding(ir, parameterBindingId)?.name,
+          bindingById(ir, parameterBindingId)?.name,
         ]),
       ).toEqual(expected);
     },

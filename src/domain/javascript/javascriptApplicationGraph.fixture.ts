@@ -2,10 +2,11 @@ import {
   createJavaScriptApplicationEdge,
   createJavaScriptApplicationGraph,
   createJavaScriptApplicationNode,
-  type ApplicationGraphEvidence,
-  type ApplicationNode,
   type JavaScriptApplicationGraph,
 } from "./javascriptApplicationGraph.js";
+import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
+import type { ApplicationGraphEvidence } from "./javascriptApplicationEvidenceSchemas.js";
+import { resolveJavaScriptSourceMapReferences } from "./javascriptSourceMapPaths.js";
 
 export const APPLICATION_GRAPH_DIGESTS = {
   package: "1".repeat(64),
@@ -21,6 +22,20 @@ export const completeCoverage = {
   omitted_count: 0,
   limits: [],
 } satisfies ApplicationGraphEvidence["coverage"];
+
+export const sourceMapReference = (
+  sourceName: string,
+  sourceRoot: string | null,
+  mapPath: string,
+) => {
+  const reference = resolveJavaScriptSourceMapReferences(
+    [sourceName],
+    sourceRoot,
+    mapPath,
+  )[0];
+  if (reference == null) throw new TypeError("Expected a source-map reference");
+  return reference;
+};
 
 const extractor = (operation: string) => ({
   name: "rea-test-fixture",
@@ -109,7 +124,7 @@ type FixtureNodeArguments = [
   evidence: ApplicationGraphEvidence,
 ];
 
-const fixtureNode = (
+export const fixtureNode = (
   ...[kind, identity, label, properties, evidence]: FixtureNodeArguments
 ): FixtureNode =>
   createJavaScriptApplicationNode({

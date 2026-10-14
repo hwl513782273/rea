@@ -1,5 +1,50 @@
 import type { JsonValue } from "./jsonValue.js";
-import { AnalysisError } from "./analysisErrorBase.js";
+import {
+  AnalysisError,
+  type AnalysisErrorOptions,
+} from "./analysisErrorBase.js";
+
+/** A readable supplied artifact lies outside this operation's supported target formats. */
+export class AnalysisUnsupportedTargetError extends AnalysisError {
+  readonly _tag = "AnalysisUnsupportedTargetError";
+  /** Refusal-specific recovery, when the producer knows an available workflow. */
+  readonly remediationAction: string | undefined;
+  constructor(
+    readonly operation: string,
+    readonly path: string,
+    readonly reason: string,
+    options?: AnalysisErrorOptions & { readonly remediationAction?: string },
+  ) {
+    super(`Unsupported target for ${operation} at ${path}: ${reason}`, options);
+    this.remediationAction = options?.remediationAction;
+  }
+}
+
+/** An analysis or transport resource failure, distinct from malformed input or unsupported coverage. */
+export const ANALYSIS_RESOURCE_KINDS = [
+  "memory",
+  "cpu",
+  "file-size",
+  "transport",
+  "capacity",
+] as const;
+
+/** A measured resource constraint or bounded admission refusal. */
+export class AnalysisResourceConstraintError extends AnalysisError {
+  readonly _tag = "AnalysisResourceConstraintError";
+  readonly remediationAction: string | undefined;
+
+  constructor(
+    readonly operation: string,
+    readonly resource: (typeof ANALYSIS_RESOURCE_KINDS)[number],
+    readonly reason: string,
+    readonly reportedLimits: Readonly<Record<string, JsonValue>> | null,
+    options?: AnalysisErrorOptions & { readonly remediationAction?: string },
+  ) {
+    super(`Resource constraint during ${operation}: ${reason}`, options);
+    this.remediationAction = options?.remediationAction;
+  }
+}
 
 /** Provider-neutral invalid analysis input or output at an application boundary. */
 export class AnalysisProtocolError extends AnalysisError {
@@ -9,13 +54,15 @@ export class AnalysisProtocolError extends AnalysisError {
 /** Caller input failed provider-neutral application parsing. */
 export class AnalysisInputError extends AnalysisError {
   readonly _tag = "AnalysisInputError";
+  override readonly userMessage: string | undefined;
 
   constructor(
     readonly operation: string,
-    options?: ErrorOptions,
+    options?: AnalysisErrorOptions & { readonly userMessage?: string },
     readonly issues: readonly AnalysisInputIssue[] = [],
   ) {
     super(`Invalid analysis input for ${operation}`, options);
+    this.userMessage = options?.userMessage;
   }
 }
 
@@ -36,16 +83,30 @@ export interface AnalysisInputIssue {
   readonly maximum?: number;
 }
 
+/** Refusal-specific context a producer projects with an output failure. */
+export interface AnalysisOutputErrorOptions extends AnalysisErrorOptions {
+  /** Caller-facing explanation for a deterministic, diagnosable refusal. */
+  readonly userMessage?: string;
+  readonly remediationAction?: string;
+  readonly cleanupOnly?: boolean;
+}
+
 /** Provider output failed provider-neutral application parsing. */
 export class AnalysisOutputError extends AnalysisError {
   readonly _tag = "AnalysisOutputError";
+  override readonly userMessage: string | undefined;
+  readonly remediationAction: string | undefined;
+  readonly cleanupOnly: boolean;
 
   constructor(
     readonly operation: string,
     readonly reason: string,
-    options?: ErrorOptions,
+    options?: AnalysisOutputErrorOptions,
   ) {
     super(`Invalid analysis output for ${operation}: ${reason}`, options);
+    this.userMessage = options?.userMessage;
+    this.remediationAction = options?.remediationAction;
+    this.cleanupOnly = options?.cleanupOnly ?? false;
   }
 }
 
@@ -53,18 +114,24 @@ export class AnalysisOutputError extends AnalysisError {
 export class AnalysisCapabilityUnavailableError extends AnalysisError {
   readonly _tag = "AnalysisCapabilityUnavailableError";
   override readonly userMessage: string | undefined;
+  /** Incomplete cleanup must settle before the operation can be retried. */
+  readonly retryable: boolean;
 
   constructor(
     readonly providerId: string,
     readonly operation: string,
     readonly reason: string,
-    options?: ErrorOptions & { readonly userMessage?: string },
+    options?: AnalysisErrorOptions & {
+      readonly userMessage?: string;
+      readonly retryable?: boolean;
+    },
   ) {
     super(
       `Provider ${providerId} cannot execute ${operation}: ${reason}`,
       options,
     );
     this.userMessage = options?.userMessage;
+    this.retryable = options?.retryable === true && !this.cleanupIncomplete;
   }
 }
 
@@ -72,8 +139,11 @@ export class AnalysisCapabilityUnavailableError extends AnalysisError {
 export class AnalysisCancelledError extends AnalysisError {
   readonly _tag = "AnalysisCancelledError";
 
-  constructor(readonly operation: string) {
-    super(`Analysis operation was cancelled: ${operation}`);
+  constructor(
+    readonly operation: string,
+    options?: AnalysisErrorOptions,
+  ) {
+    super(`Analysis operation was cancelled: ${operation}`, options);
   }
 }
 
@@ -84,9 +154,40 @@ export class AnalysisTimeoutError extends AnalysisError {
   constructor(
     readonly operation: string,
     readonly timeoutMs: number,
+    options?: AnalysisErrorOptions,
   ) {
     super(
       `Analysis operation timed out after ${String(timeoutMs)}ms: ${operation}`,
+      options,
     );
+  }
+}
+
+/** Host filesystem permissions denied the selected read; this is not malformed caller input. */
+export class AnalysisAccessDeniedError extends AnalysisError {
+  readonly _tag = "AnalysisAccessDeniedError";
+  constructor(
+    readonly operation: string,
+    readonly path: string,
+    readonly systemCode: "EACCES" | "EPERM",
+    options?: AnalysisErrorOptions,
+  ) {
+    super(
+      `Host filesystem read access denied (${systemCode}) for ${path} during ${operation}`,
+      options,
+    );
+  }
+}
+
+/** Selected artifact acquisition observed a change, so no stable identity can be reported. */
+export class AnalysisArtifactChangedError extends AnalysisError {
+  readonly _tag = "AnalysisArtifactChangedError";
+  constructor(
+    readonly operation: string,
+    readonly path: string,
+    readonly reason: string,
+    options?: AnalysisErrorOptions,
+  ) {
+    super(`Selected artifact changed during acquisition: ${reason}`, options);
   }
 }

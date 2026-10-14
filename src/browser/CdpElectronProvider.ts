@@ -14,7 +14,7 @@ import {
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   discoverCdpEndpoint,
@@ -29,15 +29,12 @@ import {
 import { inspectCdpElectronPage } from "./CdpElectronInspection.js";
 import { authorizedElectronFile } from "./ElectronFileScope.js";
 
-/** Public identity committed by passive Electron observations. */
-export { CDP_ELECTRON_PROVIDER_IDENTITY } from "./providerIdentities.js";
 import { CDP_ELECTRON_PROVIDER_IDENTITY } from "./providerIdentities.js";
-const IDENTITY = CDP_ELECTRON_PROVIDER_IDENTITY;
-
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 /** Passive Electron provider for local file pages exposed by loopback CDP. */
 export class CdpElectronProvider implements ElectronObservationPort {
   identity(): ProviderIdentity {
-    return IDENTITY;
+    return CDP_ELECTRON_PROVIDER_IDENTITY;
   }
 
   async listTargets(
@@ -77,7 +74,7 @@ export class CdpElectronProvider implements ElectronObservationPort {
         });
       }
       allowed.sort((left, right) =>
-        left.target_id.localeCompare(right.target_id),
+        compareUnicodeCodePoints(left.target_id, right.target_id),
       );
       return ok(
         electronTargetListSchema.parse({
@@ -94,6 +91,11 @@ export class CdpElectronProvider implements ElectronObservationPort {
               : [
                   `${String(unconnectable)} otherwise allowed page target(s) lacked a validated direct CDP WebSocket and were excluded.`,
                 ]),
+            ...(allowed.some((target) => target.attached === null)
+              ? [
+                  "CDP discovery omitted attachment state for one or more targets; attached is reported as unknown.",
+                ]
+              : []),
           ],
         }),
       );
@@ -171,4 +173,6 @@ const providerError = (
     ? new BrowserObservationError(operation, cause.reason, { cause })
     : cause instanceof AnalysisError
       ? cause
-      : new ProviderAdapterError(IDENTITY.id, operation, { cause });
+      : new ProviderAdapterError(CDP_ELECTRON_PROVIDER_IDENTITY.id, operation, {
+          cause,
+        });

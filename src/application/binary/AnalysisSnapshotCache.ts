@@ -1,21 +1,29 @@
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import type { EvidenceBundle } from "../../domain/evidenceBundle.js";
-import { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
+import {
+  EvidenceIntegrityError,
+  AnalysisSnapshotMismatchError,
+} from "../../domain/evidenceErrors.js";
 import { NoBinaryOpenError } from "../../domain/configurationErrors.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisInputError } from "../../domain/analysisErrorCore.js";
+import { rebindEvidenceSubjectTargetPath } from "../../domain/evidence.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import {
   analysisQueryId,
   createAnalysisSnapshotEntry,
+  createAnalysisSnapshotWorkflowEntry,
   snapshotBinding,
   snapshotMatchesProfile,
   snapshotMatchesTarget,
   snapshotTarget,
   parseAnalysisSnapshot,
+  immutableAnalysisSnapshot,
   type AnalysisSnapshot,
   type AnalysisSnapshotEntry,
+  type AnalysisSnapshotWorkflowEntry,
   type AnalysisSnapshotBinding,
   type AnalysisSnapshotTarget,
 } from "../../domain/analysisSnapshot.js";
@@ -25,6 +33,12 @@ import type {
   CapabilityDescriptor,
 } from "../AnalysisProvider.js";
 import { OFFICIAL_TOOL_CONTRACTS } from "../../contracts/officialToolContracts.js";
+import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
+
+const RELATIONSHIP_OPERATIONS: ReadonlySet<AnalysisOperation> = new Set([
+  "procedure_callers",
+  "procedure_callees",
+]);
 
 const STATEFUL_OPERATIONS: ReadonlySet<AnalysisOperation> = new Set([
   "health",
@@ -33,7 +47,6 @@ const STATEFUL_OPERATIONS: ReadonlySet<AnalysisOperation> = new Set([
   "current_document",
   "goto_address",
   "list_documents",
-  "set_current_document",
 ]);
 
 const CURSOR_DEFAULT_OPERATIONS: ReadonlySet<AnalysisOperation> = new Set([
@@ -47,12 +60,12 @@ const CURSOR_DEFAULT_OPERATIONS: ReadonlySet<AnalysisOperation> = new Set([
 
 const DOCUMENT_SCOPED_OPERATIONS: ReadonlySet<string> = new Set(
   OFFICIAL_TOOL_CONTRACTS.map(({ name }) => name).filter(
-    (name) =>
-      name !== "current_document" &&
-      name !== "list_documents" &&
-      name !== "set_current_document",
+    (name) => name !== "current_document" && name !== "list_documents",
   ),
 );
+
+/** Maximum duplicated result bindings retained across direct and workflow queries. */
+export const SNAPSHOT_CACHE_ENTRY_CEILING = 10_000;
 
 /** Whether an operation is immutable and independent of provider UI state. */
 export const isSnapshotCacheable = (
@@ -67,12 +80,19 @@ export const isSnapshotCacheable = (
     typeof parameters.address === "string") &&
   descriptor?.effects.mutatesArtifact === false &&
   descriptor.cachePolicy !== "live" &&
-  descriptor.effects.mayWriteFilesystem === false &&
+  (descriptor.cachePolicy === "snapshot" ||
+    descriptor.effects.mayWriteFilesystem === false) &&
   descriptor.effects.changesPermissions === false;
+
+/** Windows Ghidra must admit the selected source through its native snapshot owner. */
+export const requiresNativeSourceAdmissionBeforeReplay = (
+  providerId: string | undefined,
+): boolean => process.platform === "win32" && providerId === "ghidra";
 
 /** Bounded in-memory cache for one immutable binary identity. */
 export class AnalysisSnapshotCache {
   readonly #entries = new Map<string, AnalysisSnapshotEntry>();
+  readonly #workflowEntries = new Map<string, AnalysisSnapshotWorkflowEntry>();
   #target: AnalysisSnapshotTarget | undefined;
   #binding: AnalysisSnapshotBinding | undefined;
 
@@ -93,13 +113,14 @@ export class AnalysisSnapshotCache {
 
   /** Replace cache state when the target or selected profile changes. */
   select(target: BinaryTarget, profile: AnalysisProfileCommitment): void {
-    if (!this.matches(target, profile)) this.#entries.clear();
+    if (!this.matches(target, profile)) this.#clearEntries();
     this.#target = snapshotTarget(target);
     this.#binding = snapshotBinding(profile);
   }
 
   /** Merge already-validated entries and return the new-entry count. */
   stage(snapshot: AnalysisSnapshot): number {
+    snapshot = immutableAnalysisSnapshot(snapshot);
     if (
       (this.#target !== undefined &&
         JSON.stringify(this.#target) !== JSON.stringify(snapshot.target)) ||
@@ -109,13 +130,19 @@ export class AnalysisSnapshotCache {
           snapshot.binding.analysis_profile,
         ))
     )
-      this.#entries.clear();
+      this.#clearEntries();
     this.#target = structuredClone(snapshot.target);
     this.#binding = structuredClone(snapshot.binding);
     let imported = 0;
     for (const entry of snapshot.entries) {
+      if (!this.#entries.has(entry.query_id) && !this.#hasCapacity()) continue;
       if (!this.#entries.has(entry.query_id)) imported += 1;
-      this.#entries.set(entry.query_id, structuredClone(entry));
+      this.#entries.set(entry.query_id, entry);
+    }
+    for (const entry of snapshot.workflow_entries) {
+      if (!this.#workflowEntries.has(entry.query_id) && !this.#hasCapacity())
+        continue;
+      this.#workflowEntries.set(entry.query_id, entry);
     }
     return imported;
   }
@@ -131,13 +158,22 @@ export class AnalysisSnapshotCache {
     try {
       const snapshotTargetIdentity = snapshotTarget(target);
       const binding = snapshotBinding(profile);
-      const retainedEvidence = structuredClone(evidenceBundle);
+      const entries = [...this.#entries.values()].sort((left, right) =>
+        compareUnicodeCodePoints(left.query_id, right.query_id),
+      );
+      const workflows = [...this.#workflowEntries.values()].sort(
+        (left, right) =>
+          compareUnicodeCodePoints(left.query_id, right.query_id),
+      );
+      // Parsing owns the returned JSON and metadata; pre-cloning the same
+      // payloads here only adds another full materialization.
       return ok(
         parseAnalysisSnapshot({
           target: snapshotTargetIdentity,
           binding,
-          entries: this.entries(),
-          evidence_bundle: retainedEvidence,
+          entries,
+          workflow_entries: workflows,
+          evidence_bundle: evidenceBundle,
         }),
       );
     } catch (cause: unknown) {
@@ -160,11 +196,11 @@ export class AnalysisSnapshotCache {
       | undefined,
     mergeEvidence: (
       bundle: EvidenceBundle,
-    ) => Result<number, EvidenceIntegrityError>,
+    ) => Result<number, EvidenceIntegrityError | AnalysisInputError>,
   ): Result<number, AnalysisError> {
     let validated: AnalysisSnapshot;
     try {
-      validated = parseAnalysisSnapshot(snapshot);
+      validated = immutableAnalysisSnapshot(snapshot);
     } catch (cause: unknown) {
       return err(
         new EvidenceIntegrityError("Analysis snapshot validation failed", {
@@ -178,7 +214,7 @@ export class AnalysisSnapshotCache {
         !snapshotMatchesProfile(validated.binding, active.profile))
     )
       return err(
-        new EvidenceIntegrityError(
+        new AnalysisSnapshotMismatchError(
           "Analysis snapshot profile_mismatch: target, provider, or analysis profile does not match the active binary",
         ),
       );
@@ -189,8 +225,54 @@ export class AnalysisSnapshotCache {
   /** Return canonical entries for persistence. */
   entries(): AnalysisSnapshotEntry[] {
     return [...this.#entries.values()]
-      .sort((left, right) => left.query_id.localeCompare(right.query_id))
+      .sort((left, right) =>
+        compareUnicodeCodePoints(left.query_id, right.query_id),
+      )
       .map((entry) => structuredClone(entry));
+  }
+
+  /** Return canonical composed-workflow entries for persistence. */
+  workflowEntries(): AnalysisSnapshotWorkflowEntry[] {
+    return [...this.#workflowEntries.values()]
+      .sort((left, right) =>
+        compareUnicodeCodePoints(left.query_id, right.query_id),
+      )
+      .map((entry) => structuredClone(entry));
+  }
+
+  /** Record one exact derived workflow result unless the shared cache is full. */
+  recordWorkflow(input: {
+    readonly target: BinaryTarget;
+    readonly profile: AnalysisProfileCommitment;
+    readonly operation: string;
+    readonly parameters: Readonly<Record<string, JsonValue>>;
+    readonly execution: {
+      readonly result: JsonValue;
+      readonly rawResult: JsonValue | null;
+      readonly provider: AnalysisExecution["provider"];
+      readonly analysisProfile: AnalysisProfileCommitment;
+      readonly limitations: readonly string[];
+      readonly relationshipCoverage?: AnalysisExecution["relationshipCoverage"];
+      readonly locations: AnalysisExecution["locations"];
+      readonly subject: AnalysisExecution["subject"];
+    };
+  }): void {
+    this.select(input.target, input.profile);
+    const queryId = analysisQueryId(
+      snapshotTarget(input.target),
+      snapshotBinding(input.profile),
+      input.operation,
+      input.parameters,
+    );
+    if (!this.#workflowEntries.has(queryId) && !this.#hasCapacity()) return;
+    const entry = createAnalysisSnapshotWorkflowEntry({
+      target: snapshotTarget(input.target),
+      binding: snapshotBinding(input.profile),
+      operation: input.operation,
+      parameters: input.parameters,
+      execution: input.execution,
+    });
+    this.#workflowEntries.set(entry.query_id, entry);
   }
 
   /** Replay an exact provider-specific query, marking its cached provenance. */
@@ -208,7 +290,21 @@ export class AnalysisSnapshotCache {
     );
     const cached = this.#entries.get(queryId);
     if (cached === undefined) return undefined;
-    const subject = cached.execution.subject;
+    const cachedSubject = cached.execution.subject;
+    const subject =
+      cachedSubject === null
+        ? null
+        : rebindEvidenceSubjectTargetPath(
+            {
+              path: cachedSubject.path,
+              sha256: cachedSubject.sha256,
+              format: cachedSubject.format,
+              ...(cachedSubject.architecture === null
+                ? {}
+                : { architecture: cachedSubject.architecture }),
+            },
+            target,
+          );
     return structuredClone({
       result: cached.execution.result,
       rawResult: cached.execution.raw_result,
@@ -218,22 +314,21 @@ export class AnalysisSnapshotCache {
         ...cached.execution.limitations,
         "Loaded from a local REA analysis snapshot; this call did not re-run the provider.",
       ],
+      ...(cached.execution.relationship_coverage === null &&
+      RELATIONSHIP_OPERATIONS.has(operation)
+        ? {
+            relationshipCoverage: {
+              status: "unknown",
+              reason: "Snapshot entry does not report relationship coverage.",
+            },
+          }
+        : cached.execution.relationship_coverage === null
+          ? {}
+          : {
+              relationshipCoverage: cached.execution.relationship_coverage,
+            }),
       locations: cached.execution.locations,
-      subject:
-        subject === null
-          ? null
-          : subject.architecture === null
-            ? {
-                path: subject.path,
-                sha256: subject.sha256,
-                format: subject.format,
-              }
-            : {
-                path: subject.path,
-                sha256: subject.sha256,
-                format: subject.format,
-                architecture: subject.architecture,
-              },
+      subject,
     });
   }
 
@@ -246,8 +341,17 @@ export class AnalysisSnapshotCache {
     readonly execution: AnalysisExecution;
   }): void {
     const { target, profile, operation, parameters, execution } = input;
-    if (this.#entries.size >= 10_000) return;
     this.select(target, profile);
+    // The snapshot format does not carry reference truncation; a replay would
+    // present a capped read as complete, so it is not recorded.
+    if (execution.referencesTruncated === true) return;
+    const queryId = analysisQueryId(
+      snapshotTarget(target),
+      snapshotBinding(profile),
+      operation,
+      parameters,
+    );
+    if (!this.#entries.has(queryId) && !this.#hasCapacity()) return;
     const entry = createAnalysisSnapshotEntry({
       target: snapshotTarget(target),
       binding: snapshotBinding(profile),
@@ -260,8 +364,20 @@ export class AnalysisSnapshotCache {
 
   /** Forget all target-bound entries. */
   clear(): void {
-    this.#entries.clear();
+    this.#clearEntries();
     this.#target = undefined;
     this.#binding = undefined;
+  }
+
+  #clearEntries(): void {
+    this.#entries.clear();
+    this.#workflowEntries.clear();
+  }
+
+  #hasCapacity(): boolean {
+    return (
+      this.#entries.size + this.#workflowEntries.size <
+      SNAPSHOT_CACHE_ENTRY_CEILING
+    );
   }
 }

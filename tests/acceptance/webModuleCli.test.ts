@@ -24,7 +24,7 @@ cliTest(
       join(root, "files", "modules", "main.js"),
       artifacts.source,
     );
-    const manifestPath = join(root, "manifest.json");
+    const manifestPath = join(root, "manifest.json").replaceAll("\\", "/");
     await writeFile(manifestPath, JSON.stringify(manifest));
     const environment = {
       REA_LOG_LEVEL: "silent",
@@ -35,7 +35,9 @@ cliTest(
       environment,
       timeoutMs: 15000,
     });
-    expect(cliResponse.exitCode).toBe(0);
+    expect(cliResponse.exitCode, cliResponse.stdout + cliResponse.stderr).toBe(
+      0,
+    );
     expect(cliResponse.json).toMatchObject({
       normalized_result: {
         engine: null,
@@ -48,9 +50,12 @@ cliTest(
     const session = createTestBinarySession(() => {
       throw new Error("no binary acquisition");
     });
-    const server = createServer(session, session, {
-      webModuleTrace: createWebModuleTraceService(environment),
-    });
+    const server = createServer(
+      { kind: "session", session },
+      {
+        webModuleTrace: createWebModuleTraceService(environment),
+      },
+    );
     const client = new Client({ name: "module-cli-parity", version: "1" });
     onTestFinished(async () => {
       await client.close();
@@ -67,6 +72,6 @@ cliTest(
     });
     expect(response.isError).not.toBe(true);
     const expected = cliResponse.json;
-    expect(response.structuredContent).toMatchObject({ evidence: expected });
+    expect(response.structuredContent).toEqual(expected);
   },
 );

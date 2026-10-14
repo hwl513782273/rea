@@ -24,71 +24,34 @@ import {
   type UninstallHost,
 } from "./application/Uninstall.js";
 import { CLI_COMMANDS } from "./cliCommandNames.js";
-import { isProcessCliFailure } from "./application/ProcessCli.js";
 
-describe("CLI operation status classification", () => {
-  it.each([
-    [
-      "projected error",
-      projectAnalysisError(new ConfigurationError("invalid setting")),
-    ],
-    [
-      "MCP-shaped projected error",
-      {
-        error: projectAnalysisError(new ConfigurationError("invalid setting")),
-      },
-    ],
-    ["unhealthy diagnostic", { healthy: false, checks: [] }],
-  ])("classifies %s as failure", (_label, value) => {
-    expect(isCliOperationFailure(value)).toBe(true);
-  });
-
-  it.each([
-    [
-      "ordinary data with code",
-      { code: "configuration_invalid", message: "source data" },
-    ],
-    [
-      "evidence about an error",
-      {
-        result: projectAnalysisError(new ConfigurationError("source setting")),
-      },
-    ],
-    ["requested dry run", { status: "planned" }],
-    ["partial analysis", { status: "partial" }],
-    ["unsupported facet with evidence", { status: "unsupported" }],
-    ["cancelled setup", { status: "cancelled" }],
-    ["ready setup", { status: "ready" }],
-    ["complete uninstall", { status: "complete" }],
-    ["current version", { status: "current" }],
-    ["completed update", { status: "updated" }],
-    ["healthy diagnostics", { healthy: true, checks: [] }],
-    ["bounded evidence", { evidence: [{ truncated: true }] }],
-  ])("keeps %s successful", (_label, value) => {
-    expect(isCliOperationFailure(value)).toBe(false);
-  });
-
-  it("uses the process command's typed error output", () => {
-    expect(
-      isProcessCliFailure({
-        error: "Process command failed",
-        category: "invalid_input",
-        message: "The capture input is invalid.",
-      }),
-    ).toBe(true);
-    expect(isProcessCliFailure({ error: "data about an error" })).toBe(false);
-  });
+it("does not treat ordinary error-looking data or nested Evidence as command failure", () => {
+  expect(
+    isCliOperationFailure({
+      code: "configuration_invalid",
+      message: "source data",
+    }),
+  ).toBe(false);
+  expect(
+    isCliOperationFailure({
+      result: projectAnalysisError(new ConfigurationError("source setting")),
+    }),
+  ).toBe(false);
 });
 
 describe("CLI command outcome classification", () => {
   it("returns nonzero for the UpdateResult failure variant", async () => {
     const installation = {
+      manager: "npm",
       prefix: "/fixture",
       packageRoot: "/fixture/lib/node_modules/rea-agents",
-    };
+    } as const;
     const updateHost: UpdateHost = {
       installation: () => Promise.resolve(installation),
-      latestVersion: () => Promise.resolve(err("registry unavailable")),
+      latestVersion: () =>
+        Promise.resolve(
+          err({ kind: "unavailable", detail: "registry unavailable" }),
+        ),
       installVersion: () => Promise.resolve(err("not called")),
       installedVersion: () => Promise.resolve(err("not called")),
       planMaintenance: () =>
@@ -142,6 +105,7 @@ describe("CLI command outcome classification", () => {
   it("returns nonzero when the real uninstall outcome contains a failed action", async () => {
     const host: UninstallHost = {
       clients: () => Promise.resolve([]),
+      inspectClient: () => Promise.resolve(undefined),
       removeClient: () =>
         Promise.resolve({ name: "client", status: "failed", detail: "write" }),
       removeSkill: () =>

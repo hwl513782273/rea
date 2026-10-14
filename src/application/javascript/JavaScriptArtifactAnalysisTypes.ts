@@ -1,9 +1,12 @@
+import type { JavaScriptSourceMapReference } from "../../domain/javascript/javascriptSourceMapPaths.js";
 import type {
   JavaScriptSourceRange,
   JavaScriptStaticAnalysis,
 } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import type { JavaScriptSemanticIr } from "../../domain/javascript/javascriptSemanticIr.js";
+import type { JavaScriptModuleSemanticIr } from "../../domain/javascript/javascriptModuleSemanticIr.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
+import type { JsonValue } from "../../domain/jsonValue.js";
 
 interface JavaScriptStructuredObservation {
   readonly path: string;
@@ -42,9 +45,23 @@ export interface JavaScriptHtmlScriptObservation {
   readonly location: JavaScriptSourceRange;
 }
 
+/** Bounded source locations for inline JavaScript bodies skipped by analysis. */
+export interface JavaScriptHtmlInlineScriptsObservation {
+  readonly path: string;
+  readonly script_count: number;
+  readonly scripts: readonly {
+    readonly script_type: "classic" | "module";
+    readonly location: JavaScriptSourceRange;
+  }[];
+}
+
 /** One original source declared by a local source map. */
 export interface JavaScriptSourceMapOriginal {
-  readonly source: string;
+  /** Index within the leaf map's sources and sourcesContent arrays. */
+  readonly source_index: number;
+  /** Index across the flattened map's leaf declarations. */
+  readonly declaration_index: number;
+  readonly reference: JavaScriptSourceMapReference | null;
   readonly content: string | null;
   readonly content_sha256: string | null;
 }
@@ -87,26 +104,49 @@ export type JavaScriptJsonModuleObservation = JavaScriptStructuredObservation &
       }
   );
 
+/** Module facts needed after file-local semantic projection has finished. */
+export type { JavaScriptModuleSemanticIr } from "../../domain/javascript/javascriptModuleSemanticIr.js";
+
 /** One relevant file plus optional AST-only JavaScript facts. */
-export interface AnalyzedJavaScriptArtifactFile {
+export interface AnalyzedJavaScriptArtifactFile<
+  SemanticIr extends JavaScriptModuleSemanticIr = JavaScriptSemanticIr,
+> {
   readonly file: JavaScriptArtifactFile;
   readonly javascript: JavaScriptStaticAnalysis | null;
   readonly semantic: {
-    readonly ir: JavaScriptSemanticIr;
+    readonly ir: SemanticIr;
   } | null;
+  /** Operational incompleteness, distinct from a malformed source file. */
+  readonly analysis_failure?: {
+    readonly reason: string;
+    readonly error: JsonValue;
+    readonly limits: Readonly<Record<string, JsonValue>> | null;
+  };
+  /** Facts retained inline when their expanded graph exceeds available memory. */
+  readonly application_projection_failure?: {
+    readonly reason: string;
+    readonly error: JsonValue;
+    readonly limits: Readonly<Record<string, JsonValue>> | null;
+  };
 }
 
 /** Complete static-analysis projection before graph construction. */
-export interface JavaScriptArtifactAnalysis {
-  readonly files: readonly AnalyzedJavaScriptArtifactFile[];
+export interface JavaScriptArtifactAnalysis<
+  SemanticIr extends JavaScriptModuleSemanticIr = JavaScriptSemanticIr,
+> {
+  readonly files: readonly AnalyzedJavaScriptArtifactFile<SemanticIr>[];
   readonly packages: readonly JavaScriptPackageObservation[];
   readonly json_modules: readonly JavaScriptJsonModuleObservation[];
   readonly html_scripts: readonly JavaScriptHtmlScriptObservation[];
+  readonly html_inline_scripts: readonly JavaScriptHtmlInlineScriptsObservation[];
   readonly source_maps: readonly JavaScriptSourceMapObservation[];
   readonly visited_ast_nodes: number;
   readonly findings: number;
   readonly modules: number;
   readonly parse_failures: number;
-  readonly truncated_scopes: number;
   readonly limitations: readonly string[];
 }
+
+/** Artifact facts retaining only semantics used by application relationships. */
+export type JavaScriptModuleArtifactAnalysis =
+  JavaScriptArtifactAnalysis<JavaScriptModuleSemanticIr>;

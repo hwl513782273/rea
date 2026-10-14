@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { inferJsonShape } from "./jsonShape.js";
+import { inferJsonShape, jsonShapeSchema } from "./jsonShape.js";
+
+const property = (name: string) => ({ kind: "property" as const, name });
+const element = { kind: "array-element" as const };
 
 describe("inferJsonShape", () => {
   it("retains paths and types without retaining JSON values", () => {
@@ -18,14 +21,18 @@ describe("inferJsonShape", () => {
     expect(shape).toMatchObject({
       root_type: "object",
       properties: expect.arrayContaining([
-        { path: "/token", types: ["string"], observations: 1 },
         {
-          path: "/users/*/id",
+          path: [property("token")],
+          types: ["string"],
+          observations: 1,
+        },
+        {
+          path: [property("users"), element, property("id")],
           types: ["number", "string"],
           observations: 2,
         },
         {
-          path: "/users/*/active",
+          path: [property("users"), element, property("active")],
           types: ["boolean"],
           observations: 2,
         },
@@ -35,49 +42,82 @@ describe("inferJsonShape", () => {
     expect(JSON.stringify(shape)).not.toContain("second-secret");
   });
 
+  it("distinguishes array elements from literal star properties and counts primitive types", () => {
+    const shape = inferJsonShape('{"items":[{"*":1},[true,"x",null],2]}');
+    expect(shape?.properties).toEqual(
+      expect.arrayContaining([
+        {
+          path: [property("items"), element],
+          types: ["array", "number", "object"],
+          observations: 3,
+        },
+        {
+          path: [property("items"), element, property("*")],
+          types: ["number"],
+          observations: 1,
+        },
+        {
+          path: [property("items"), element, element],
+          types: ["boolean", "null", "string"],
+          observations: 3,
+        },
+      ]),
+    );
+  });
+
   it("rejects malformed JSON", () => {
     expect(inferJsonShape("not-json")).toBeNull();
   });
 
-  it.each([
-    ["é", "e\u0301", "e\u0341"],
-    ["é", "e\u0341", "e\u0301"],
-    ["e\u0301", "é", "e\u0341"],
-    ["e\u0301", "e\u0341", "é"],
-    ["e\u0341", "é", "e\u0301"],
-    ["e\u0341", "e\u0301", "é"],
-  ])("orders distinct collation-equal paths from %j, %j, %j", (...names) => {
-    for (const name of names) expect(name.localeCompare("é")).toBe(0);
-    const values: Readonly<Record<string, unknown>> = {
-      é: 1,
-      "e\u0301": "value",
-      "e\u0341": null,
-    };
-    const shape = inferJsonShape(
-      JSON.stringify(
-        Object.fromEntries(names.map((name) => [name, values[name]])),
-      ),
-    );
+  it("orders mixed array and property descendants with parents first", () => {
+    const shape = inferJsonShape('[{"z":1,"a":{"x":true}},[null],{"a":2}]');
 
-    expect(shape).toEqual({
-      root_type: "object",
-      node_count: 4,
-      max_depth_observed: 1,
-      properties: [
-        { path: "/e\u0301", types: ["string"], observations: 1 },
-        { path: "/e\u0341", types: ["null"], observations: 1 },
-        { path: "/é", types: ["number"], observations: 1 },
-      ],
+    expect(shape?.properties.map(({ path }) => path)).toEqual([
+      [element],
+      [element, element],
+      [element, property("a")],
+      [element, property("a"), property("x")],
+      [element, property("z")],
+    ]);
+    expect(shape?.properties[2]).toMatchObject({
+      types: ["number", "object"],
+      observations: 2,
     });
   });
 
-  it.each([false, true])(
-    "preserves nested types, counts, depth and pointer names with reversed keys: %s",
-    (reverse) => {
+  it("retains deep coverage and independently owned path segments", () => {
+    const depth = 512;
+    const shape = inferJsonShape("[".repeat(depth) + "1" + "]".repeat(depth));
+    expect(shape).not.toBeNull();
+    if (shape === null) return;
+
+    expect(shape.node_count).toBe(depth + 1);
+    expect(shape.max_depth_observed).toBe(depth);
+    expect(shape.properties).toHaveLength(depth);
+    expect(shape.properties.at(-1)).toEqual({
+      path: Array.from({ length: depth }, () => element),
+      types: ["number"],
+      observations: 1,
+    });
+    expect(jsonShapeSchema.parse(shape)).toEqual(shape);
+    expect(shape.properties[0]?.path[0]).not.toBe(shape.properties[1]?.path[0]);
+  });
+});
+
+describe("JSON shape completeness and ordering", () => {
+  it("preserves raw property names and code-point ordering independently of key insertion order", () => {
+    for (const reverse of [false, true]) {
       const object = (number: number, value: unknown) => {
         const entries = [
           ["é/~", number],
           ["e\u0301/~", value],
+          ["e\u0341/~", true],
+          ["A", false],
+          ["_", false],
+          ["a", false],
+          ["z", false],
+          ["\u{10000}", false],
+          ["\uE000", false],
         ];
         return Object.fromEntries(reverse ? entries.reverse() : entries);
       };
@@ -87,35 +127,72 @@ describe("inferJsonShape", () => {
 
       expect(shape).toEqual({
         root_type: "object",
-        node_count: 9,
+        node_count: 23,
         max_depth_observed: 4,
         properties: [
-          { path: "/nested", types: ["array"], observations: 1 },
           {
-            path: "/nested/*/e\u0301~1~0",
+            path: [property("nested")],
+            types: ["array"],
+            observations: 1,
+          },
+          {
+            path: [property("nested"), element],
+            types: ["object"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("A")],
+            types: ["boolean"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("_")],
+            types: ["boolean"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("a")],
+            types: ["boolean"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("e\u0301/~")],
             types: ["array", "null"],
             observations: 2,
           },
-          { path: "/nested/*/é~1~0", types: ["number"], observations: 2 },
+          {
+            path: [property("nested"), element, property("e\u0301/~"), element],
+            types: ["null"],
+            observations: 1,
+          },
+          {
+            path: [property("nested"), element, property("e\u0341/~")],
+            types: ["boolean"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("z")],
+            types: ["boolean"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("é/~")],
+            types: ["number"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("\uE000")],
+            types: ["boolean"],
+            observations: 2,
+          },
+          {
+            path: [property("nested"), element, property("\u{10000}")],
+            types: ["boolean"],
+            observations: 2,
+          },
         ],
       });
-    },
-  );
-
-  it("preserves the existing locale order for paths that do not tie", () => {
-    const names = ["z", "é", "A", "_", "a"];
-    const expected = names
-      .map((name) => `/${name}`)
-      .sort((left, right) => left.localeCompare(right));
-    expect(new Set(expected).size).toBe(names.length);
-    for (const [index, left] of expected.entries())
-      for (const right of expected.slice(index + 1))
-        expect(left.localeCompare(right)).not.toBe(0);
-    const shape = inferJsonShape(
-      JSON.stringify(Object.fromEntries(names.map((name) => [name, true]))),
-    );
-
-    expect(shape?.properties.map(({ path }) => path)).toEqual(expected);
+    }
   });
 
   it("retains every parsed property beyond the former shape-node limit", () => {
@@ -127,7 +204,7 @@ describe("inferJsonShape", () => {
     expect(shape?.properties).toHaveLength(5_001);
     expect(shape?.node_count).toBe(5_002);
     expect(shape?.properties).toContainEqual({
-      path: "/field_5000",
+      path: [property("field_5000")],
       types: ["number"],
       observations: 1,
     });

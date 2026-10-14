@@ -1,27 +1,18 @@
 import { z } from "zod";
+import { isAbsolute } from "node:path";
 
-import { artifactComparisonInputSchema } from "../domain/artifactComparison.js";
-import { bundleComparisonInputSchema } from "../domain/bundleComparison.js";
-import { callPathInputSchema } from "../domain/callPath.js";
-import { changedBehaviorInputSchema } from "../domain/changedBehavior.js";
-import { functionComparisonInputSchema } from "../domain/functionComparison.js";
-import { jsonValueSchema } from "../domain/jsonValue.js";
-import { processScenarioSchema } from "../domain/processCapture.js";
-import { processTraceSpecificationSchema } from "../domain/processTraceComparison.js";
-import { recordUnknownInputSchema } from "../domain/residualUnknown.js";
-import { reconstructionVerificationInputSchema } from "../domain/reconstructionVerification.js";
-import { staticRuntimeCorrelationInputSchema } from "../domain/staticRuntimeCorrelation.js";
+import { localPathStringSchema } from "../domain/localPath.js";
+
+import { processTraceSpecificationSchema } from "../domain/process/processTraceSpecification.js";
 import { evidenceSchema } from "../domain/evidence.js";
-import { updateUnknownInputSchema } from "../domain/residualUnknown.js";
-import {
-  openBinaryInputSchema,
-  closeBinaryInputSchema,
-} from "./sessionLifecycleInputs.js";
-import { binarySessionInputSchema } from "./sessionStatusContract.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
+import { evidenceRecordFiltersSchema } from "../domain/evidenceRecordSummary.js";
 
-/** Return the current canonical Evidence bundle inline. */
-export const getEvidenceBundleInputSchema = z.strictObject({});
+/** Complete retained Evidence, or selected discovery metadata without payloads. */
+export const getEvidenceBundleInputSchema = z.strictObject({
+  detail: z.enum(["complete", "summary"]).default("complete"),
+  filters: evidenceRecordFiltersSchema.optional(),
+});
 
 /** Optional document selection for volatile navigation context. */
 export const navigationContextInputSchema = z.strictObject({
@@ -36,7 +27,14 @@ export const addressContextInputSchema = z.strictObject({
 
 /** Session-owned Evidence bundle import options. */
 export const importEvidenceBundleInputSchema = z.strictObject({
-  path: z.string().min(1),
+  path: localPathStringSchema
+    .refine(isAbsolute, {
+      message:
+        "path must be an absolute local filesystem path (for example /tmp/evidence.json or C:\\rea\\evidence.json)",
+    })
+    .describe(
+      "Absolute local filesystem path for the evidence bundle to import; relative paths are rejected.",
+    ),
 });
 
 /** Evidence references for deterministic process comparison. */
@@ -54,25 +52,25 @@ export const listUnknownsInputSchema = z.strictObject({
     .optional(),
   severity: z.enum(["low", "medium", "high", "critical"]).optional(),
   domain: z.string().trim().min(1).optional(),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(0)
+    .describe("Zero-based offset in the stable filtered unknown ID order."),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(Number.MAX_SAFE_INTEGER)
+    .optional()
+    .describe(
+      "Optional maximum number of heads to return. Omit to return every matching head from offset.",
+    ),
 });
 
 /** Exact residual-unknown identity to revalidate. */
 export const verifyUnknownResolutionInputSchema = z.strictObject({
   unknown_id: prefixedDigestSchema("unk"),
 });
-
-export {
-  artifactComparisonInputSchema,
-  binarySessionInputSchema,
-  bundleComparisonInputSchema,
-  callPathInputSchema,
-  changedBehaviorInputSchema,
-  closeBinaryInputSchema,
-  functionComparisonInputSchema,
-  openBinaryInputSchema,
-  processScenarioSchema,
-  reconstructionVerificationInputSchema,
-  recordUnknownInputSchema,
-  staticRuntimeCorrelationInputSchema,
-  updateUnknownInputSchema,
-};

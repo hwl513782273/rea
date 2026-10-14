@@ -1,5 +1,24 @@
 import type { z } from "zod";
-import type { AnalysisInputIssue } from "./analysisErrorCore.js";
+import {
+  AnalysisInputError,
+  type AnalysisInputIssue,
+} from "./analysisErrorCore.js";
+
+/** Build the standard application input error while retaining schema causes and extra semantic issues. */
+export const analysisInputErrorFromIssues = (
+  operation: string,
+  issues: readonly z.core.$ZodIssue[],
+  input: unknown,
+  options: {
+    readonly cause?: unknown;
+    readonly additionalIssues?: readonly AnalysisInputIssue[];
+  } = {},
+): AnalysisInputError =>
+  new AnalysisInputError(
+    operation,
+    options.cause === undefined ? undefined : { cause: options.cause },
+    [...projectInputIssues(issues, input), ...(options.additionalIssues ?? [])],
+  );
 
 /** Project Zod failures to secret-safe caller correction metadata. */
 export const projectInputIssues = (
@@ -16,7 +35,23 @@ const projectIssue = (
     typeof part === "string" || typeof part === "number" ? [part] : [],
   );
   // Branch issue paths are relative to the union; branches often agree.
-  if (issue.code === "invalid_union")
+  if (issue.code === "invalid_union") {
+    // Unmatched discriminators and ambiguous unions have no branch issues.
+    // Keep their outer failure instead of flattening it into an empty list.
+    if (issue.errors.length === 0) {
+      const expected =
+        "options" in issue ? issue.options?.filter(isSafeExpected) : undefined;
+      return [
+        {
+          path,
+          reason:
+            valueAtPath(input, path) === undefined
+              ? "missing_argument"
+              : "invalid_value",
+          ...(expected === undefined ? {} : { expected }),
+        },
+      ];
+    }
     return uniqueIssues(
       issue.errors.flatMap((branch) =>
         branch.flatMap((branchIssue) =>
@@ -27,6 +62,7 @@ const projectIssue = (
         ),
       ),
     );
+  }
   if (issue.code === "invalid_key")
     return issue.issues.flatMap((keyIssue) =>
       projectIssue(

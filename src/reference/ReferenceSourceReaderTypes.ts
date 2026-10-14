@@ -1,10 +1,27 @@
-import { type BigIntStats } from "node:fs";
+import type { BigIntStats } from "node:fs";
 
-import { type Result } from "../domain/result.js";
+import type { Result } from "../domain/result.js";
+import type { AnalysisCleanupObservation } from "../domain/analysisErrorBase.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+
+export type ReferenceSourceEntryKind =
+  | "file"
+  | "directory"
+  | "symlink"
+  | "other";
+
+/**
+ * Kind offered to exclusion predicates. `unknown` marks an entry whose
+ * metadata could not be read, so its concrete kind cannot be claimed.
+ */
+export type ReferenceSourceExclusionKind = ReferenceSourceEntryKind | "unknown";
 
 export interface ReferenceSourceReaderOptions {
   readonly signal?: AbortSignal;
-  readonly shouldExclude?: (path: string) => boolean;
+  readonly shouldExclude?: (
+    path: string,
+    kind: ReferenceSourceExclusionKind,
+  ) => boolean;
 }
 
 export type ReferenceSourceFailureCode =
@@ -31,6 +48,7 @@ export type ReferenceSourceEntry =
       readonly status: "read";
       readonly kind: "symlink";
       readonly path: string;
+      /** Internal and relative missing targets are resolved from the inventory root. */
       readonly target: string;
       readonly targetState: "internal" | "external" | "missing";
     }
@@ -55,30 +73,37 @@ export interface ReferenceSourceReaderError {
   readonly tag: "reference-source-reader";
   readonly code: "cancelled" | "invalid-root" | "io" | "unsupported";
   readonly message: string;
+  readonly cleanup?: AnalysisCleanupObservation;
+  /** Captured entries before failure; this does not establish complete tree coverage. */
+  readonly partial?: ReferenceSourceRead;
+  readonly cause?: unknown;
 }
-
-export type BigStats = BigIntStats;
 
 export type PendingDirectory = {
   readonly path: string;
 };
 
 export type TraversalState = {
+  readonly resources: ArtifactResourceScope;
   readonly root: string;
-  readonly rootIdentity: BigStats;
+  readonly rootIdentity: BigIntStats;
   readonly signal?: AbortSignal;
-  readonly shouldExclude?: (path: string) => boolean;
+  readonly shouldExclude?: (
+    path: string,
+    kind: ReferenceSourceExclusionKind,
+  ) => boolean;
   readonly entries: ReferenceSourceEntry[];
   readonly pending: PendingDirectory[];
   bytesRead: number;
 };
 
 export type StableFileRequest = {
+  readonly resources: ArtifactResourceScope;
   readonly root: string;
-  readonly rootIdentity: BigStats;
+  readonly rootIdentity: BigIntStats;
   readonly absolute: string;
   readonly path: string;
-  readonly expected: BigStats;
+  readonly expected: BigIntStats;
   readonly signal?: AbortSignal;
 };
 

@@ -1,19 +1,26 @@
+import { ok as resultOk } from "../../../src/domain/result.js";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-import type { AnalysisClient } from "../../../src/application/AnalysisProvider.js";
+import {
+  createAnalysisExecution,
+  type AnalysisClient,
+} from "../../../src/application/AnalysisProvider.js";
+import type { AnalysisProfileCommitment } from "../../../src/domain/analysisProfile.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { ARTIFACT_COMPARISON_EXAMPLE } from "../../../src/contracts/artifactComparisonExample.js";
 import { PROCESS_CAPTURE_REFERENCE } from "../../../src/contracts/investigationExamples.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../../src/domain/process/processCaptureExample.js";
 import { createEvidence } from "../../../src/domain/evidence.js";
 import { createArtifactInspection } from "../../../src/domain/artifactInspection.js";
 import { artifactInventoryResultSchema } from "../../../src/domain/artifactGraph.js";
 import { jsonValueSchema } from "../../../src/domain/jsonValue.js";
 import { createPromptCompletionSource } from "../../../src/server/promptCompletion.js";
 import { observed } from "../../fixtures/analysisExecution.js";
+import { createAnalysisProfile } from "../../../src/domain/analysisProfile.js";
 
 let directory: string | undefined;
 
@@ -26,12 +33,33 @@ afterEach(async () => {
 describe("guided prompt completion from live analysis", () => {
   it("reads live documents and complete procedures without ambiguous names", async () => {
     const requests: Array<Readonly<Record<string, unknown>>> = [];
-    const session = createTestBinarySession(() => client(requests));
+    const session = createTestBinarySession(
+      (_target, profile) => client(requests, profile),
+      {
+        resolveAnalysisProfile: () =>
+          Promise.resolve(
+            resultOk({
+              profile: createAnalysisProfile(
+                {
+                  id: "fixture",
+                  name: "Fixture analysis provider",
+                  version: "1",
+                },
+                { fixture: true },
+              ),
+            }),
+          ),
+      },
+    );
     directory = await createTestTempDirectory("rea-prompt-completion-");
     const target = join(directory, "fixture.hop");
     await writeFile(target, "fixture");
     expect((await session.open(target)).ok).toBe(true);
     const completion = createPromptCompletionSource(session, session);
+    expect(await completion.complete("document", "app")).toEqual([]);
+    expect(await completion.complete("procedure", "")).toEqual([]);
+    const warmed = await session.execute("list_documents", {});
+    if (!warmed.ok) throw warmed.error;
 
     expect(await completion.complete("document", "app")).toEqual([
       "App",
@@ -43,9 +71,7 @@ describe("guided prompt completion from live analysis", () => {
       }),
     ).toEqual(["0x1000", "0x2000", "0x3000", "0x4000", "tail", "unique"]);
     expect(requests).toEqual([{ document: "App" }]);
-    expect(await completion.complete("provider", "uni")).toEqual([
-      "unidentified",
-    ]);
+    expect(await completion.complete("provider", "fix")).toEqual(["fixture"]);
     expect(await completion.complete("document", "x".repeat(4_097))).toEqual(
       [],
     );
@@ -57,6 +83,36 @@ describe("guided prompt completion from live analysis", () => {
 });
 
 describe("guided prompt completion from investigation records", () => {
+  it("excludes process captures missing canonical executable identity", async () => {
+    const session = createTestBinarySession(() => client([]));
+    const {
+      selected_executable_sha256: _selectedDigest,
+      executable_identity: _identity,
+      executable_sha256,
+      ...legacyManifest
+    } = EMPTY_PROCESS_CAPTURE_EXAMPLE.manifest;
+    const legacyCapture = {
+      ...EMPTY_PROCESS_CAPTURE_EXAMPLE,
+      manifest: { ...legacyManifest, executable_sha256 },
+    };
+    const evidence = createEvidence(undefined, fixtureProvider, {
+      operation: "capture_process_scenario",
+      parameters: {},
+      result: legacyCapture,
+      confidence: "observed",
+      authority: "controlled-replay",
+      environment: fixtureEnvironment,
+    });
+    expect(session.recordEvidence(evidence).ok).toBe(true);
+    const completion = createPromptCompletionSource(session, session);
+
+    expect(
+      await completion.complete("capture", evidence.evidence_id.slice(0, 8)),
+    ).toEqual([]);
+
+    await session.close();
+  });
+
   it("projects only validated typed identifiers from the evidence ledger", async () => {
     const session = createTestBinarySession(() => client([]));
     const invalidCapture = createEvidence(undefined, fixtureProvider, {
@@ -224,14 +280,23 @@ const fixtureEnvironment = {
 
 const client = (
   requests: Array<Readonly<Record<string, unknown>>>,
-): AnalysisClient => ({
-  execute(operation, parameters) {
+  analysisProfile?: AnalysisProfileCommitment,
+): AnalysisClient => {
+  const observe = (value: unknown) =>
+    resultOk(
+      createAnalysisExecution(
+        value,
+        analysisProfile?.provider ?? fixtureProvider,
+        analysisProfile === undefined ? {} : { analysisProfile },
+      ),
+    );
+  const execute: AnalysisClient["execute"] = (operation, parameters) => {
     if (operation === "list_documents")
-      return Promise.resolve(observed(["AppTests", "App", "App"]));
+      return Promise.resolve(observe(["AppTests", "App", "App"]));
     if (operation === "list_procedures") {
       requests.push(parameters);
       return Promise.resolve(
-        observed([
+        observe([
           { address: "0x1000", value: "duplicate" },
           { address: "0x2000", value: "unique" },
           { address: "0x3000", value: "duplicate" },
@@ -239,7 +304,11 @@ const client = (
         ]),
       );
     }
-    return Promise.resolve(observed(null));
-  },
-  close: () => Promise.resolve(),
-});
+    return Promise.resolve(observe(null));
+  };
+  return {
+    execute,
+    executeIfReady: execute,
+    close: () => Promise.resolve(resultOk(null)),
+  };
+};

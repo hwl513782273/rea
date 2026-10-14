@@ -2,6 +2,7 @@ import type { ObjcSwiftMetadata } from "../domain/native/objcSwiftMetadata.js";
 import type { Section } from "./AppleMachoSelection.js";
 import type { ObjcDispatchReaders } from "./AppleObjcDispatchFacets.js";
 import { readObjcPropertiesOf } from "./AppleObjcProperties.js";
+import { issue, type DecodeIssue } from "./AppleDispatchDecodeFacts.js";
 
 const CLASS_SYMBOL = /^_OBJC_(?:META)?CLASS_\$_(.+)$/u;
 
@@ -22,7 +23,7 @@ export const decodeObjcCategories = (input: {
   readonly sections: readonly Section[];
   readonly read: ObjcDispatchReaders;
   readonly result: ObjcSwiftMetadata;
-  readonly failures: string[];
+  readonly issues: DecodeIssue[];
   readonly admit: () => boolean;
   /** Decode a method list into implementations attributed to the category. */
   readonly methods: (
@@ -35,7 +36,7 @@ export const decodeObjcCategories = (input: {
   /** Name of a class defined in this image, from its class_ro_t. */
   readonly localClassName: (address: bigint) => string;
 }): number => {
-  const { read, result, failures } = input;
+  const { read, result } = input;
   let examined = 0;
   for (const section of input.sections.filter(
     ({ name }) => name === "__objc_catlist",
@@ -79,7 +80,8 @@ export const decodeObjcCategories = (input: {
           properties: readObjcPropertiesOf(read, read.pointer(category + 40n), {
             owner: `category ${name}`,
             admit: input.admit,
-            failures,
+            issues: input.issues,
+            location: `0x${read.pointer(category + 40n).toString(16)}`,
           }),
           location: read.location(category),
           decode:
@@ -89,8 +91,14 @@ export const decodeObjcCategories = (input: {
           evidence: read.evidence(category, "Objective-C category_t record"),
         });
       } catch (cause: unknown) {
-        failures.push(
-          `Category at ${`0x${field.toString(16)}`}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        const message = cause instanceof Error ? cause.message : String(cause);
+        input.issues.push(
+          issue(
+            "objc_properties_categories",
+            "category_decode_failed",
+            message,
+            `0x${field.toString(16)}`,
+          ),
         );
       }
     }

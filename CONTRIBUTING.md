@@ -1,16 +1,206 @@
 # Contributing to REA
 
-REA welcomes focused bug fixes, documentation improvements, tests, and reverse-engineering workflow enhancements. Open an issue before a large contract or architecture change so its scope can be agreed before implementation.
+REA welcomes focused bug fixes, documentation improvements, tests, and reverse-engineering workflows. For large contract or architecture changes, explain the intended scope and link the relevant issue or design discussion.
 
-For capability organization and provider composition, follow the incremental
-[migration guide](docs/capability-migration.md). Run `npm run verify:test-discovery`
-after adding or moving tests.
+## Choosing a contribution
+
+Explain the concrete problem, keep related corrections together, and report
+verification and unavailable coverage. Contributions should justify their review
+and maintenance cost. Keep cosmetic polish with useful fixes; confusing or
+incorrect user instructions warrant standalone corrections. Collect other
+cosmetic-only suggestions in an issue rather than separate PRs.
+
+For capability organization and provider composition, use the
+[architecture map](docs/architecture.mermaid). Production factories in
+`src/composition/` construct fresh providers without starting engines or acquiring
+targets; optional adapter failures must preserve successful peers. Run
+`npm run verify:test-discovery` after adding or moving tests. Resolved import
+boundaries are checked by `npm run verify:module-boundaries`, included in lint.
+
+For analysis workflows and agent interfaces, follow the
+[performance priorities](AGENTS.md#performance). Explain the selected output
+scope, reuse/cache decisions, and relevant before/after measurements when these
+costs change.
 
 When adding or changing an MCP tool, follow the [tool design guide](docs/tool-design.md) and preserve the canonical contracts and generated catalog.
 
+## Reporting issues
+
+Use the issue form that fits the report and keep it concise. For bugs, include
+the actual result, the shortest reproduction you ran, the tested version and
+environment, and the smallest useful output, artifact, screenshot, or source
+reference. Ground expected behavior in documentation, source, or a known-good
+version when available. State observed impact and frequency; keep untested scope
+and suspected causes explicit.
+
+Incomplete reports and intermittent failures are welcome. If a narrative answer
+or supporting evidence is unavailable, write `NOT_ENOUGH_INFO` and explain the
+gap. Clearly label source-only findings and proposed checks; do not claim runtime
+reproduction or results you did not observe. A root-cause analysis or fix is not
+required to report a problem. Documentation reports should identify the relevant
+passage or missing guidance and explain the correction or confusion.
+
+Feature and design proposals can start with a problem and desired outcome.
+Examples, prior art, and measurements help when available; ideas without them
+are welcome. Maintainers can investigate reports and help resolve open questions.
+Human ownership and readiness declarations apply to PRs as described below.
+
+## Pull request ownership and readiness
+
+AI-assisted contributions are welcome. Every PR must have a human owner who
+takes responsibility for the complete change, including code, tests,
+documentation, and claims produced with AI assistance. The PR author is the
+owner unless another human is named in the PR and explicitly accepts ownership.
+These requirements also apply to maintainer-authored PRs.
+
+Before requesting maintainer review, the human owner must:
+
+- Review the final diff and relevant existing code. Be able to explain the
+  problem, the chosen approach, how it fits REA, and meaningful edge cases.
+- Provide evidence that the change works. Summarize what was checked, the
+  observed results, and meaningful gaps in the PR body. Use focused tests,
+  representative CLI/MCP output, CI artifacts, screenshots, or other checks
+  appropriate to the change. For fixes, show the original failure and why the
+  regression coverage catches it when practical. Documentation-only changes
+  can use source, link, or rendered-document checks. Label source-derived
+  conclusions and proposed checks accurately; never report an unrun check as
+  passing. Follow the [verification requirements](#development-feedback-and-pr-verification)
+  for required checks and real-provider coverage.
+- Complete the **Author readiness** declaration in the PR template, explicitly
+  stating that the PR is ready for initial review.
+
+Keep the PR description concise and current. Explain the problem, observable
+outcome, approach, and useful evidence; link long logs or put them in optional
+details. Address actionable automated review findings and explain disagreements.
+Human ownership and review remain required when CI or an automated reviewer
+reports success. Readiness requests maintainer review; it does not grant scope
+approval or permission to merge.
+
+Draft PRs may request early feedback with open questions and incomplete checks.
+Leave the readiness declaration unchecked until the human owner has completed
+it. The declaration records initial readiness; later pushes do not invalidate
+it or require another human sign-off. Keep the PR description and affected
+validation current as work changes. AI agents must leave human declarations to
+the human owner and must not attest to a human review on their behalf.
+
+The `PR readiness` check reports pending for drafts and requires a named human
+owner and all three template declarations for non-drafts. It checks that the
+declaration is filled, not whether the code or evidence is correct. Existing PRs
+can copy the **Author readiness** section from the current template.
+Open PRs must have distinct head commits because GitHub shares commit statuses.
+
+Maintainers enable merge enforcement after the workflow is merged: run
+`gh workflow run pr-readiness.yml -f pull_request_number=NUMBER` for existing
+open PRs, then add `PR readiness` from GitHub Actions to the branch's required
+status checks alongside its existing checks. Deploy the workflow to each
+protected target branch before requiring it there. The workflow reads PR
+metadata using trusted default-branch code and writes only a commit status.
+
+Maintainers may return a PR to the author or close it when the problem is
+unsupported, validation is missing, or the owner cannot explain the change.
+Contributors are responsible for completing this work before requesting review.
+
+## Contribution scope
+
+REA focuses on software structure, runtime behavior, and evidence through
+general-purpose reverse-engineering workflows. Evaluate a proposal by its actual
+capabilities, side effects, defaults, and complete workflow. A tool name or a
+reference to vulnerability research, malware analysis, or CTFs does not determine
+whether it belongs in REA.
+
+Supported contributions include format inspection, ordinary archive and standard
+compression extraction, disassembly, decompilation, cross-references, general
+static deobfuscation, vulnerability analysis, and evidence reporting. Static
+protection detection is distinct from defeating that protection. Security fixes
+and isolated regression tests remain in scope.
+
+Runtime investigation needs explicit boundaries. Launching or attaching to a
+process, injecting instrumentation, running scripts, and changing memory or
+registers require review of target selection, execution and mutation authority,
+provenance, resource limits, cancellation, and cleanup. General Frida or debugger
+support is not inherently read-only, and existing support does not authorize
+every workflow built on it. General-purpose interfaces are not classified as
+dedicated bypass workflows solely because caller-provided code could be misused;
+their execution and mutation authority must still be reviewed.
+
+REA does not integrate or officially distribute:
+
+- Purpose-built workflows to defeat commercial packing or code-virtualization
+  protections and automatically recover protected code.
+- Anti-debugging or anti-instrumentation evasion, or DRM, license, anti-cheat, or
+  access-control bypass workflows.
+- Exploit or attack-payload automation, credential theft, covert persistence,
+  unauthorized access, or bulk attack workflows.
+
+These boundaries apply to first-party providers, adapters, plugins, bundled
+scripts, defaults, examples, and documentation. Moving a capability into an
+optional dependency or plugin does not exempt it. Review what the integration
+exposes, including upstream defaults and raw-command or script execution paths.
+Ordinary extraction and general static deobfuscation are not excluded merely
+because the input is packed or obfuscated; assess added bypass or execution
+behavior separately.
+
+This is a product and maintenance boundary, not a judgment about a contributor's
+intentions or a declaration that all excluded research is unlawful. Contributors
+must have the rights and authorization needed for their work. A local-only design
+or an "authorized use only" disclaimer does not establish containment or settle
+legal and scope questions.
+
+### Fail-closed integration
+
+If scope fit, target or authorization boundaries, side effects, or the verification
+needed to establish those boundaries remain materially unresolved, **do not merge,
+enable, or include the capability in official packages or distributions**. Keep
+the proposal pending, narrow it, or decline it. Record unknowns explicitly; do not
+turn them into "none" or assumed safety. Passing CI, completed implementation,
+upstream popularity, or silence from maintainers is not scope approval.
+
+For a new provider or a capability involving target execution, injection,
+mutation, or protection recovery, seek an explicit maintainer scope decision in
+the linked issue or design discussion before substantial implementation intended
+for integration. Small exploratory prototypes and draft PRs may help inform that
+decision; they do not authorize integration. The decision must cover the final
+proposed behavior; a scope expansion needs a new decision. Routine fixes and
+documentation changes within existing boundaries do not need a separate advance
+decision, but must not silently expand those boundaries.
+
+### Starting a proposal
+
+To open a feature request or design discussion, describe the problem and desired
+outcome or decision. Short answers and the forms' "Not sure yet" options are
+welcome. You do not need code, a complete design or test plan, legal analysis, or
+private proof-of-authorization documents to start a discussion. Share what you
+know and leave optional details blank when you need help.
+
+Form selections guide triage; they are not proof of authorization or scope
+approval. Unselected effects must not be treated as established absence.
+Maintainers and implementers work together to resolve the following before
+integration:
+
+- The concrete analyst question, requested inputs and outputs, and why existing
+  REA operations are insufficient.
+- Why the workflow fits this scope, its non-goals, and any protection recovery,
+  bypass, or attack automation it would expose.
+- The selected targets and every execution, injection, mutation, network, or
+  persistence effect, including behavior inherited from upstream tools.
+- How the boundaries and outcome will be verified with self-owned or appropriately
+  licensed samples; identify real CLI/MCP and provider coverage, cleanup and
+  resource checks, and remaining unknowns. Do not publish private binaries,
+  credentials, or sensitive target data; follow [SECURITY.md](SECURITY.md) for
+  private vulnerability reports.
+
+Mixed proposals should separate acceptable analysis capabilities from excluded
+workflows so each can be decided independently. An issue may discuss unresolved
+questions; opening an issue or PR does not authorize integration. This is a
+maintainer integration gate, not a per-call confirmation requirement or a sandbox
+guarantee.
+
 ## Development setup
 
-REA development requires Node.js 24.18.x and npm 11.16.x (pinned toolchain via `nvm use`; the supported runtime range is Node.js ^22.19 || ^24.11 || >=26, as the README badge states). Real-Hopper verification additionally requires either macOS 12+ or an officially supported Linux host (Ubuntu 24.04+, Fedora 41+, 64-bit Arch, or CachyOS) and an installed Hopper application. Linux demo verification uses its own private Xvfb display and does not require a desktop session. Run `nvm use` before installing dependencies.
+Use the development toolchain pinned in `.nvmrc` and
+`package.json#packageManager`. Run `nvm use` before installing dependencies;
+installed-package runtime support is documented in
+[installation](docs/installation.md#start-setup).
 
 ```bash
 npm ci
@@ -19,133 +209,158 @@ npm run check:fast
 
 `npm ci` installs the exact dependencies and prepares the Husky hooks without
 building the project. Run `npm run build:cached` when you need the standalone
-CLI or MCP server; `npm run build` remains the uncached compiler leaf used by
-Turbo. Turbo caches deterministic builds and static checks across Git
-worktrees. After a package, lockfile, or managed-skill version change, run
+CLI or MCP server; it compiles the runtime and bundles the authored skill.
+`npm run build` forces those tasks to rerun. Neither command generates test
+catalogs, documentation projections, or managed verification evidence. Turbo
+caches deterministic builds and static checks across Git worktrees. After a package, lockfile, or managed-skill version change, run
 `npm run metadata:generate` before building.
 
-Keep dependencies flowing inward through the existing domain, contracts, provider, application, server, and adapter layers. Parse unknown values at process and protocol boundaries, model expected failures with `Result`, and preserve the canonical tool inventory defined by `TOOL_CONTRACTS` unless a deliberate contract change updates every verifier, generated catalog artifact, and snapshot. Keep tool discovery complete and report capability- and session-scoped availability through `binary_session`.
+Repository invariants live in [AGENTS.md](AGENTS.md). Keep provider-specific
+protocols in adapters and shared CLI/MCP workflows in the application layer.
+
+### Windows source checkouts
+
+The published npm package includes the Windows x64 native addon and its
+manifest. A source checkout does not: `native/windows/build/` is ignored by
+Git, and neither `npm ci` nor `npm run build:cached` (or `npm run build`)
+produces `rea-windows-x64.node` or `manifest.json` in that directory.
+Windows workflows and tests that require native controls need these artifacts;
+without them, those controls are unavailable even after a successful runtime build.
+
+Follow the [Windows native build guide](native/windows/README.md#build) before
+running those workflows from source. The artifact build requires Linux,
+MinGW-w64, and `tar`; the build script does not run on Windows. See that guide
+for the build and artifact-verification commands and the separate real Windows
+verification prerequisites. Keep the generated addon and manifest uncommitted.
 
 ## Documentation website
 
-The VitePress site uses the Markdown files in `docs/` and deploys to
-<https://morluto.github.io/rea/>. Run `npm run docs:dev` for live editing,
-`npm run docs:build` to check the production build and links, and
-`npm run docs:preview` to preview that build at `/rea/`.
+The VitePress site uses the Markdown files in `docs/`. Run `npm run docs:dev`
+for live editing, `npm run docs:build` to check the production build and
+links, and `npm run docs:preview` to preview that build at `/rea/`.
 
 Site navigation lives in `docs/.vitepress/config.ts`. Keep links to guides
 relative so they work on GitHub and the website; link to repository files
 outside `docs/` using their full GitHub URLs. Generated reference documents
-still use `npm run docs:generate`; `docs:build` only builds the website.
+use `npm run docs:generate`; `docs:build` generates them before building the website.
 
-The documentation workflow builds pull requests and deploys changes on `main`.
-The repository's **Settings → Pages → Build and deployment → Source** must be
-set to **GitHub Actions** before the first deployment.
+Pull requests run `npm run docs:check`. `.github/workflows/pages.yml` is a
+manual VitePress build and does not publish. The public site at
+<https://rea.tools/> serves `website/public/` through Cloudflare Workers. See
+the [website README](website/README.md#cloudflare-workers) for previews and
+manual deployments.
+
+The separate GitHub Pages host uses only the manual
+`.github/workflows/website-pages.yml` workflow on `main`. The repository's
+**Settings → Pages → Build and deployment → Source** must be set to
+**GitHub Actions** before deploying there.
 
 ## Development feedback and PR verification
 
-For an ordinary edit, run the relevant regression and cached static checks:
+For routine merges, wait for the required checks to pass for the current PR
+revision. Administrators retain an override for deliberate maintainer recovery.
+If `main` is broken, prioritize a focused repair before updating affected PRs.
+
+Select checks for the behavior changed. For a source edit:
 
 ```bash
 npm run test:focused -- src/config.test.ts
 npm run check:fast
 ```
 
-`test:local` selects dirty source tests without building; explicit source test
-paths run even on a clean tree. `check:changed` adds source tests affected since
-the branch merge base with `origin/main`. Use `npm run test:changed -- --base
-REVISION` to choose another base. Changed-test selection follows the import
-graph and is feedback, not complete correctness evidence. Inspect relevant
-boundary and provider behavior explicitly; see [docs/testing.md](docs/testing.md).
+`test:local` runs source tests without building. `check:changed` combines cached
+static checks with source tests affected since the merge base with `origin/main`.
+Import-graph selection can miss runtime registration, bridges, and generated data;
+select relevant boundary tests explicitly. See [testing](docs/testing.md#developer-commands)
+for commands, test placement, pruning, and real-provider prerequisites.
 
-Before handing off a PR, run the relevant tests, `npm run check`, and
-`npm run docs:check` when contracts or generated metadata change. Record which
-checks ran. CI owns complete deterministic tests and aggregate coverage. Use
-`npm run check:pr` for a deliberate full local gate on broad changes or when
-investigating CI failures; it is not required after each edit, rebase, or push.
-Packaging, setup, installation, or distribution changes also require
-`npm run verify:package` and `npm pack --dry-run`. Provider behavior changes
-require the matching real-provider `verify:*` lane.
+Before requesting review, run relevant tests and `npm run check`; add
+`npm run docs:check` when contracts or generated metadata change. Record the
+checks and unavailable coverage. CI owns the full deterministic suite and
+coverage. `npm run check:pr` is an optional full local gate for broad changes or
+CI diagnosis. Packaging/setup/distribution changes additionally require
+`npm run verify:package` and `npm pack --dry-run`; provider changes require the
+matching real-provider lane. State which host/provider workflows ran.
 
-`check:fast` runs cached typecheck and lint, reporting diagnostics on failure.
-`check` adds formatting, dead-code, and package-metadata freshness checks.
-Formatting uses Oxfmt and the committed `.oxfmtrc.json`; generated sources use
-the same configuration. Pre-commit formats and lints staged files; pre-push runs
-`check:fast`.
-`docs:check` checks committed generated metadata. `docs:generate` regenerates
-those files, and the docs CI lane checks them.
-Real-provider execution remains uncached; deterministic builds use Turbo.
+For CI/test correctness, drift, or performance investigations, use the
+[`rea-ci-tests-audit` contributor skill](.agents/skills/rea-ci-tests-audit/SKILL.md).
+It guides reproduction and comparable measurements before changing checks.
 
-Local `npm test` runs every deterministic Vitest project without coverage or
-retries. CI runs four coverage shards and merges JUnit and timing reports.
-CI cancels superseded PR runs and skips package, Windows, and full test lanes
-for documentation-only PRs. Coverage thresholds remain in `vitest.config.ts`.
+`check:pr` reuses build and static-check outputs while executing the test suite
+fresh, including the fast Python producer checks. `docs:check` also runs the
+onboarding example consistency suite for README-only changes.
 
-Tests that need a temporary directory must use
-`createTestTempDirectory` from `tests/fixtures/temporaryDirectory.ts`. The
-helper binds exact-path, awaited cleanup to the current Vitest case, including
-failure and timeout completion. Run `npm run verify:test-temp-hygiene` to build
-REA, execute the complete suite under a fresh `TMPDIR`, and reject any remaining
-REA-owned temporary path. Never add a glob cleanup for shared `/tmp/rea-*`
-content.
+Pre-commit formats and lints staged files; pre-push runs `check:fast`.
 
-Set `REA_LOG_LEVEL` to `trace`, `debug`, `info`, `warn`, `error`, `fatal`, or
-`silent` to control structured JSON diagnostics. MCP mode defaults to `info` and
-always writes logs to stderr so the stdio protocol remains intact. One-shot CLI
-logging is opt-in and writes to stdout when a level is configured, preserving
-machine-readable command output by default. Request arguments, bridge
-authentication tokens, and environment data are redacted.
+### Generated files and command ownership
 
-Changes that claim real Hopper behavior must also be tested against the
-source-owned, digest-bound conformance manifest. The verifier builds the
-platform-native fixtures before starting Hopper:
+`docs:generate` prepares documentation and portable managed evidence;
+`evidence:generate` prepares only the managed commitment and its runtime/skill
+dependencies. The ignored outputs are `docs/public/product-catalog.json`,
+`docs/verification/managed-conformance-*.json`, and `skills/`. Edit authored
+skill instructions in `.agents/skills/reverse-engineer-anything/`, where Skills
+can discover the public bundle directly from a clean checkout. `verify:package`
+installs that bundle with Skills 1.7.2 using default repository-root discovery
+and checks every installed file, alongside the packaged setup checks.
+CI validates generated outputs and retains them as artifacts; do not commit
+them. Reviewed source metadata, including
+`src/generatedPackageMetadata.ts` and `docs/error-contract.schema.json`, remains
+tracked and checked for freshness.
 
-```bash
-npm run verify:hopper
-```
+The packaged skill contains instructions and inventory metadata, not runtime
+schema hashes. Its conformance commitment covers that exact bundle and portable
+verification; it does not attest optional real-provider runs. Schema-only changes
+should not alter that commitment. Doctor and `binary_session` expose runtime
+schema identity.
 
-On a self-hosted Linux runner with the setup-installed Xvfb dependencies, use:
+Build/generation commands hold a SQLite transaction around the entire Turbo
+graph, including cache restoration. `.cache/rea-command-locks/` databases identify
+locks, not stale files; never remove them while commands run. POSIX cancellation
+retains process-group ownership until settlement; Windows waits for completion.
+Real-provider execution is uncached.
 
-```bash
-npm run verify:hopper:linux
-```
+### Temporary files and diagnostics
 
-Set `REA_HOPPER_CONFORMANCE_MANIFEST_PATH` only to verify another source-built
-manifest. The normal commands use `build/conformance/manifest.json`; generated
-fixtures and manifests remain ignored and must not be committed.
+Tests use `createTestTempDirectory` from `tests/fixtures/temporaryDirectory.ts`
+for exact-path, awaited cleanup, including failures and timeouts.
+`npm run verify:test-temp-hygiene` runs the suite under a fresh `TMPDIR` and
+rejects remaining REA-owned paths. Never glob-clean shared `/tmp/rea-*` content.
 
-The macOS and Linux real-Hopper workflows remain separate so a successful mock or package test cannot be reported as platform-runtime proof. Pull requests changing setup, launch, bridge, or Hopper behavior must state which real workflows ran and why either workflow was unavailable.
+`REA_LOG_LEVEL` selects `trace`, `debug`, `info`, `warn`, `error`, `fatal`, or
+`silent`. Logs go to stderr: MCP defaults to `info`, and one-shot CLI logging
+is opt-in, so stdout carries only protocol messages and command results.
+Request arguments, bridge tokens, and environment data are redacted from
+diagnostic logs.
 
-Describe the behavior change and verification performed in the pull request. Never commit binaries, Hopper documents, credentials, `dist/`, `node_modules/`, or local planning artifacts.
+## Real Hopper changes
+
+Run `npm run verify:hopper` on a supported macOS host or
+`npm run verify:hopper:linux` on the supported Linux demo runner. These build
+native fixtures and verify the installed engine through CLI/MCP; package or
+simulated-provider checks do not establish engine behavior. See
+[real-toolchain verification](docs/testing.md#end-to-end-integration-and-golden-evidence)
+for prerequisites and scope, and [Hopper setup](docs/installation.md#hopper)
+for supported hosts and unattended startup.
+
+Use the default `build/conformance/manifest.json` unless explicitly verifying
+another source-built manifest with `REA_HOPPER_CONFORMANCE_MANIFEST_PATH`.
+Generated fixtures and manifests remain ignored.
 
 ## Maintainer release checklist
 
-Run `npm run check:pr`, the isolated package verifier, package dry run, and two-target real-Hopper verifier described above. Build a local tarball and exercise the executable through the package boundary:
+Use the [release guide](docs/releasing.md). Main pushes automatically refresh a
+Release Please PR with the next version and changelog. Review its migration
+notes, wait for the current CI checks to pass, and merge it into main to publish.
 
-```bash
-npm pack
-```
+The Release workflow validates and tags that merge; both publishers build its
+exact SHA. Ordinary main pushes cannot publish packages. An optional manual
+`release/VERSION` checkpoint retains explicit preparation and publication.
 
-Use the exact filename printed by `npm pack` to run the packaged executable:
+For grouped release notes with verified contributor thanks, use the repository's
+`rea-changelog-update` skill in `.agents/skills/rea-changelog-update/`. Its inventory,
+credit checks, and finalization process are described in the release guide.
 
-```bash
-npm exec --yes --package ./rea-agents-VERSION.tgz -- rea --help
-```
-
-Replace `VERSION` with the packed version; do not use a tarball from an earlier
-build.
-
-Publish the public package:
-
-```bash
-npm publish --access public
-```
-
-After npm registry propagation, verify the published CLI and connect the client SDK version pinned in `package.json` to the published server to confirm the canonical tool catalog:
-
-```bash
-npx -y rea-agents@latest --help
-npx -y rea-agents@latest doctor
-npx -y rea-agents@latest setup --yes --all-detected
-npx -y rea-agents@latest mcp
-```
+Keep new implementation commits on main for the next release. The workflow
+owns packaged-artifact verification, npm publication, the published CLI/MCP
+canary, and MCP Registry publication. Sync manual checkpoint metadata back to
+main after publication; see the guide for recovery and verification.

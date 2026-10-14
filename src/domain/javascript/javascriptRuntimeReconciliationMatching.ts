@@ -1,11 +1,9 @@
-import {
-  createJavaScriptApplicationEdge,
-  type ApplicationEdge,
-  type ApplicationGraphEvidence,
-} from "./javascriptApplicationGraph.js";
-import { canonicalDigest } from "../comparisonSemantics.js";
+import { createJavaScriptApplicationEdge } from "./javascriptApplicationGraph.js";
+import type { ApplicationEdge } from "./javascriptApplicationGraphSchemas.js";
+import type { ApplicationGraphEvidence } from "./javascriptApplicationEvidenceSchemas.js";
+import { digestCanonicalValue } from "../canonicalDigest.js";
 import type { ParsedStaticLayer } from "./javascriptRuntimeReconciliationParsing.js";
-import { compareCodePoints } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { JavaScriptRuntimeReconciliationItem } from "./javascriptRuntimeReconciliationSchemas.js";
 import type { RuntimeReconciliationEntity } from "./javascriptRuntimeReconciliationRuntime.js";
 import {
@@ -31,7 +29,7 @@ export const reconcileRuntimeEntities = (input: {
     reconcileEntity(entity, index, input.layers),
   );
   const retained = evaluated.sort((left, right) =>
-    compareCodePoints(
+    compareUnicodeCodePoints(
       left.item.reconciliation_id,
       right.item.reconciliation_id,
     ),
@@ -52,6 +50,13 @@ interface CandidateIndex {
   readonly byCategoryDigest: ReadonlyMap<
     string,
     readonly StaticRuntimeCandidate[]
+  >;
+  readonly byNativeDeclarationPath: ReadonlyMap<
+    string,
+    readonly {
+      readonly candidate: StaticRuntimeCandidate;
+      readonly sourcePath: string | null;
+    }[]
   >;
   readonly byLayerCategoryPath: ReadonlyMap<
     string,
@@ -172,14 +177,30 @@ const candidatesWithLocation = (
   const located = new Map<string, LocatedCandidate>();
   for (const layer of layers)
     for (const mapping of mappedRuntimePaths(layer, entity))
-      for (const candidate of index.byLayerCategoryPath.get(
-        layerCategoryPathKey(layer.layerId, entity.staticKind, mapping.path),
-      ) ?? []) {
+      for (const candidate of [
+        ...(index.byLayerCategoryPath.get(
+          layerCategoryPathKey(layer.layerId, entity.staticKind, mapping.path),
+        ) ?? []),
+        ...(mapping.fileStyle === null || mapping.nativeRelativePath === null
+          ? []
+          : (
+              index.byNativeDeclarationPath.get(
+                `${mapping.fileStyle}\0${layerCategoryPathKey(layer.layerId, entity.staticKind, mapping.nativeRelativePath)}`,
+              ) ?? []
+            )
+              .filter(
+                ({ sourcePath }) =>
+                  mapping.artifactPrefix === "" ||
+                  (sourcePath !== null &&
+                    sourcePath.startsWith(`${mapping.artifactPrefix}/`)),
+              )
+              .map(({ candidate }) => candidate)),
+      ]) {
         const key = candidateKey(candidate);
         if (!located.has(key)) located.set(key, { candidate, mapping });
       }
   return [...located.values()].sort((left, right) =>
-    compareCodePoints(
+    compareUnicodeCodePoints(
       candidateKey(left.candidate),
       candidateKey(right.candidate),
     ),
@@ -191,6 +212,10 @@ const indexCandidates = (
 ): CandidateIndex => {
   const byCategoryDigest = new Map<string, StaticRuntimeCandidate[]>();
   const byLayerCategoryPath = new Map<string, StaticRuntimeCandidate[]>();
+  const byNativeDeclarationPath = new Map<
+    string,
+    { candidate: StaticRuntimeCandidate; sourcePath: string | null }[]
+  >();
   for (const candidate of candidates) {
     for (const { sha256 } of candidate.digests)
       appendIndex(
@@ -204,14 +229,23 @@ const indexCandidates = (
         layerCategoryPathKey(candidate.layer.layerId, candidate.category, path),
         candidate,
       );
+    for (const style of ["posix", "windows"] as const)
+      for (const { path, sourcePath } of candidate.nativeDeclarationPaths[
+        style
+      ])
+        appendIndex(
+          byNativeDeclarationPath,
+          `${style}\0${layerCategoryPathKey(candidate.layer.layerId, candidate.category, path)}`,
+          { candidate, sourcePath },
+        );
   }
-  return { byCategoryDigest, byLayerCategoryPath };
+  return { byCategoryDigest, byLayerCategoryPath, byNativeDeclarationPath };
 };
 
-const appendIndex = (
-  index: Map<string, StaticRuntimeCandidate[]>,
+const appendIndex = <Value>(
+  index: Map<string, Value[]>,
   key: string,
-  candidate: StaticRuntimeCandidate,
+  candidate: Value,
 ): void => {
   const values = index.get(key);
   if (values === undefined) index.set(key, [candidate]);
@@ -333,7 +367,7 @@ const createItem = (
     candidate_static_nodes: candidateReferences.items,
   } satisfies Omit<JavaScriptRuntimeReconciliationItem, "reconciliation_id">;
   return {
-    reconciliation_id: `jrr_item_${canonicalDigest(semantic, "Runtime reconciliation")}`,
+    reconciliation_id: `jrr_item_${digestCanonicalValue(semantic, "Runtime reconciliation")}`,
     ...semantic,
   };
 };

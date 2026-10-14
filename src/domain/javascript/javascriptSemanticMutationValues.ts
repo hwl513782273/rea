@@ -1,65 +1,121 @@
-import type { JavaScriptSemanticValue } from "./javascriptSemanticIr.js";
+import type {
+  JavaScriptSemanticProperty,
+  JavaScriptSemanticValue,
+} from "./javascriptSemanticValueTypes.js";
+import {
+  semanticPropertyPathKeyMatches,
+  type JavaScriptSemanticPropertyPath,
+} from "./javascriptSemanticPropertyPaths.js";
 
-/** Invalidate only slots that an explicit mutation can affect. */
-export const invalidateSemanticMutationPath = (
+/** Invalidate escaped object references without rewriting their containing slots. */
+export const invalidateSemanticEscapedPath = (
   value: JavaScriptSemanticValue,
-  path: readonly (string | number | null)[],
+  path: JavaScriptSemanticPropertyPath,
 ): JavaScriptSemanticValue => {
+  if (value.status !== "object" && value.status !== "array") return value;
   const [key, ...remaining] = path;
-  const unknown: JavaScriptSemanticValue = {
-    status: "unknown",
-    reason: "This property may have been mutated.",
+  if (key === undefined)
+    return {
+      status: "unknown",
+      reason: "This object reference may have been mutated by a call.",
+    };
+  const invalidateChild = (
+    property: JavaScriptSemanticProperty,
+  ): JavaScriptSemanticProperty =>
+    semanticPropertyPathKeyMatches(key, property.name)
+      ? {
+          ...property,
+          value: invalidateSemanticEscapedPath(property.value, remaining),
+        }
+      : property;
+  return value.status === "object"
+    ? { ...value, properties: value.properties.map(invalidateChild) }
+    : { ...value, items: value.items.map(invalidateChild) };
+};
+
+/**
+ * Invalidate only slots that explicit mutations can affect, as if applying each
+ * path in order. Paths are grouped per slot so that many writes to one object
+ * cost one pass over its slots rather than one pass per write.
+ */
+export const invalidateSemanticMutationPaths = (
+  value: JavaScriptSemanticValue,
+  paths: readonly JavaScriptSemanticPropertyPath[],
+): JavaScriptSemanticValue => {
+  if (paths.length === 0) return value;
+  // An unknown key or a replaced value leaves nothing that a later path can
+  // restore, wherever it occurs in the sequence.
+  if (
+    (value.status !== "object" && value.status !== "array") ||
+    paths.some(([key]) => key === undefined || key === null)
+  )
+    return {
+      status: "unknown",
+      reason: "This property may have been mutated.",
+    };
+  // Writing an array length discards every item known before it.
+  const reset =
+    value.status === "array"
+      ? paths.findLastIndex(([key]) => key === "length")
+      : -1;
+  const base: typeof value =
+    reset < 0
+      ? value
+      : { status: "array", items: [], unknownItems: true, omittedItems: null };
+  const slots = base.status === "object" ? base.properties : base.items;
+  const slotsByName = new Map<string, number[]>();
+  slots.forEach((property, index) => {
+    const indexes = slotsByName.get(property.name) ?? [];
+    indexes.push(index);
+    slotsByName.set(property.name, indexes);
+  });
+  const slotPaths = new Map<number, JavaScriptSemanticPropertyPath[]>();
+  const replacedSlots = new Set<number>();
+  const select = (index: number, remaining: JavaScriptSemanticPropertyPath) => {
+    const selected = slotPaths.get(index) ?? [];
+    selected.push(remaining);
+    slotPaths.set(index, selected);
+    if (remaining.length === 0) replacedSlots.add(index);
   };
-  if (key === undefined || key === null) return unknown;
-  if (value.status === "object") {
-    const name = String(key);
-    const observed = value.properties.some(
-      (property) => property.name === name,
-    );
-    const properties = value.properties.map((property) =>
-      property.name === name
-        ? {
+  // An added slot is already unknown, so later paths that select it are inert.
+  const added = new Set<string>();
+  for (const [key, ...remaining] of paths.slice(reset + 1)) {
+    if (key === undefined || key === null) continue;
+    if (typeof key === "object") {
+      slots.forEach((property, index) => {
+        if (semanticPropertyPathKeyMatches(key, property.name))
+          select(index, remaining);
+      });
+      continue;
+    }
+    const indexes = slotsByName.get(String(key));
+    if (indexes === undefined) added.add(String(key));
+    else for (const index of indexes) select(index, remaining);
+  }
+  const properties: JavaScriptSemanticProperty[] = slots.map(
+    (property, index) => {
+      const selected = slotPaths.get(index);
+      return selected === undefined
+        ? property
+        : {
             ...property,
-            value: invalidateSemanticMutationPath(property.value, remaining),
-          }
-        : property,
-    );
-    return value.unknownProperties || !observed
-      ? {
-          status: "object",
-          properties,
-          unknownProperties: true,
-          omittedProperties: observed ? value.omittedProperties : null,
-        }
-      : {
-          status: "object",
-          properties,
-          unknownProperties: false,
-          omittedProperties: 0,
-        };
-  }
-  if (value.status === "array") {
-    const index = typeof key === "number" ? key : Number(key);
-    if (
-      !Number.isSafeInteger(index) ||
-      index < 0 ||
-      String(index) !== String(key)
-    )
-      return unknown;
-    const observed = value.items[index] !== undefined;
-    const items = value.items.map((item, position) =>
-      position === index
-        ? invalidateSemanticMutationPath(item, remaining)
-        : item,
-    );
-    return value.unknownItems || !observed
-      ? {
-          status: "array",
-          items,
-          unknownItems: true,
-          omittedItems: observed ? value.omittedItems : null,
-        }
-      : { status: "array", items, unknownItems: false, omittedItems: 0 };
-  }
-  return unknown;
+            ...(replacedSlots.has(index)
+              ? { presence: "unknown-coverage" as const }
+              : {}),
+            value: invalidateSemanticMutationPaths(property.value, selected),
+          };
+    },
+  );
+  for (const name of added)
+    properties.push({
+      name,
+      value: {
+        status: "unknown",
+        reason: "This property may have been mutated.",
+      },
+      presence: "unknown-coverage",
+    });
+  return base.status === "object"
+    ? { ...base, properties }
+    : { ...base, items: properties };
 };

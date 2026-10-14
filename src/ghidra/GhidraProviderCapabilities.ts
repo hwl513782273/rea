@@ -3,11 +3,12 @@ import type {
   ProviderIdentity,
 } from "../application/AnalysisProvider.js";
 import {
-  hasWindowsNativeAuthority,
-  windowsNativeAuthorityUnavailableReason,
+  inspectWindowsNativeReadiness,
+  type WindowsNativeReadiness,
 } from "../process/WindowsAuthority.js";
 import { GHIDRA_FUNCTION_OPERATIONS } from "./GhidraFunctionValues.js";
 import { GHIDRA_INVENTORY_OPERATIONS } from "./GhidraInventoryValues.js";
+import { GHIDRA_MUTATING_OPERATIONS } from "./GhidraSessionValues.js";
 
 /** Public identity committed by every Ghidra-backed observation. */
 export const GHIDRA_PROVIDER_IDENTITY: ProviderIdentity = Object.freeze({
@@ -26,14 +27,21 @@ export const GHIDRA_OPERATIONS = Object.freeze([
 export const healthLimitations = Object.freeze([
   "The session serves operations only after Ghidra reports default auto-analysis complete; incomplete analysis does not expose partial results.",
   "The imported Program and temporary project are ephemeral and deleted on close. Annotation operations edit session database metadata; original executable bytes are never written.",
+  "Cancelling an active Ghidra request terminates its ephemeral database and discards session annotations. The selected target remains open; the next provider query imports the original artifact again.",
 ]);
 
 /** Additional limitations applied to the experimental Windows x64 P0 boundary. */
 export const windowsP0Limitations = Object.freeze([
-  "Windows Ghidra P0 accepts approved native x86-64 PE applications only; DLL, managed, hostile, sensitive, and mutable-path targets are unsupported.",
+  "Windows Ghidra P0 accepts native x86 and x86-64 PE applications and DLLs, and explicitly selected raw 6502 images; managed, hostile, sensitive, and mutable-path targets are unsupported.",
   "The Windows bridge uses authenticated IPv4 loopback because Node path-based IPC does not expose Java AF_UNIX sockets; the endpoint file contains no bearer token.",
   "Windows sessions require the matching packaged Windows x64 native addon, local NTFS targets and runtimes, and Windows 10 or later. Native handles enforce path admission, private DACLs, and Job Object ownership automatically.",
 ]);
+
+const stringInventoryLimitation =
+  "Only Ghidra-defined string Data is observed; packed or undefined string bytes may be absent. Completeness applies to that inventory, and an empty search does not establish that text is absent from the artifact. If an address is known, use read_bytes and xrefs to inspect bytes and references.";
+
+const searchLimitation =
+  "Regex mode uses Java Pattern semantics. Matcher or compiler stack exhaustion returns a resource constraint without closing the session; literal mode avoids regex recursion and returns complete matching values.";
 
 /** Limitation text for one admitted operation, including the common base. */
 export const limitationsFor = (operation: string): readonly string[] => {
@@ -45,18 +53,32 @@ export const limitationsFor = (operation: string): readonly string[] => {
     case "annotate_native_function":
       return [
         ...common,
-        "Names use Ghidra USER_DEFINED source. Name writes preserve the existing namespace; readback uses the fully qualified name. Regular comments map to PRE and inline comments to EOL at the exact function entry. Changes commit together after readback and refreshed analysis; failure rolls them all back.",
+        "Names use Ghidra USER_DEFINED source. Name writes accept a leaf name or a fully qualified name within the existing namespace; readback uses the fully qualified name and can be reused without adding namespace prefixes. Edits retain the current namespace; other namespace-like text remains literal leaf-name text. Regular comments map to PRE and inline comments to EOL at the exact function entry. Changes commit together after readback and refreshed analysis; failure rolls them all back.",
+        "Annotation text rejects NUL and unpaired Unicode surrogates before mutation, with the field and UTF-16 index in the error. Supported Unicode and line endings are preserved.",
         "Metadata edits invalidate immutable analysis snapshots and are discarded on close. CLI returns the updated dossier before session cleanup; this is not a saved Ghidra project.",
+      ];
+    case "set_address_name":
+    case "set_addresses_names":
+      return [
+        ...common,
+        "Names use Ghidra USER_DEFINED source. A local function entry renames that function; any other mapped address receives a new or renamed primary label. Existing symbols retain their namespace and accept leaf names or qualified names within that namespace; qualified readback can be reused without adding namespace prefixes. Readback compares the primary symbol name.",
+        "set_addresses_names applies each address in its own transaction and reports per-address success; invalid names, unmapped addresses, and readback mismatches roll back only that address.",
+        "Metadata edits invalidate immutable analysis snapshots and are discarded on close; this is not a saved Ghidra project.",
       ];
     case "inspect_native_load_image":
       return [
         ...common,
-        "Independent verification supports DOS MZ and explicitly selected COM, including measured COM entry context. Measured source mappings use inclusive end addresses and complete region digests; no target execution or project mutation occurs.",
+        "Independent verification covers admitted DOS MZ, explicitly selected COM with measured entry context, and caller-supplied raw-binary imports. Measured source mappings use inclusive end addresses and complete region digests; no target execution or project mutation occurs.",
       ];
     case "read_bytes":
       return [
         ...common,
         "Bytes reflect Ghidra's initialized memory, including loader fixups. Reads stop at an unmapped or uninitialized byte and report completeness explicitly.",
+      ];
+    case "search_bytes":
+      return [
+        ...common,
+        "Searches initialized loader-adjusted memory independently per block, in provider address order. Bounds and page coverage ends are inclusive. Uninitialized blocks are listed separately. Overlapping matches are included; patterns never cross block boundaries. A cursor resumes the same target, profile and query. Cancellation discards the active search and returns no successful partial page.",
       ];
     case "address_to_file_offset":
       return [
@@ -82,7 +104,13 @@ export const limitationsFor = (operation: string): readonly string[] => {
     case "list_strings":
       return [
         ...common,
-        "Only Ghidra-defined string Data is observed; charset is reported, while a non-missing terminator cannot distinguish a present terminator from a fixed or Pascal layout.",
+        stringInventoryLimitation,
+        "Charset is reported, while a non-missing terminator cannot distinguish a present terminator from a fixed or Pascal layout.",
+      ];
+    case "resolve_containing_procedure":
+      return [
+        ...common,
+        "An exact external entry resolves to its observed function identity even when its body is empty. This does not establish mapped executable bytes or containment of nearby external addresses.",
       ];
     case "list_segments":
       return [
@@ -90,8 +118,9 @@ export const limitationsFor = (operation: string): readonly string[] => {
         "Memory-block end addresses are exclusive; permissions come from Ghidra MemoryBlock flags rather than inference from section names.",
       ];
     case "search_procedures":
+      return [...common, searchLimitation];
     case "search_strings":
-      return common;
+      return [...common, stringInventoryLimitation, searchLimitation];
     case "procedure_pseudo_code":
       return [
         ...common,
@@ -111,10 +140,7 @@ export const limitationsFor = (operation: string): readonly string[] => {
       ];
     case "procedure_callers":
     case "procedure_callees":
-      return [
-        ...common,
-        "Only resolved Ghidra call references are returned; unresolved computed or indirect calls remain unknown, while function classifications distinguish thunks and externals.",
-      ];
+      return common;
     case "xrefs":
       return [
         ...common,
@@ -124,12 +150,14 @@ export const limitationsFor = (operation: string): readonly string[] => {
     case "procedure_references":
       return [
         ...common,
+        "References cover the complete Ghidra function-body AddressSet and exact entry, including instruction-interior destinations and embedded-data sources; an enclosing address span does not establish function ownership.",
         "Reference kinds are direct Ghidra ReferenceManager observations; unresolved computed flows without a target are absent and remain unknown.",
         "Synthetic Ghidra entry-point references without actionable memory sources are omitted.",
       ];
     case "analyze_function":
       return [
         ...common,
+        "References cover the complete Ghidra function-body AddressSet and exact entry. Dossier incoming edges omit sources owned by that function; procedure_references also retains those internal edges.",
         "The dossier combines Ghidra FunctionManager, Listing, ReferenceManager, BasicBlockModel, and decompiler observations; provider-specific pseudocode and assembly are not cross-provider text invariants.",
         "Resolved reference metadata identifies computed, indirect, external, call, jump, and data edges; unresolved targetless flows remain unknown, and function classifications distinguish thunks and externals.",
         "Synthetic Ghidra entry-point references without actionable memory sources are omitted.",
@@ -148,8 +176,14 @@ export const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
       operation,
       available: true,
       reason: null,
+      // Project writes are private import machinery. Analysis reads are bound
+      // to the artifact/profile; session annotations disable snapshot replay.
+      ...(GHIDRA_MUTATING_OPERATIONS.has(operation) ||
+      operation === "list_documents"
+        ? {}
+        : { cachePolicy: "snapshot" as const }),
       effects: Object.freeze({
-        mutatesArtifact: operation === "annotate_native_function",
+        mutatesArtifact: GHIDRA_MUTATING_OPERATIONS.has(operation),
         launchesProcess: true,
         mayShowUi: false,
         mayAccessNetwork: false,
@@ -163,8 +197,9 @@ export const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
 );
 
 /** Capabilities advertised for the experimental Windows x64 P0 boundary. */
-export const windowsP0Capabilities = (): readonly CapabilityDescriptor[] => {
-  const available = hasWindowsNativeAuthority("win32");
+export const windowsP0Capabilities = (
+  readiness: WindowsNativeReadiness = inspectWindowsNativeReadiness("win32"),
+): readonly CapabilityDescriptor[] => {
   return Object.freeze(
     CAPABILITIES.map((capability): CapabilityDescriptor => {
       const limitations = Object.freeze([
@@ -179,13 +214,13 @@ export const windowsP0Capabilities = (): readonly CapabilityDescriptor[] => {
           availabilityCode: "unsupported_host",
           limitations,
         });
-      return available
+      return readiness.available
         ? Object.freeze({ ...capability, limitations })
         : Object.freeze({
             ...capability,
             available: false,
-            reason: windowsNativeAuthorityUnavailableReason("win32"),
-            availabilityCode: "unsupported_host",
+            reason: readiness.reason,
+            availabilityCode: readiness.code,
             limitations,
           });
     }),

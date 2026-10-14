@@ -1,8 +1,13 @@
 import { z } from "zod";
+import {
+  bytePatternFields,
+  validateBytePattern,
+  byteSearchResultSchema,
+} from "../domain/native/bytePattern.js";
 import { nativeLoadImageObservationSchema } from "../domain/native/nativeLoadImage.js";
 
 import {
-  AnalysisInputError,
+  type AnalysisInputError,
   AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
 import {
@@ -11,11 +16,16 @@ import {
 } from "../domain/hopperValues.js";
 import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 
-/** Read-only direct inventory operations admitted by the Ghidra adapter. */
+/**
+ * Direct inventory operations admitted by the Ghidra adapter. All are reads
+ * except the naming operations, which edit the ephemeral session database.
+ */
 export const GHIDRA_INVENTORY_OPERATIONS = [
   "inspect_native_load_image",
   "read_bytes",
+  "search_bytes",
   "address_to_file_offset",
   "address_name",
   "list_documents",
@@ -27,7 +37,15 @@ export const GHIDRA_INVENTORY_OPERATIONS = [
   "resolve_containing_procedure",
   "search_procedures",
   "search_strings",
+  "set_address_name",
+  "set_addresses_names",
 ] as const;
+
+/** Inventory operations that write analyst names into the session database. */
+export const GHIDRA_NAMING_OPERATIONS = [
+  "set_address_name",
+  "set_addresses_names",
+] as const satisfies readonly GhidraInventoryOperation[];
 
 /** One direct inventory operation implemented by the packaged Java bridge. */
 export type GhidraInventoryOperation =
@@ -43,7 +61,14 @@ export const isGhidraInventoryOperation = (
 export const ghidraIdentifierSchema = z.string().min(1);
 const identifier = ghidraIdentifierSchema;
 const document = identifier.nullable().default(null);
-const explicitAddress = identifier;
+/** Caller address spelling; the bridge resolves its space and emits canonical output. */
+export const ghidraInputAddressSchema = z
+  .string()
+  .regex(
+    /^(?:(?:0[xX])?[0-9a-fA-F]+|(?:[A-Za-z0-9._~-]|%[0-9a-fA-F]{2})+:0[xX][0-9a-fA-F]+)$/u,
+    "Use hexadecimal digits, optionally prefixed with 0x, or an encoded address-space name followed by :0x and hexadecimal digits",
+  );
+const explicitAddress = ghidraInputAddressSchema;
 const filteredAddress = explicitAddress.nullable().default(null);
 const searchInput = {
   pattern: z.string().min(1),
@@ -53,6 +78,16 @@ const searchInput = {
 };
 
 const inputSchemas = {
+  search_bytes: z
+    .strictObject({
+      ...bytePatternFields,
+      document,
+      start: explicitAddress.optional(),
+      end: explicitAddress.optional(),
+      limit: z.number().int().min(1).max(1000).default(100),
+      cursor: z.string().min(1).optional(),
+    })
+    .superRefine(validateBytePattern),
   inspect_native_load_image: z.strictObject({}),
   read_bytes: z.strictObject({
     document,
@@ -75,6 +110,19 @@ const inputSchemas = {
     .strict(),
   search_procedures: z.object(searchInput).strict(),
   search_strings: z.object(searchInput).strict(),
+  set_address_name: z
+    .object({ document, address: explicitAddress, name: z.string().min(1) })
+    .strict(),
+  set_addresses_names: z
+    .object({
+      document,
+      names: z.record(explicitAddress, z.string().min(1)),
+    })
+    .strict()
+    .refine(
+      (value) => Object.keys(value.names).length > 0,
+      "Supply at least one address name",
+    ),
 } satisfies Readonly<Record<GhidraInventoryOperation, z.ZodType>>;
 
 /** Validate and default one provider request before it crosses the socket. */
@@ -84,7 +132,11 @@ export const parseGhidraInventoryInput = (
 ): Result<Readonly<Record<string, JsonValue>>, AnalysisInputError> => {
   const parsed = inputSchemas[operation].safeParse(value);
   if (!parsed.success)
-    return err(new AnalysisInputError(operation, { cause: parsed.error }));
+    return err(
+      analysisInputErrorFromIssues(operation, parsed.error.issues, value, {
+        cause: parsed.error,
+      }),
+    );
   return ok(parsed.data);
 };
 
@@ -207,7 +259,11 @@ const containingProcedure = z.discriminatedUnion("found", [
     .strict()
     .superRefine((value, context) => {
       const body = value.procedure.body;
+      const exactExternalEntry =
+        value.procedure.classification.external &&
+        value.query_address === value.procedure.address;
       if (
+        !exactExternalEntry &&
         body.available &&
         !functionBodyEntryAgrees(
           { ...body, contains_entry: true },
@@ -231,6 +287,24 @@ const containingProcedure = z.discriminatedUnion("found", [
 ]);
 
 const resultSchemas = {
+  search_bytes: byteSearchResultSchema.superRefine((value, context) => {
+    const addresses = [
+      ...value.matches.flatMap((match) => [
+        match.address,
+        ...(match.procedure === null ? [] : [match.procedure.address]),
+      ]),
+      ...[
+        ...value.searched.blocks,
+        ...value.searched.skipped_uninitialized,
+        ...value.searched.skipped_not_loaded,
+      ].flatMap((block) => [block.start, block.end]),
+    ];
+    if (addresses.some((value) => !canonicalAddress.safeParse(value).success))
+      context.addIssue({
+        code: "custom",
+        message: "Byte search addresses must be canonical",
+      });
+  }),
   inspect_native_load_image: nativeLoadImageObservationSchema,
   read_bytes: z
     .strictObject({
@@ -265,6 +339,8 @@ const resultSchemas = {
   resolve_containing_procedure: containingProcedure,
   search_procedures: z.array(searchItem),
   search_strings: z.array(searchItem),
+  set_address_name: z.boolean(),
+  set_addresses_names: z.record(z.string(), z.boolean()),
 } satisfies Readonly<Record<GhidraInventoryOperation, z.ZodType>>;
 
 /** Validate exact Java-bridge output before creating Evidence. */

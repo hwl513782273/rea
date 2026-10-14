@@ -2,16 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { createEvidence, type Evidence } from "./evidence.js";
 import { createEvidenceBundle } from "./evidenceBundle.js";
-import {
-  reconstructionVerificationResultSchema,
-  verifyReconstruction,
-} from "./reconstructionVerification.js";
+import { reconstructionVerificationResultSchema } from "./reconstructionVerificationSchemas.js";
 import type { JsonValue } from "./jsonValue.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "./processCapture.fixture.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "./process/processCaptureExample.js";
 import { reconstructionSpecificationSchema } from "./reconstructionVerificationSchemas.js";
 import { ARTIFACT_COMPARISON_EXAMPLE } from "../contracts/artifactComparisonExample.js";
 import { createResidualUnknown } from "./residualUnknown.js";
 
+import { verifyReconstruction } from "./reconstructionVerification.js";
 const environment = {
   id: "fixture-linux",
   platform: "linux",
@@ -23,6 +21,13 @@ const source = (
   digit: string,
   authority: "controlled-replay" | "shipped-artifact",
   confidence: "observed" | "derived" = "observed",
+  {
+    captureResult = EMPTY_PROCESS_CAPTURE_EXAMPLE,
+    replayEnvironment = environment,
+  }: {
+    readonly captureResult?: JsonValue;
+    readonly replayEnvironment?: typeof environment | null;
+  } = {},
 ): Evidence =>
   createEvidence(
     {
@@ -41,15 +46,25 @@ const source = (
           ? "capture_process_scenario"
           : "inventory_artifact",
       parameters: {},
-      result:
-        authority === "controlled-replay"
-          ? EMPTY_PROCESS_CAPTURE_EXAMPLE
-          : { digit },
+      result: authority === "controlled-replay" ? captureResult : { digit },
       confidence,
       authority,
-      environment: authority === "controlled-replay" ? environment : null,
+      environment: authority === "controlled-replay" ? replayEnvironment : null,
     },
   );
+
+const legacyV3Capture = () => {
+  const {
+    selected_executable_sha256: _selectedDigest,
+    executable_identity: _executableIdentity,
+    executable_sha256,
+    ...legacyManifest
+  } = EMPTY_PROCESS_CAPTURE_EXAMPLE.manifest;
+  return {
+    ...EMPTY_PROCESS_CAPTURE_EXAMPLE,
+    manifest: { ...legacyManifest, executable_sha256 },
+  };
+};
 
 const processResult = (
   terminal: "unchanged" | "changed" | "unknown" = "unchanged",
@@ -101,6 +116,31 @@ const processComparison = (
       confidence: "derived",
       authority: "analyst-inference",
       evidenceLinks: [left.evidence_id, right.evidence_id, ...extraLinks],
+    },
+  );
+
+const multiSourceProcessComparison = (
+  left: readonly Evidence[],
+  right: readonly Evidence[],
+): Evidence =>
+  createEvidence(
+    undefined,
+    {
+      id: "rea-process",
+      name: "REA deterministic process harness",
+      version: "3",
+    },
+    {
+      predicateType: "rea.process-comparison",
+      operation: "compare_process_captures",
+      parameters: {
+        left_evidence_ids: left.map(({ evidence_id: id }) => id),
+        right_evidence_ids: right.map(({ evidence_id: id }) => id),
+      },
+      result: processResult(),
+      confidence: "derived",
+      authority: "analyst-inference",
+      evidenceLinks: [...left, ...right].map(({ evidence_id: id }) => id),
     },
   );
 
@@ -274,6 +314,67 @@ describe("reconstruction verification", () => {
         right.evidence_id,
       ]),
     );
+  });
+});
+
+describe("reconstruction process capture input", () => {
+  it("rejects saved captures without explicit executable identity", () => {
+    const left = source("1", "controlled-replay", "observed", {
+      captureResult: legacyV3Capture(),
+    });
+    const right = source("2", "controlled-replay");
+    const comparison = processComparison(left, right, processResult());
+    expect(() =>
+      verifyReconstruction(
+        behavioralSpec(comparison),
+        createEvidenceBundle([comparison, left, right]),
+      ),
+    ).toThrow();
+  });
+});
+
+describe("reconstruction verification outcomes", () => {
+  it("requires every selected behavioral source to share a replay environment", () => {
+    const replay = (digit: string, id: string | null) =>
+      source(digit, "controlled-replay", "observed", {
+        replayEnvironment: id === null ? null : { ...environment, id },
+      });
+    const verify = (left: readonly Evidence[], right: readonly Evidence[]) => {
+      const comparison = multiSourceProcessComparison(left, right);
+      return verifyReconstruction(
+        behavioralSpec(comparison),
+        createEvidenceBundle([...left, ...right, comparison]),
+      );
+    };
+    const limitation =
+      "Controlled replay environments are unavailable or incompatible.";
+    const differentOnLeft = verify(
+      [replay("1", "env-a"), replay("2", "env-b")],
+      [replay("3", "env-a"), replay("4", "env-a")],
+    );
+    expect(differentOnLeft.status).toBe("unknown");
+    expect(differentOnLeft.claims.items[0]?.limitations).toContain(limitation);
+
+    const differentOnRight = verify(
+      [replay("5", "env-a"), replay("6", "env-a")],
+      [replay("7", "env-a"), replay("8", "env-b")],
+    );
+    expect(differentOnRight.status).toBe("unknown");
+    expect(differentOnRight.claims.items[0]?.limitations).toContain(limitation);
+
+    const unavailable = verify(
+      [replay("9", "env-a"), replay("a", "env-a")],
+      [replay("b", "env-a"), replay("c", null)],
+    );
+    expect(unavailable.status).toBe("unknown");
+    expect(unavailable.claims.items[0]?.limitations).toContain(limitation);
+
+    expect(
+      verify(
+        [replay("d", "env-a"), replay("e", "env-a")],
+        [replay("f", "env-a"), replay("0", "env-a")],
+      ).status,
+    ).toBe("pass");
   });
 
   it("fails an authoritative observed disagreement", () => {

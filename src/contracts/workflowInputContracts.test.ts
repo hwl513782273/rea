@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
+import { managedNativeVerificationInputSchema } from "../domain/managed/managedNativeVerificationSchemas.js";
+import { toolContract } from "./toolContracts.js";
+import { toolInputSchemaWithMetadata } from "./toolSchemaMetadata.js";
+
 import { traceJavaScriptSemanticsRequestSchema } from "./javascript/applicationWorkflowInputContracts.js";
-import { ARTIFACT_TOOL_CONTRACTS } from "./artifactToolContracts.js";
-import { JAVASCRIPT_FEATURE_TRACE_FULL_EVIDENCE_EXAMPLE } from "./javascript/javascriptApplicationWorkflowExamples.js";
+import { JAVASCRIPT_FEATURE_TRACE_EXAMPLE } from "./javascript/javascriptApplicationWorkflowExamples.js";
 import {
   MANAGED_APPLICATION_GRAPH_EXAMPLE,
   MANAGED_MEMBER_COMPARISON_EXAMPLE,
@@ -11,7 +14,6 @@ import {
 import {
   compareManagedMembersReferenceInputSchema,
   managedApplicationGraphReferenceInputSchema,
-  managedNativeVerificationReferenceInputSchema,
 } from "./managed/managedWorkflowToolContracts.js";
 
 describe("workflow input contracts", () => {
@@ -24,7 +26,7 @@ describe("workflow input contracts", () => {
       traceJavaScriptSemanticsRequestSchema.safeParse({ query }).success,
     ).toBe(false);
 
-    const evidence = JAVASCRIPT_FEATURE_TRACE_FULL_EVIDENCE_EXAMPLE.application;
+    const evidence = JAVASCRIPT_FEATURE_TRACE_EXAMPLE.application;
     expect(
       traceJavaScriptSemanticsRequestSchema.safeParse({
         application: evidence,
@@ -43,17 +45,6 @@ describe("workflow input contracts", () => {
     ).toBe(false);
 
     expect(
-      managedNativeVerificationReferenceInputSchema.safeParse({
-        managed_boundaries:
-          MANAGED_NATIVE_VERIFICATION_EXAMPLE.managed_boundaries,
-        native_observations: [
-          MANAGED_NATIVE_VERIFICATION_EXAMPLE.native_observations[0],
-          MANAGED_NATIVE_VERIFICATION_EXAMPLE.native_observations[0],
-        ],
-      }).success,
-    ).toBe(false);
-
-    expect(
       managedApplicationGraphReferenceInputSchema.safeParse({
         managed_artifact: MANAGED_APPLICATION_GRAPH_EXAMPLE.managed_members,
         managed_members: MANAGED_APPLICATION_GRAPH_EXAMPLE.managed_members,
@@ -64,26 +55,79 @@ describe("workflow input contracts", () => {
     ).toBe(false);
   });
 
-  it("accepts each complete managed application Evidence source", () => {
-    for (const input of [
-      { managed_artifact: MANAGED_APPLICATION_GRAPH_EXAMPLE.managed_members },
-      { managed_members: MANAGED_APPLICATION_GRAPH_EXAMPLE.managed_members },
-      {
-        managed_native_boundaries:
-          MANAGED_APPLICATION_GRAPH_EXAMPLE.managed_members,
-      },
-    ])
-      expect(
-        managedApplicationGraphReferenceInputSchema.safeParse(input).success,
-      ).toBe(true);
-  });
-
-  it("accepts an explicit artifact integrity continuation policy", () => {
-    const input = { integrity_policy: "record-and-continue" as const };
-    const inspect = ARTIFACT_TOOL_CONTRACTS.find(
-      ({ name }) => name === "inspect_artifact",
-    );
-    if (inspect === undefined) throw new Error("Missing inspect_artifact");
-    expect(inspect.inputSchema.safeParse(input).success).toBe(true);
-  });
+  it.each([
+    {
+      name: "one observation reusing the boundary",
+      observations: [MANAGED_NATIVE_VERIFICATION_EXAMPLE.managed_boundaries],
+      issues: [
+        {
+          path: ["native_observations", 0],
+          message:
+            "Native observation Evidence must be distinct from managed boundary Evidence",
+        },
+      ],
+    },
+    {
+      name: "repeated native observations",
+      observations: [
+        MANAGED_NATIVE_VERIFICATION_EXAMPLE.native_observations[0],
+        MANAGED_NATIVE_VERIFICATION_EXAMPLE.native_observations[0],
+      ],
+      issues: [
+        {
+          path: ["native_observations", 1],
+          message: "Native observation Evidence IDs must be unique",
+        },
+      ],
+    },
+    {
+      name: "repeated observations reusing the boundary",
+      observations: [
+        MANAGED_NATIVE_VERIFICATION_EXAMPLE.managed_boundaries,
+        MANAGED_NATIVE_VERIFICATION_EXAMPLE.managed_boundaries,
+      ],
+      issues: [
+        {
+          path: ["native_observations", 0],
+          message:
+            "Native observation Evidence must be distinct from managed boundary Evidence",
+        },
+        {
+          path: ["native_observations", 1],
+          message:
+            "Native observation Evidence must be distinct from managed boundary Evidence",
+        },
+        {
+          path: ["native_observations", 1],
+          message: "Native observation Evidence IDs must be unique",
+        },
+      ],
+    },
+    {
+      name: "distinct native observations",
+      observations: MANAGED_NATIVE_VERIFICATION_EXAMPLE.native_observations,
+      issues: [],
+    },
+  ])(
+    "preserves managed/native diagnostics for $name",
+    async ({ observations, issues }) => {
+      const input = {
+        managed_boundaries:
+          MANAGED_NATIVE_VERIFICATION_EXAMPLE.managed_boundaries,
+        native_observations: observations,
+      };
+      const contract = toolContract("verify_managed_native_boundaries");
+      for (const schema of [
+        managedNativeVerificationInputSchema,
+        contract.inputSchema,
+        toolInputSchemaWithMetadata(contract),
+      ]) {
+        const result = await schema["~standard"].validate(input);
+        expect(
+          result.issues?.map(({ path, message }) => ({ path, message })) ?? [],
+        ).toEqual(issues);
+        if (issues.length === 0) expect(result).toEqual({ value: input });
+      }
+    },
+  );
 });

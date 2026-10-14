@@ -7,8 +7,9 @@ export const createDoctorHostFixture = (
   overrides: Partial<DoctorHost> = {},
 ): DoctorHost => ({
   platform: "darwin",
+  homeDirectory: "/fixture/home",
   architecture: "x64",
-  nodeVersion: "24.18.0",
+  runtime: { id: "node", version: "24.18.0" },
   macosVersion: () => Promise.resolve("14.0"),
   linuxDistribution: () => Promise.resolve(undefined),
   validTarget: (path) => Promise.resolve(path.includes("Hopper")),
@@ -26,7 +27,7 @@ export const createDoctorHostFixture = (
     Promise.resolve({
       version: PRODUCT_IDENTITY.skillVersion,
       toolCount: CATALOG_IDENTITY.counts.mcp_tools,
-      catalogDigest: CATALOG_IDENTITY.digests.combined_sha256,
+      canonical: true,
     }),
   ...overrides,
 });

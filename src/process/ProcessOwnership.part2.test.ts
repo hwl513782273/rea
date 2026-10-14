@@ -5,36 +5,7 @@ import {
   type ProcessOwnershipHost,
 } from "./ProcessOwnership.js";
 import { observeOwnedProcessLineage } from "./ProcessOwnershipObservation.js";
-const ownership = {
-  runId: "run-token",
-  leaderPid: 100,
-  processGroupId: 100,
-};
-const host = (
-  environments: Readonly<Record<number, Readonly<Record<string, string>>>>,
-): {
-  readonly adapter: ProcessOwnershipHost;
-  readonly signalGroup: ReturnType<typeof vi.fn>;
-} => {
-  const signalGroup = vi.fn();
-  return {
-    adapter: {
-      listProcesses: () =>
-        Promise.resolve(
-          Object.keys(environments).map((pid) => ({
-            pid: Number(pid),
-            parentPid: Number(pid) === 100 ? 1 : 100,
-            processGroupId: 100,
-            state: "S",
-            command: "fixture",
-          })),
-        ),
-      environment: (pid) => Promise.resolve(environments[pid] ?? {}),
-      signalGroup,
-    },
-    signalGroup,
-  };
-};
+import { host, ownership } from "./ProcessOwnership.fixture.js";
 describe("owned process-group cleanup discovery", () => {
   it("signals token-owned groups that were reparented outside the launcher tree", async () => {
     const signalGroup = vi.fn();
@@ -140,7 +111,7 @@ describe("owned process-group cleanup discovery", () => {
     await expect(cleanupOwnedProcessGroup(ownership, adapter)).resolves.toEqual(
       {
         cleaned: false,
-        reason: "process tree contains an unowned or PID-reused process",
+        reason: "process ownership token mismatch for PID(s): 104",
         failures: [{ pid: 104, reason: "run-token-mismatch" }],
       },
     );
@@ -208,4 +179,73 @@ describe("owned process-group cleanup discovery", () => {
       },
     });
   });
+});
+
+describe("process environment permission diagnostics", () => {
+  it.each(["EACCES", "EPERM"])(
+    "preserves %s while refusing to signal an unverifiable live process",
+    async (code) => {
+      const signalGroup = vi.fn();
+      const diagnostic = `${code}: permission denied, open '/proc/900/environ'`;
+      const adapter: ProcessOwnershipHost = {
+        listProcesses: () =>
+          Promise.resolve([
+            {
+              pid: 900,
+              parentPid: 1,
+              processGroupId: 900,
+              state: "S",
+              command: "unverifiable-process",
+            },
+          ]),
+        environment: () => Promise.reject(new Error(diagnostic)),
+        signalGroup,
+      };
+      await expect(
+        cleanupOwnedProcessGroup(
+          { ...ownership, sweepTokenOwnedProcesses: true },
+          adapter,
+        ),
+      ).resolves.toMatchObject({
+        cleaned: false,
+        reason: `process ownership token could not be read for 1 live process(es): environment_errno_${code}=1; live candidates 900=environment_errno_${code}`,
+        failures: [{ pid: 900, reason: "environment-unreadable", diagnostic }],
+      });
+      expect(signalGroup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.skipIf(typeof process.getuid !== "function")(
+    "records a foreign-uid unreadable candidate as unverified without signaling",
+    async () => {
+      const foreignUid = process.getuid?.() === 0 ? 1 : 0;
+      const signalGroup = vi.fn();
+      const adapter: ProcessOwnershipHost = {
+        listProcesses: () =>
+          Promise.resolve([
+            {
+              pid: 900,
+              parentPid: 1,
+              processGroupId: 900,
+              uid: foreignUid,
+              state: "S",
+              command: "unverifiable-process",
+            },
+          ]),
+        environment: () => Promise.reject(new Error("EINVAL: sysctl failed")),
+        signalGroup,
+      };
+      await expect(
+        cleanupOwnedProcessGroup(
+          { ...ownership, sweepTokenOwnedProcesses: true },
+          adapter,
+        ),
+      ).resolves.toMatchObject({
+        cleaned: true,
+        signaled: false,
+        unverified: [{ pid: 900, diagnostic: "EINVAL: sysctl failed" }],
+      });
+      expect(signalGroup).not.toHaveBeenCalled();
+    },
+  );
 });

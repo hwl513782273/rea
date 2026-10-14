@@ -1,51 +1,33 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 
 import { createProgressReporter } from "./ProgressReporter.js";
 
-describe("progress reporter", () => {
-  it("preserves monotonic order, rate bounds intermediate updates, and always emits terminal state", async () => {
-    let now = 0;
-    const observed: unknown[] = [];
-    const reporter = createProgressReporter(
-      (update) => {
-        observed.push(update);
-        return Promise.resolve();
-      },
-      { minimumIntervalMs: 100, now: () => now },
-    );
+it("limits intermediate sends to 100 ms and always delivers terminal status", async () => {
+  let now = 0;
+  const sent: number[] = [];
+  const reporter = createProgressReporter(
+    async () => {
+      sent.push(now);
+    },
+    { now: () => now },
+  );
+  for (const [completed, elapsed] of [0, 25, 50, 99, 100, 199, 200].entries()) {
+    now = elapsed;
     await reporter.report({
-      phase: "scan",
-      completed: 0,
-      total: 3,
-      message: "start",
+      phase: "running",
+      completed,
+      total: null,
+      message: "Observed capture status",
     });
-    now = 10;
-    await reporter.report({
-      phase: "scan",
-      completed: 1,
-      total: 3,
-      message: "one",
-    });
-    now = 20;
-    await reporter.report({
-      phase: "scan",
-      completed: 3,
-      total: 3,
-      message: "done",
-      terminal: true,
-    });
-
-    expect(observed).toEqual([
-      expect.objectContaining({ sequence: 1, completed: 0 }),
-      expect.objectContaining({ sequence: 2, completed: 3, terminal: true }),
-    ]);
-    await expect(
-      reporter.report({
-        phase: "scan",
-        completed: 2,
-        total: 3,
-        message: "back",
-      }),
-    ).rejects.toThrow(/backwards/u);
+  }
+  expect(sent).toEqual([0, 100, 200]);
+  now = 201;
+  await reporter.report({
+    phase: "cleanup",
+    completed: 7,
+    total: null,
+    message: "Owned cleanup complete",
+    terminal: true,
   });
+  expect(sent).toEqual([0, 100, 200, 201]);
 });

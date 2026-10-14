@@ -58,7 +58,11 @@ const unavailableFileEntry = (
   ...overrides,
 });
 
-const symlinkEntry = (overrides: Partial<SymlinkEntry> = {}): SymlinkEntry => ({
+type KnownTargetSymlinkEntry = Extract<SymlinkEntry, { target: string }>;
+
+const symlinkEntry = (
+  overrides: Partial<KnownTargetSymlinkEntry> = {},
+): KnownTargetSymlinkEntry => ({
   path: "src/package.json",
   kind: "symlink",
   target: "main.ts",
@@ -171,7 +175,11 @@ describe("historical source graph", () => {
       },
       (input: HistoricalSourceGraphInput) => {
         input.exclusions = [
-          { path: "private.env", reason: "configured-secret" },
+          {
+            path: "private.env",
+            reason: "configured-secret",
+            pattern: ".env",
+          },
         ];
         input.inventory_state = "partial";
       },
@@ -184,7 +192,21 @@ describe("historical source graph", () => {
     }
   });
 
-  it("retains actual external targets and accepts legacy markers", () => {
+  it("commits the matched pattern for each exclusion", () => {
+    const graphWith = (pattern: string) =>
+      createHistoricalSourceGraph({
+        ...graphInput(),
+        inventory_state: "partial",
+        exclusions: [
+          { path: "private.env", reason: "configured-secret", pattern },
+        ],
+      });
+    expect(graphWith(".env").root_sha256).not.toBe(
+      graphWith("*.env").root_sha256,
+    );
+  });
+
+  it("retains actual external targets and rejects placeholder targets", () => {
     const input = { ...graphInput(), inventory_state: "partial" as const };
     input.entries[2] = symlinkEntry({
       target: "/private/shared/target.js",
@@ -205,7 +227,7 @@ describe("historical source graph", () => {
             : entry,
         ),
       }),
-    ).not.toThrow();
+    ).toThrow(/target path does not match/u);
   });
 
   it("derives language and manifest indexes and enforces code-point order", () => {
@@ -237,6 +259,74 @@ describe("historical source graph", () => {
 });
 
 describe("partial historical source graphs", () => {
+  it("keeps unknown-entry diagnostics outside the root commitment", () => {
+    const base = graphInput();
+    base.inventory_state = "partial";
+    base.entries[2] = {
+      path: "src/package.json",
+      kind: "unknown",
+      classifications: ["unknown"],
+      limitations: ["Permission denied at /private/first"],
+    };
+    const graph = createHistoricalSourceGraph(base);
+    const changedMessage = structuredClone(base);
+    changedMessage.entries[2] = {
+      path: "src/package.json",
+      kind: "unknown",
+      classifications: ["unknown"],
+      limitations: ["Permission denied at /private/second"],
+    };
+    const revised = createHistoricalSourceGraph(changedMessage);
+    expect(revised.root_sha256).toBe(graph.root_sha256);
+    expect(computeHistoricalSourceGraphSha256(revised)).not.toBe(
+      computeHistoricalSourceGraphSha256(graph),
+    );
+  });
+
+  it("keeps an unreadable symlink target unknown and out of root identity", () => {
+    const base = graphInput();
+    base.inventory_state = "partial";
+    base.entries[2] = {
+      path: "src/package.json",
+      kind: "symlink",
+      target: null,
+      target_state: "unreadable",
+      classifications: ["manifest"],
+      limitations: ["Target could not be read."],
+    };
+    const graph = createHistoricalSourceGraph(base);
+    expect(graph.entries[2]).toMatchObject({
+      kind: "symlink",
+      target: null,
+      target_state: "unreadable",
+    });
+
+    const changedMessage = structuredClone(base);
+    changedMessage.entries[2] = {
+      path: "src/package.json",
+      kind: "symlink",
+      target: null,
+      target_state: "unreadable",
+      classifications: ["manifest"],
+      limitations: ["A different diagnostic."],
+    };
+    const revised = createHistoricalSourceGraph(changedMessage);
+    expect(revised.root_sha256).toBe(graph.root_sha256);
+    expect(computeHistoricalSourceGraphSha256(revised)).not.toBe(
+      computeHistoricalSourceGraphSha256(graph),
+    );
+    expect(() =>
+      createHistoricalSourceGraph({
+        ...base,
+        entries: base.entries.map((entry) =>
+          entry.kind === "symlink"
+            ? { ...entry, target: "<unreadable>" }
+            : entry,
+        ),
+      }),
+    ).toThrow();
+  });
+
   it("preserves partial observations but rejects every partial complete graph", () => {
     const partial = graphInput();
     partial.inventory_state = "partial";
@@ -252,7 +342,13 @@ describe("partial historical source graphs", () => {
       { entries: partial.entries },
       { parse_failures: partial.parse_failures },
       {
-        exclusions: [{ path: "secret", reason: "configured-secret" as const }],
+        exclusions: [
+          {
+            path: "secret",
+            reason: "configured-secret" as const,
+            pattern: "secret",
+          },
+        ],
       },
       { limitations: ["Incomplete"] },
       {
@@ -337,7 +433,7 @@ describe("historical source graph validation", () => {
             : entry,
         ),
       }),
-    ).not.toThrow();
+    ).toThrow(/target path does not match/u);
     expect(() =>
       createHistoricalSourceGraph({
         ...graphInput(),
@@ -360,4 +456,168 @@ describe("historical source graph validation", () => {
       parseHistoricalSourceManifest({ ...manifest, entry_count: 999 }),
     ).toThrow(/identifier does not match/u);
   });
+});
+
+describe("historical source graph excluded symlink targets", () => {
+  it("retains internal symlinks into excluded trees without accepting sibling prefixes", () => {
+    const input = { ...graphInput(), inventory_state: "partial" as const };
+    input.exclusions = [
+      {
+        path: "dist",
+        entry_kind: "directory",
+        reason: "caller-excluded",
+        pattern: "dist/",
+      },
+    ];
+    input.entries[2] = symlinkEntry({ target: "../dist/generated.js" });
+    const graph = createHistoricalSourceGraph(input);
+    expect(graph.entries[2]).toMatchObject({
+      target: "../dist/generated.js",
+      target_state: "internal",
+    });
+
+    input.entries[2] = symlinkEntry({ target: "../dist-old/generated.js" });
+    expect(() => createHistoricalSourceGraph(input)).toThrow(
+      /recorded exclusion/u,
+    );
+  });
+
+  it("does not treat an excluded file or unknown-kind ancestor as a directory", () => {
+    const input = { ...graphInput(), inventory_state: "partial" as const };
+    input.exclusions = [
+      {
+        path: "secret.txt",
+        entry_kind: "file",
+        reason: "configured-secret",
+        pattern: "secret.txt",
+      },
+    ];
+    input.entries[2] = symlinkEntry({ target: "../secret.txt/child" });
+    expect(() => createHistoricalSourceGraph(input)).toThrow(
+      /recorded exclusion/u,
+    );
+
+    input.exclusions[0] = {
+      path: "secret.txt",
+      entry_kind: "unknown",
+      reason: "configured-secret",
+      pattern: "secret.txt",
+    };
+    expect(() => createHistoricalSourceGraph(input)).toThrow(
+      /recorded exclusion/u,
+    );
+
+    input.exclusions[0] = {
+      path: "secret.txt",
+      reason: "configured-secret",
+      pattern: "secret.txt",
+    };
+    expect(() => createHistoricalSourceGraph(input)).toThrow(
+      /recorded exclusion/u,
+    );
+  });
+});
+
+describe("historical source graph symlink path identity", () => {
+  it("joins internal symlink targets with the inventory NFC normalizer", () => {
+    // "café" spelled NFC, as the inventory produces it, and the same
+    // name spelled NFD, as a macOS readlink can report it.
+    const nfcPath = "src/café.ts";
+    const nfdTarget = "cafe\u0301.ts";
+    expect(nfcPath).not.toBe(nfdTarget);
+
+    const input = { ...graphInput(), inventory_state: "partial" as const };
+    input.entries[1] = fileEntry({ path: nfcPath });
+    input.entries[2] = symlinkEntry({
+      path: "src/link.js",
+      target: nfdTarget,
+      target_state: "internal",
+    });
+    input.relationships = [];
+    const graph = createHistoricalSourceGraph(input);
+    expect(graph.entries[2]).toMatchObject({
+      kind: "symlink",
+      target: nfdTarget,
+      target_state: "internal",
+    });
+  });
+
+  it("preserves an exact NFD inventory spelling when resolving its symlink", () => {
+    const input = { ...graphInput(), inventory_state: "partial" as const };
+    input.entries[1] = fileEntry({ path: "src/cafe\u0301.ts" });
+    input.entries[2] = symlinkEntry({
+      path: "src/link.js",
+      target: "cafe\u0301.ts",
+      target_state: "internal",
+    });
+    input.relationships = [];
+    expect(createHistoricalSourceGraph(input).entries[1]?.path).toBe(
+      "src/cafe\u0301.ts",
+    );
+  });
+
+  it("still rejects an internal symlink target that no inventory holds", () => {
+    const input = { ...graphInput(), inventory_state: "partial" as const };
+    input.entries[2] = symlinkEntry({
+      path: "src/link.js",
+      // The NFD spelling normalizes to "src/café.ts", which the
+      // inventory does not contain, so the join must still miss.
+      target: "cafe\u0301.ts",
+      target_state: "internal",
+    });
+    expect(() => createHistoricalSourceGraph(input)).toThrow(
+      /must resolve to an inventoried entry/u,
+    );
+  });
+});
+
+it.each([
+  "\0",
+  "/absolute.js",
+  "../outside.js",
+  "a/../b.js",
+  "a//b.js",
+  "./a.js",
+  "a/",
+])("rejects unsafe historical logical entry spelling %j", (path) => {
+  const input = graphInput();
+  input.entries = [fileEntry({ path })];
+  input.relationships = [];
+  expect(() => createHistoricalSourceGraph(input)).toThrow();
+});
+
+it("rejects NUL in observed symlink targets before graph identity", () => {
+  const input = graphInput();
+  input.entries[2] = symlinkEntry({ target: "literal\0name.js" });
+  expect(() => createHistoricalSourceGraph(input)).toThrow(
+    /normalized POSIX symlink target/u,
+  );
+});
+
+it.each(["C:\\outside\\file.js", "\\\\server\\share.js"])(
+  "preserves unowned recorded Windows absolute target policy %j",
+  (target) => {
+    const external = graphInput();
+    external.inventory_state = "partial";
+    external.entries[2] = symlinkEntry({ target, target_state: "external" });
+    expect(createHistoricalSourceGraph(external).entries).toContainEqual(
+      expect.objectContaining({ target, target_state: "external" }),
+    );
+    const internal = graphInput();
+    internal.entries[2] = symlinkEntry({ target, target_state: "internal" });
+    expect(() => createHistoricalSourceGraph(internal)).toThrow(
+      /target path does not match its target state/u,
+    );
+  },
+);
+
+it("refuses an absolute POSIX internal target even when lexical joining would name an inventoried file", () => {
+  const input = graphInput();
+  input.entries[2] = symlinkEntry({
+    target: "/main.ts",
+    target_state: "internal",
+  });
+  expect(() => createHistoricalSourceGraph(input)).toThrow(
+    /target path does not match its target state/u,
+  );
 });

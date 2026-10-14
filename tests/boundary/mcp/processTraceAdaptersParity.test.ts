@@ -1,3 +1,4 @@
+import { ok as resultOk } from "../../../src/domain/result.js";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -6,78 +7,18 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import type { AnalysisClient } from "../../../src/application/AnalysisProvider.js";
-import { compareProcessEvidenceFiles } from "../../../src/application/ProcessCli.js";
-import { PROCESS_PROVIDER } from "../../../src/application/ProcessEvidence.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../../src/contracts/processCaptureExample.js";
+import { compareProcessEvidenceFiles } from "../../../src/application/process/ProcessCli.js";
+import { PROCESS_PROVIDER } from "../../../src/domain/process/processEvidenceProvider.js";
+import { processTraceCaptureFixture } from "../../../src/domain/process/processCapture.fixture.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { jsonValueSchema } from "../../../src/domain/jsonValue.js";
-import type { ProcessTraceSpecification } from "../../../src/domain/processTraceComparison.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed as ok } from "../../fixtures/analysisExecution.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 const resources: Array<{ close(): Promise<void> }> = [];
 const temporaryRoots: string[] = [];
-const beforeCheckpoint = {
-  name: "before",
-  at_ms: 0,
-  files: [],
-  effects: [],
-  truncated: false,
-};
-const afterCheckpoint = {
-  name: "after_settlement",
-  at_ms: 50,
-  files: [],
-  effects: [],
-  truncated: false,
-};
-const capture = {
-  ...EMPTY_PROCESS_CAPTURE_EXAMPLE,
-  event_journal: [
-    { capture_order: 0, collection: "filesystem_checkpoints", index: 0 },
-    { capture_order: 1, collection: "lifecycle", index: 0 },
-    { capture_order: 2, collection: "lifecycle", index: 1 },
-    { capture_order: 3, collection: "filesystem_checkpoints", index: 1 },
-  ],
-} as const;
-const traceSpecification: ProcessTraceSpecification = {
-  events: [
-    {
-      id: "before",
-      source: "filesystem",
-      exact: beforeCheckpoint,
-      cardinality: { kind: "required" },
-    },
-    {
-      id: "exit",
-      source: "lifecycle",
-      exact: { event: "exit", ...capture.exit },
-      cardinality: { kind: "required" },
-    },
-    {
-      id: "settlement",
-      source: "lifecycle",
-      exact: { event: "settlement", ...capture.settlement },
-      cardinality: { kind: "required" },
-    },
-    {
-      id: "after",
-      source: "filesystem",
-      exact: afterCheckpoint,
-      cardinality: { kind: "required" },
-    },
-  ],
-  language: {
-    kind: "finite_traces",
-    variants: [
-      {
-        id: "normal",
-        trace: ["before", "exit", "settlement", "after"],
-      },
-    ],
-  },
-};
+const { capture, traceSpecification } = processTraceCaptureFixture();
 
 const captureEvidence = (side: "left" | "right") =>
   createEvidence(undefined, PROCESS_PROVIDER, {
@@ -89,6 +30,29 @@ const captureEvidence = (side: "left" | "right") =>
     authority: "controlled-replay",
     locations: [{ kind: "artifact-path", path: `/fixture/${side}` }],
   });
+
+const comparisonClient = async (
+  left: ReturnType<typeof captureEvidence>,
+  right: ReturnType<typeof captureEvidence>,
+) => {
+  const session = createTestBinarySession(
+    (_path) =>
+      ({
+        execute: () => Promise.resolve(ok(null)),
+        close: () => Promise.resolve(resultOk(null)),
+      }) satisfies AnalysisClient,
+  );
+  expect(session.recordEvidence(left).ok).toBe(true);
+  expect(session.recordEvidence(right).ok).toBe(true);
+  const server = createServer({ kind: "session", session });
+  const client = new Client({ name: "trace-parity", version: "1" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  resources.push(client, server);
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  return client;
+};
 
 afterEach(async () => {
   await Promise.all(resources.splice(0).map((resource) => resource.close()));
@@ -116,25 +80,7 @@ describe("declared trace adapter parity", () => {
     const cliEvidence = parseEvidence(
       await compareProcessEvidenceFiles(leftPath, rightPath, specificationPath),
     );
-    const session = createTestBinarySession(
-      (_path) =>
-        ({
-          execute: () => Promise.resolve(ok(null)),
-          close: () => Promise.resolve(),
-        }) satisfies AnalysisClient,
-    );
-    expect(session.recordEvidence(left).ok).toBe(true);
-    expect(session.recordEvidence(right).ok).toBe(true);
-    const server = createServer(
-      { execute: () => Promise.resolve(ok(null)) },
-      session,
-    );
-    const client = new Client({ name: "trace-parity", version: "1" });
-    const [clientTransport, serverTransport] =
-      InMemoryTransport.createLinkedPair();
-    resources.push(client, server);
-    await server.connect(serverTransport);
-    await client.connect(clientTransport);
+    const client = await comparisonClient(left, right);
     const response = await client.callTool({
       name: "compare_process_captures",
       arguments: {
@@ -145,18 +91,68 @@ describe("declared trace adapter parity", () => {
     });
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
-      result: { trace: { verdict: "equivalent" } },
+      normalized_result: { trace: { verdict: "equivalent" } },
       evidence_id: cliEvidence.evidence_id,
     });
     const structuredResult =
       typeof response.structuredContent === "object" &&
       response.structuredContent !== null
-        ? Reflect.get(response.structuredContent, "result")
+        ? Reflect.get(response.structuredContent, "normalized_result")
         : undefined;
     expect(structuredResult).toEqual(cliEvidence.normalized_result);
     expect(cliEvidence.locations).toEqual([
       { kind: "artifact-path", path: "/fixture/left" },
       { kind: "artifact-path", path: "/fixture/right" },
     ]);
+  });
+
+  it("reports one complete missing-pair diagnostic through CLI and MCP", async () => {
+    const left = captureEvidence("left");
+    const right = captureEvidence("right");
+    const incompleteSpecification = {
+      events: Array.from({ length: 200 }, (_, index) => ({
+        id: `e${String(index)}`,
+        source: "lifecycle",
+        exact: { fixture: index },
+        cardinality: { kind: "optional" },
+      })),
+      language: { kind: "partial_order" },
+    };
+    const root = await createTestTempDirectory("rea-trace-diagnostics-");
+    temporaryRoots.push(root);
+    const leftPath = join(root, "left.json");
+    const rightPath = join(root, "right.json");
+    const specificationPath = join(root, "trace.json");
+    await Promise.all([
+      writeFile(leftPath, JSON.stringify(left)),
+      writeFile(rightPath, JSON.stringify(right)),
+      writeFile(specificationPath, JSON.stringify(incompleteSpecification)),
+    ]);
+    const message =
+      "19900 event pairs must be explicitly ordered or unordered; first undeclared pair: e0/e1";
+    const cli = await compareProcessEvidenceFiles(
+      leftPath,
+      rightPath,
+      specificationPath,
+    );
+    expect(cli).toMatchObject({
+      category: "invalid_input",
+      details: {
+        issues: [{ path: ["trace_spec", "language"], message }],
+      },
+    });
+    const client = await comparisonClient(left, right);
+    const response = await client.callTool({
+      name: "compare_process_captures",
+      arguments: { left, right, trace_spec: incompleteSpecification },
+    });
+    expect(response.isError).toBe(true);
+    const text = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+    expect(text).toContain(message);
+    expect(text.match(/first undeclared pair/g)).toHaveLength(1);
+    await client.ping();
   });
 });

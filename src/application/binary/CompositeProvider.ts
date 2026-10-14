@@ -1,19 +1,22 @@
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
+import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
+import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import { err, ok } from "../../domain/result.js";
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
 import type {
   AnalysisClient,
   AnalysisClientContext,
-  AnalysisProfileResolutionOptions,
   AnalysisProvider,
   CapabilityDescriptor,
+  ExecutionOptions,
   ProviderIdentity,
 } from "../AnalysisProvider.js";
 import { closeAnalysisClient } from "./AnalysisClientCleanup.js";
+import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 
-/** Synthetic compatibility identity for a deterministic provider set. */
-export const compositeProviderIdentity = (
+/** Synthetic identity for a deterministic provider set. */
+const compositeProviderIdentity = (
   identities: readonly ProviderIdentity[],
 ): ProviderIdentity => ({
   id: `composite:${identities
@@ -24,24 +27,97 @@ export const compositeProviderIdentity = (
   version: null,
 });
 
+const closeCompositeClients =
+  (
+    identity: ProviderIdentity,
+    clients: ReadonlyMap<AnalysisProvider, AnalysisClient>,
+  ): AnalysisClient["close"] =>
+  async (options) => {
+    const outcomes = await Promise.all(
+      [...clients.entries()].map(([provider, client]) =>
+        closeAnalysisClient(client, provider.identity().id, options).then(
+          (result) => ({ providerId: provider.identity().id, result }),
+        ),
+      ),
+    );
+    const failures = outcomes.flatMap(({ providerId, result }) =>
+      result.ok ? [] : [{ providerId, error: result.error }],
+    );
+    if (failures.length === 0) return ok(null);
+    if (failures.length === 1) {
+      const failure = failures[0];
+      if (failure !== undefined) return err(failure.error);
+    }
+    const resources = [
+      ...new Set(failures.flatMap(({ error }) => error.cleanupResources)),
+    ];
+    return err(
+      new ProviderCleanupError(
+        identity.id,
+        resources,
+        {
+          reason:
+            "Multiple composed provider clients could not be confirmed closed.",
+          failures: failures.map(({ providerId, error }) => ({
+            provider_id: providerId,
+            message: error.message,
+            resources: [...error.cleanupResources],
+            ...(error.diagnostics === undefined
+              ? {}
+              : { diagnostics: error.diagnostics }),
+          })),
+        },
+        {
+          cause: new AggregateError(
+            failures.map(({ error }) => error),
+            "Composed provider cleanup failed.",
+          ),
+        },
+      ),
+    );
+  };
+
+const executeCompositeHealth = async (
+  identity: ProviderIdentity,
+  clients: ReadonlyMap<AnalysisProvider, AnalysisClient>,
+  options: ExecutionOptions | undefined,
+): ReturnType<AnalysisClient["execute"]> => {
+  for (const [provider, client] of clients) {
+    const health = client.operationHealthSnapshot?.();
+    if (
+      health !== undefined &&
+      health.state !== "idle" &&
+      health.state !== "busy"
+    )
+      return err(
+        new ProviderAdapterError(provider.identity().id, "health", {
+          diagnostics: {
+            reason: `instantiated provider client is ${health.state}`,
+          },
+        }),
+      );
+    const checked = await client.execute("health", {}, options);
+    if (!checked.ok) return checked;
+  }
+  return ok({
+    result: null,
+    rawResult: null,
+    provider: identity,
+    limitations: [],
+    locations: [],
+    subject: null,
+  });
+};
+
 /** Deterministically route disjoint operations without eagerly starting children. */
 export class CompositeProvider implements AnalysisProvider {
   readonly #identity: ProviderIdentity;
   readonly #capabilities: readonly CapabilityDescriptor[];
   readonly #providerByOperation: ReadonlyMap<string, AnalysisProvider>;
-  readonly #profileProvider: AnalysisProvider | undefined;
 
   constructor(readonly providers: readonly AnalysisProvider[]) {
     if (providers.length === 0)
       throw new RangeError("CompositeProvider requires at least one provider");
-    const profileProviders = providers.filter(
-      ({ resolveAnalysisProfile }) => resolveAnalysisProfile !== undefined,
-    );
-    if (profileProviders.length > 1)
-      throw new TypeError(
-        "CompositeProvider supports at most one target-bound analysis profile",
-      );
-    this.#profileProvider = profileProviders[0];
     this.#identity = Object.freeze(
       compositeProviderIdentity(
         providers.map((provider) => provider.identity()),
@@ -63,8 +139,8 @@ export class CompositeProvider implements AnalysisProvider {
     this.#capabilities = Object.freeze(
       capabilities.sort(
         (left, right) =>
-          left.operation.localeCompare(right.operation) ||
-          left.provider.id.localeCompare(right.provider.id),
+          compareUnicodeCodePoints(left.operation, right.operation) ||
+          compareUnicodeCodePoints(left.provider.id, right.provider.id),
       ),
     );
   }
@@ -75,16 +151,6 @@ export class CompositeProvider implements AnalysisProvider {
 
   capabilities(): readonly CapabilityDescriptor[] {
     return this.#capabilities;
-  }
-
-  resolveAnalysisProfile(
-    target: BinaryTarget,
-    options?: AnalysisProfileResolutionOptions,
-  ) {
-    const resolve = this.#profileProvider?.resolveAnalysisProfile;
-    return resolve === undefined
-      ? Promise.resolve(ok({ profile: null, compatibility: {} }))
-      : resolve.call(this.#profileProvider, target, options);
   }
 
   createClient(
@@ -104,29 +170,20 @@ export class CompositeProvider implements AnalysisProvider {
       clients.set(provider, created);
       return created;
     };
-    const closeWithOutcome: NonNullable<
-      AnalysisClient["closeWithOutcome"]
-    > = async (options) => {
-      const outcomes = await Promise.all(
-        [...clients.entries()].map(([provider, client]) =>
-          closeAnalysisClient(client, provider.identity().id, options),
-        ),
-      );
-      return outcomes.find((outcome) => !outcome.ok) ?? ok(null);
-    };
+    const close = closeCompositeClients(this.#identity, clients);
     return {
-      execute: (operation, parameters, options) => {
+      executeIfReady: (operation, parameters, options) => {
+        const provider = this.#providerByOperation.get(operation);
+        const client =
+          provider === undefined ? undefined : clients.get(provider);
+        return (
+          client?.executeIfReady?.(operation, parameters, options) ??
+          Promise.resolve(undefined)
+        );
+      },
+      execute: async (operation, parameters, options) => {
         if (operation === "health")
-          return Promise.resolve(
-            ok({
-              result: null,
-              rawResult: null,
-              provider: this.#identity,
-              limitations: [],
-              locations: [],
-              subject: null,
-            }),
-          );
+          return executeCompositeHealth(this.#identity, clients, options);
         const provider = this.#providerByOperation.get(operation);
         return provider === undefined
           ? Promise.resolve(
@@ -144,18 +201,27 @@ export class CompositeProvider implements AnalysisProvider {
         [...clients.values()]
           .flatMap((client) => client.runtimeLineageSnapshots?.() ?? [])
           .sort((left, right) =>
-            left.provider.id.localeCompare(right.provider.id),
+            compareUnicodeCodePoints(left.provider.id, right.provider.id),
           ),
       requestActivitySnapshots: () =>
         [...clients.values()]
           .flatMap((client) => client.requestActivitySnapshots?.() ?? [])
           .sort((left, right) =>
-            left.provider.id.localeCompare(right.provider.id),
+            compareUnicodeCodePoints(left.provider.id, right.provider.id),
           ),
-      closeWithOutcome,
-      close: async () => {
-        await closeWithOutcome();
+      operationHealthSnapshot: () => {
+        const snapshots = [...clients.values()].map((client) =>
+          client.operationHealthSnapshot?.(),
+        );
+        if (snapshots.some((snapshot) => snapshot === undefined))
+          return undefined;
+        return (
+          snapshots.find(
+            (snapshot) => snapshot !== undefined && snapshot.state !== "idle",
+          ) ?? snapshots[0]
+        );
       },
+      close,
     };
   }
 }

@@ -10,11 +10,13 @@ import {
 } from "@zip.js/zip.js";
 import { afterEach, expect, it } from "vitest";
 
-import { runProviderAnalysis } from "../../../src/composition/directAnalysis.js";
+import { createDirectAnalysis } from "../../../src/composition/directAnalysis.js";
 import { parseEvidence } from "../../../src/domain/evidence.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { createServer } from "../../../src/server/createServer.js";
+
+const { runProviderAnalysis } = createDirectAnalysis({});
 
 const resources: Array<{ close(): Promise<unknown> }> = [];
 afterEach(async () => {
@@ -25,7 +27,7 @@ async function connect() {
   const session = createTestBinarySession(() => {
     throw new Error("mobile graph projection must not launch a provider");
   });
-  const server = createServer(session, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({
     name: "mobile-application-graph-test",
     version: "1",
@@ -87,12 +89,10 @@ it("advertises and executes Android and Apple inventory projections", async () =
     arguments: { inventory_evidence: [apkInventory] },
   });
   if (android.isError === true)
-    throw new Error(JSON.stringify(android.structuredContent, null, 2));
+    throw new Error(JSON.stringify(android, null, 2));
   expect(android.structuredContent).toMatchObject({
-    evidence: {
-      operation: "project_android_application_graph",
-      provider: { id: "rea-android-application" },
-    },
+    operation: "project_android_application_graph",
+    provider: { id: "rea-android-application" },
   });
 
   const ipaInventory = parseEvidence(
@@ -102,12 +102,48 @@ it("advertises and executes Android and Apple inventory projections", async () =
     name: "project_apple_application_graph",
     arguments: { inventory_evidence: [ipaInventory] },
   });
-  if (apple.isError === true)
-    throw new Error(JSON.stringify(apple.structuredContent, null, 2));
+  if (apple.isError === true) throw new Error(JSON.stringify(apple, null, 2));
   expect(apple.structuredContent).toMatchObject({
-    evidence: {
-      operation: "project_apple_application_graph",
-      provider: { id: "rea-apple-application" },
-    },
+    operation: "project_apple_application_graph",
+    provider: { id: "rea-apple-application" },
+  });
+});
+
+it("retains Harmony unavailable components and their source Evidence through MCP", async () => {
+  const client = await connect();
+  const root = await createTestTempDirectory("rea-harmony-graph-mcp-");
+  const path = join(root, "Locked.hap");
+  const writer = new ZipWriter(new Uint8ArrayWriter());
+  await writer.add("module.json", new TextReader("{}"));
+  await writer.add("ets/modules.abc", new TextReader("opaque bytecode"), {
+    password: "fixture-only",
+  });
+  await writeFile(path, await writer.close());
+  const inventory = parseEvidence(
+    await runProviderAnalysis(path, "inventory_artifact", {}),
+  );
+  const reply = await client.callTool({
+    name: "project_harmony_application_graph",
+    arguments: { inventory_evidence: [inventory] },
+  });
+  if (reply.isError === true) throw new Error(JSON.stringify(reply));
+  const evidence = parseEvidence(reply.structuredContent);
+  expect(evidence.normalized_result).toMatchObject({
+    unavailable_components: [
+      expect.objectContaining({
+        path: "ets/modules.abc",
+        artifact_id: null,
+        sha256: null,
+        encrypted: true,
+      }),
+    ],
+    coverage: { status: "partial", inventory_complete: true },
+  });
+  const bundle = await client.callTool({
+    name: "get_evidence_bundle",
+    arguments: {},
+  });
+  expect(bundle.structuredContent).toMatchObject({
+    result: { records: expect.arrayContaining([inventory, evidence]) },
   });
 });

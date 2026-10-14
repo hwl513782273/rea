@@ -3,21 +3,9 @@ import { browserNetworkContentSelectionValuesSchema } from "./browserNetworkEvid
 
 import {
   browserScenarioCompletenessSchema,
+  browserScenarioEventFamilySchema,
   browserScenarioEventSchema,
   browserScenarioStepSchema,
-} from "./browserScenarioCaptureValues.js";
-
-export {
-  classifyBrowserScenarioCompleteness,
-  browserScenarioEventSchema,
-  browserScenarioStepSchema,
-  browserStepArtifactsSchema,
-  type BrowserScenarioCompleteness,
-  type BrowserScenarioCompletenessSection,
-  type BrowserScenarioEvent,
-  type BrowserScenarioStep,
-  type BrowserScenarioStepOutcome,
-  type BrowserStepArtifacts,
 } from "./browserScenarioCaptureValues.js";
 
 /** Step-indexed browser scenario observation. */
@@ -34,7 +22,8 @@ export const browserScenarioCaptureSchema = z
       start_origin: z.string().min(1),
       action_count: z.number().int().min(1),
       secret_references: z.array(z.string().min(1)),
-      network_content: browserNetworkContentSelectionValuesSchema.optional(),
+      network_content: browserNetworkContentSelectionValuesSchema,
+      event_families: z.array(browserScenarioEventFamilySchema).optional(),
     }),
     duration_ms: z.number().int().min(0),
     steps: z.array(browserScenarioStepSchema).min(1),
@@ -108,3 +97,25 @@ export const browserScenarioCaptureSchema = z
 export type BrowserScenarioCapture = z.infer<
   typeof browserScenarioCaptureSchema
 >;
+
+/** Capture fields shared by complete results and retained partial observations. */
+export type BrowserScenarioCaptureData = Omit<
+  BrowserScenarioCapture,
+  "browser" | "steps" | "completeness" | "events"
+> & {
+  readonly browser: Omit<BrowserScenarioCapture["browser"], "cleanup"> & {
+    readonly cleanup:
+      | BrowserScenarioCapture["browser"]["cleanup"]
+      | "incomplete";
+  };
+  readonly steps: readonly BrowserScenarioCapture["steps"][number][];
+  readonly events: Omit<BrowserScenarioCapture["events"], "items"> & {
+    readonly items: readonly BrowserScenarioCapture["events"]["items"][number][];
+  };
+};
+
+/** Browser scenario data retained when an operation fails before a complete result. */
+export interface BrowserScenarioPartialObservation {
+  readonly kind: "browser-scenario-observation";
+  readonly capture: BrowserScenarioCaptureData;
+}

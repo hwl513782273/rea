@@ -7,7 +7,7 @@ import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js
 
 import { ArtifactProvider } from "../../../../src/artifacts/ArtifactProvider.js";
 import { artifactInventoryResultSchema } from "../../../../src/domain/artifactGraph.js";
-import type { BinaryTarget } from "../../../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
 
 describe("artifact directory inventory", () => {
   it("inventories app trees deterministically without following symlinks", async () => {
@@ -29,7 +29,7 @@ describe("artifact directory inventory", () => {
     await writeFile(join(app, "Contents", "Resources", "main.js"), "main();\n");
     await writeFile(join(app, "Contents", "Resources", "main.js.MAP"), "{}\n");
     await symlink("/etc/passwd", join(app, "Contents", "Resources", "outside"));
-    const client = new ArtifactProvider().createClient(
+    const client = new ArtifactProvider(process.env).createClient(
       target(app, "directory"),
     );
     const input = {};
@@ -41,7 +41,7 @@ describe("artifact directory inventory", () => {
     const left = artifactInventoryResultSchema.parse(first.value.result);
     const right = artifactInventoryResultSchema.parse(second.value.result);
     expect(left.manifest).toEqual(right.manifest);
-    expect(left.nodes.map(({ kind }) => kind)).toEqual(
+    expect(left.occurrences.map(({ artifact_kind }) => artifact_kind)).toEqual(
       expect.arrayContaining([
         "executable",
         "framework",
@@ -65,7 +65,7 @@ describe("artifact directory inventory", () => {
         expect.objectContaining({
           relation: "maps-source",
           parent_artifact_id: script?.artifact_id,
-          child_artifact_id: sourceMap?.artifact_id,
+          occurrence_id: sourceMap?.occurrence_id,
         }),
       ]),
     );

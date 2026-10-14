@@ -27,7 +27,9 @@ prompt argument or tool explicitly accepts one.
 
 For a JavaScript/Electron application directory, `investigate_feature` points
 directly to `analyze_javascript_application` with `input_path`; it does not
-require `open_binary`. The CLI equivalent is `rea analyze <directory>`.
+require `open_binary`. When that Evidence, or `inspect_binary_layout` Evidence,
+is already retained, it suggests `inspect_analysis_view` before tracing a
+feature seed. The CLI equivalent is `rea analyze <directory>`.
 `open_binary` and the doctor target check admit files and macOS app bundles.
 A directory outside that opening route is reported with an available analysis
 action; this does not establish support for every directory format.
@@ -88,6 +90,12 @@ identifiers only; they do not retrieve or replace the inline Evidence result.
 ```
 
 Completion sources are live projections of the current session:
+
+Document and procedure completion in a binary session reads an already-ready
+provider; it does not start analysis. A cold provider, a target transition, or
+unavailable inventory can return no suggestions. Run an analysis query first
+when you need inventory from a provider that supplies it. An empty completion
+list does not establish that the target has no procedures.
 
 | Argument family     | Source and filtering                                                                                                                                 |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |

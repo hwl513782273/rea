@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 import { parseBinaryTarget } from "../../../../src/application/BinaryTargetResolver.js";
-import { parseMachineType } from "../../../../src/domain/peInspection.js";
 import { buildManagedPeFixture } from "../../../../src/dotnet/ManagedPe.fixture.js";
 import { ManagedStaticProvider } from "../../../../src/dotnet/ManagedStaticProvider.js";
 
@@ -16,7 +15,6 @@ it.each([0x01c0, 0x01c2, 0x01c4])(
     const path = join(directory, "fixture.exe");
     await writeFile(path, bytes);
     const parsed = await parseBinaryTarget(path);
-    expect(parsed.ok).toBe(true);
     if (!parsed.ok) throw parsed.error;
     expect(parsed.value).toMatchObject({
       kind: "executable",
@@ -24,7 +22,6 @@ it.each([0x01c0, 0x01c2, 0x01c4])(
       architecture: "arm",
       managed: true,
     });
-    expect(parseMachineType(machine)).toBe("arm");
     const client = new ManagedStaticProvider().createClient(parsed.value);
     try {
       for (const operation of [
@@ -33,7 +30,6 @@ it.each([0x01c0, 0x01c2, 0x01c4])(
         "inspect_managed_native_boundaries",
       ] as const) {
         const observed = await client.execute(operation, {});
-        expect(observed.ok).toBe(true);
         if (!observed.ok) throw observed.error;
         expect(observed.value.subject).toMatchObject({
           path,

@@ -29,6 +29,16 @@ export type FirmwareLauncher = (
   options: OwnedProviderProcessSpawnOptions,
 ) => Promise<SpawnedOwnedProviderProcess>;
 
+/** Refuse an unmet host or tool requirement, which another target cannot satisfy. */
+export const firmwareToolUnavailable = (
+  engine: string,
+  operation: string,
+  reason: string,
+): AnalysisCapabilityUnavailableError =>
+  new AnalysisCapabilityUnavailableError(engine, operation, reason, {
+    userMessage: reason,
+  });
+
 /** Resolve explicitly supplied executable paths; never install or search for engines. */
 export const resolveFirmwareCommand = async (
   environment: Readonly<Record<string, string | undefined>>,
@@ -43,13 +53,13 @@ export const resolveFirmwareCommand = async (
     configured === undefined ||
     !isAbsolute(configured)
   )
-    throw new AnalysisCapabilityUnavailableError(
+    throw firmwareToolUnavailable(
       engine,
       operation,
       `This integration requires Linux and an absolute ${variable} path to the caller-supplied tool`,
     );
   const command = await realpath(configured).catch((cause: unknown) => {
-    throw new AnalysisCapabilityUnavailableError(
+    throw firmwareToolUnavailable(
       engine,
       operation,
       `${variable} is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -62,7 +72,7 @@ export const resolveFirmwareCommand = async (
       throw new TypeError("Configured path is not a regular file");
     sha256 = await hashFirmwareFile(command);
   } catch (cause: unknown) {
-    throw new AnalysisCapabilityUnavailableError(
+    throw firmwareToolUnavailable(
       engine,
       operation,
       `${variable} is not a readable executable regular file: ${command}: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -71,7 +81,7 @@ export const resolveFirmwareCommand = async (
   const limiter =
     environment.REA_FIRMWARE_PRLIMIT_COMMAND ?? "/usr/bin/prlimit";
   if (!isAbsolute(limiter))
-    throw new AnalysisCapabilityUnavailableError(
+    throw firmwareToolUnavailable(
       engine,
       operation,
       "REA_FIRMWARE_PRLIMIT_COMMAND must be absolute",
@@ -81,7 +91,7 @@ export const resolveFirmwareCommand = async (
     if (!(await stat(limiter)).isFile())
       throw new TypeError("Configured path is not a regular file");
   } catch (cause: unknown) {
-    throw new AnalysisCapabilityUnavailableError(
+    throw firmwareToolUnavailable(
       engine,
       operation,
       `Resource limiter is not an executable regular file: ${limiter}: ${cause instanceof Error ? cause.message : String(cause)}; provide util-linux prlimit`,
@@ -103,6 +113,7 @@ export const runFirmwareCommand = async (context: {
   launcher?: FirmwareLauncher;
   outputBudget?: { root: string; bytes: number; entries: number };
   acceptReportedExtractionFailure?: boolean;
+  retainCleanup(supervisor: ProviderProcessSupervisor): void;
 }) => {
   const { engine, operation, signal } = context;
   signal.throwIfAborted();
@@ -122,6 +133,7 @@ export const runFirmwareCommand = async (context: {
     runId,
     cwd: context.cwd,
     hostEnvironment: context.environment,
+    signal,
     env: {
       TMPDIR: context.cwd,
       OMP_NUM_THREADS: "1",
@@ -130,18 +142,45 @@ export const runFirmwareCommand = async (context: {
       NO_COLOR: "1",
     },
   });
-  const supervisor = new ProviderProcessSupervisor({
-    ...spawned,
-    ownsProcessLifetime: true,
-    cleanup:
-      spawned.cleanup ?? (() => cleanupOwnedProcessGroup(spawned.ownership)),
-  });
+  let diagnosticTruncated = false;
+  const supervisor = new ProviderProcessSupervisor(
+    {
+      ...spawned,
+      ownsProcessLifetime: true,
+      cleanup:
+        spawned.cleanup ?? (() => cleanupOwnedProcessGroup(spawned.ownership)),
+    },
+    {
+      maxDiagnosticBytes: FIRMWARE_LIMITS.diagnosticBytes,
+      onDiagnostic: (event) => {
+        if (event.type === "output" && event.truncated === true)
+          diagnosticTruncated = true;
+      },
+    },
+  );
+  const checkDiagnostics = () => {
+    if (diagnosticTruncated) {
+      const snapshot = supervisor.snapshot();
+      throw new AnalysisOutputError(
+        operation,
+        `Tool diagnostics exceeded the ${FIRMWARE_LIMITS.diagnosticBytes}-byte capture budget`,
+        {
+          capturedOutput: {
+            stdout: snapshot.stdout.text,
+            stderr: snapshot.stderr.text,
+            truncated: true,
+          },
+        },
+      );
+    }
+  };
   let failure: unknown;
   try {
-    const deadline = Date.now() + FIRMWARE_LIMITS.timeoutMs;
-    while (!(await supervisor.waitForExit(100))) {
+    const deadline = performance.now() + FIRMWARE_LIMITS.timeoutMs;
+    while (!(await supervisor.waitForOutputClose(100))) {
+      checkDiagnostics();
       if (signal.aborted) throw new AnalysisCancelledError(operation);
-      if (Date.now() >= deadline)
+      if (performance.now() >= deadline)
         throw new AnalysisTimeoutError(operation, FIRMWARE_LIMITS.timeoutMs);
       if (context.outputBudget !== undefined)
         await inventoryFirmwareOutput(
@@ -152,14 +191,15 @@ export const runFirmwareCommand = async (context: {
           signal,
         );
     }
+    checkDiagnostics();
     if (signal.aborted) throw new AnalysisCancelledError(operation);
   } catch (cause: unknown) {
     failure = cause;
   }
   const stopped = await supervisor.stop();
   const snapshot = supervisor.snapshot();
-  supervisor.dispose();
-  if (stopped.status === "incomplete")
+  if (stopped.status === "incomplete") {
+    context.retainCleanup(supervisor);
     throw new ProviderCleanupError(engine, [runId, context.cwd], {
       reason: stopped.reason,
       leader_pid: spawned.ownership.leaderPid,
@@ -172,6 +212,7 @@ export const runFirmwareCommand = async (context: {
       stderr_bytes: snapshot.stderr.bytes,
       previous_error: failure instanceof Error ? failure.message : null,
     });
+  }
   if (failure !== undefined) throw failure;
   if (
     snapshot.exitCode !== 0 &&

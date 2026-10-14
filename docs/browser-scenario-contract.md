@@ -15,6 +15,12 @@ there is no separate origin allowlist or request-interception layer. Environment
 settings (including service workers blocked by default), empty storage, and a
 final sanitized URL capture are supplied by default. Set
 `environment.service_workers` to `allow` when the application requires them.
+For attached browsers, `block` rejects captures when the selected page or its
+frames are controlled by a service worker or already have a registration,
+including after navigation. Existing caller registrations are never removed.
+Navigation can run destination code before a newly discovered worker is rejected;
+that rejection does not roll back browser effects. REA removes its owned
+future-document scripts, restores live frame methods, then disconnects.
 Add secret declarations, storage seeds, and additional artifact or event
 capture only when needed. Action, secret, and storage counts are not capped.
 Duration, action, and navigation
@@ -156,6 +162,18 @@ Storage cookies are scoped to the page URL at each capture. Unsupported action
 tags, unknown fields, duplicate step IDs, and undeclared secret references fail
 validation.
 
+Cookies are installed before the initial navigation. Local storage entries are
+seeded once per browser storage partition; session storage entries are seeded
+once per origin in each top-level browsing context. Seeding occurs before the
+first document scripts for that area. An origin first reached by a later action
+receives its seed on that first visit. Application updates, deletions, and
+empty values then persist across later navigations in the same area; a new
+scenario starts with its own seeds. Partitioned frames can receive separate
+local storage seeds even when they share an origin. The pre-script mechanism
+uses CDP debugger instrumentation. The observer resumes only pauses whose top
+frame belongs to its private seed script; page breakpoints and `debugger`
+statements remain under the attached debugger client's control.
+
 The result is Evidence with an initial state followed by one record per
 declared action. Each step reports action status, elapsed time, sanitized URLs,
 event bounds, and independently typed capture states for screenshot, DOM,
@@ -236,12 +254,17 @@ network metadata observation; listing `network` in `events` is then optional.
 Each observed request object receives a capture-scoped `transaction_id`.
 Requests sharing a URL remain distinct. Redirects link to the preceding
 transaction only when it was observed; a null predecessor does not establish
-that no earlier hop existed. Older captures without IDs remain readable and
-their transaction association is unknown.
+that no earlier hop existed. Request events require both transaction fields;
+an absent ID is malformed capture data. `redirected_from_transaction_state`
+records `root` when Playwright observed no predecessor and `unknown` when a
+predecessor exists but was outside the capture. A linked predecessor is carried
+by `redirected_from_transaction_id` with no state field. Older captures without
+the state field retain the conservative meaning that a null predecessor is
+unknown.
 
 `scenario.network_content` records the resolved content selection. Comparing
-captures with different selection, or legacy captures without that coverage
-information, reports network evidence as unknown with a recovery instruction.
+captures with different selections reports network evidence as unknown with a
+recovery instruction.
 Capturing more data alone does not establish a website change.
 
 `network-content` events reference the exact request or response event through
@@ -249,8 +272,13 @@ Capturing more data alone does not establish a website change.
 states. Captured bodies retain base64 bytes, byte count, media type, and SHA-256
 of the retained bytes. Request bytes are those exposed by Playwright; a
 `not_exposed` request body does not prove absence or complete multipart file
-coverage. Response bytes are decoded by the browser, not the compressed wire
-representation. No later fetch is substituted for the original response.
+coverage. Response bytes are the result of Playwright's `Response.body()` API.
+Playwright may satisfy that API with a credentialed follow-up load of the
+request URL when CDP has no response body. Event and transaction references
+identify the associated Playwright response object, but do not verify that the
+retained bytes came from the original network transaction. Successful selected
+response bodies include this limitation in the capture. These bytes are not
+the compressed wire representation.
 Headers preserve producer order and duplicates. Authorization,
 Proxy-Authorization, Cookie, and Set-Cookie values are null with
 `redacted: true`; ordinary values remain intact. Declared UTF-8 secret values
@@ -266,8 +294,10 @@ browser cleanup, with a provider-owned five-second timeout per read and
 cancellation support. Failed or unexposed reads retain per-content states and make selected
 event coverage incomplete. Body events can arrive during later steps or final
 drain; event bounds describe receipt during the step, while the source event
-reference establishes the transaction phase. Comparison attributes content to
-its source event's step and excludes the sequence reference from normalization.
+reference establishes the transaction phase. Comparison attributes content, like
+every other event of its transaction, to the step that sent the request (the
+receipt step when that request was not observed) and excludes the sequence
+reference from normalization.
 Playwright scenario capture does not supply initiator stacks; passive CDP
 observation retains its own initiator evidence.
 
@@ -282,7 +312,22 @@ an unchanged claim; observed differences may still prove a changed result.
 The comparison records its full normalization commitment and SHA-256 digest.
 Built-in rules exclude step elapsed time and event sequence/index fields,
 compare screenshots by content digest, and compare DOM/accessibility captures
-by normalized text. Optional caller rules are bounded exact-literal
+by normalized text. Network events are grouped by transaction without their
+capture-local transaction IDs, attributed to the step that sent the request,
+and compared as an unordered collection after caller rules apply, because
+concurrent responses arrive in any order and can land in a later step; a
+redirect retains the complete predecessor ancestry, including each hop's own
+request, response outcome, and selected network content. Each transaction's
+capture-local IDs, sequence/index fields, and content source-sequence anchor
+are removed. Caller rules normalize retained strings before hashing. The
+`preserve_redirect_transaction_ancestry` built-in rule fingerprints each hop
+as canonical SHA-256 of `{ events, redirected_from }`: `events` is the sorted
+list of its normalized event SHA-256 digests, and `redirected_from` is its
+predecessor fingerprint or null for a root. Selected transaction fingerprints
+are sorted for the step's network comparison. Temporary numeric graph indices
+are lookup references only and do not enter the final digest. Missing or cyclic
+predecessor evidence yields unknown comparability instead of an unchanged claim.
+Other events keep receipt order. Optional caller rules are bounded exact-literal
 replacements over named artifact kinds. Rules and artifact-kind lists are
 sorted canonically before application, making the same policy reproducible
 regardless of input order. Rules operate only on already-redacted durable
@@ -294,3 +339,13 @@ artifacts carry their normalized before/after digests and capture states.
 Every changed or unknown artifact record is returned inline for each aligned
 step. Missing, truncated, or mismatched capture coverage remains unknown
 instead of being treated as equality.
+
+`scenario.event_families` records the sorted, de-duplicated `capture.events`
+selection. Captures with different selections report event evidence as unknown
+with a recovery instruction, even when no selected family emitted an event.
+Captures written before this field existed omit it, so their event evidence is
+also unknown.
+
+Network normalization also commits the removal of capture-local transaction IDs,
+attribution to the requesting step, and unordered transaction comparison. These
+built-in rule identities participate in the normalization digest.

@@ -1,12 +1,12 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import { reconstructJavaScriptArtifact } from "../../src/application/javascript/JavaScriptArtifactReconstruction.js";
+import { reconstructJavaScriptArtifact } from "./javascriptApplicationScope.js";
 import type {
   ApplicationEdge,
   ApplicationNode,
-  JavaScriptApplicationGraph,
-} from "../../src/domain/javascript/javascriptApplicationGraph.js";
+} from "../../src/domain/javascript/javascriptApplicationGraphSchemas.js";
+import type { JavaScriptApplicationGraph } from "../../src/domain/javascript/javascriptApplicationGraph.js";
 
 /** Write text fixture files, creating parent directories as needed. */
 export const writeFixtureFiles = async (

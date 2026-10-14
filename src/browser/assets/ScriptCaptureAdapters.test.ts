@@ -152,9 +152,11 @@ describe("script capture identity and response projection", () => {
     )
       throw new Error("Missing response bytes");
     content.body.redacted = true;
+    content.body.representation = "playwright-response-body-bytes";
     expect(selectScriptCapture(capture).scripts[0]?.content).toMatchObject({
       state: "captured",
       redacted: true,
+      representation: "playwright-response-body-bytes",
     });
     content.body.representation = "browser-exposed-request-bytes";
     expect(selectScriptCapture(capture).scripts[0]?.content).toMatchObject({
@@ -164,21 +166,39 @@ describe("script capture identity and response projection", () => {
     });
   });
 
-  it("does not join legacy metadata by URL when transaction identity is absent", () => {
+  it("rejects captures without explicit transaction identity metadata", () => {
     const capture = scriptScenarioFixture();
-    capture.events.items = capture.events.items.filter(
-      ({ kind }) => kind !== "network-content",
-    );
-    for (const event of capture.events.items)
-      if (event.kind === "request" || event.kind === "response")
-        delete event.transaction_id;
-    capture.events.retained = capture.events.items.length;
-    expect(selectScriptCapture(capture).scripts[0]).toMatchObject({
-      source: { transaction_id: null },
-      content: {
-        state: "unavailable",
-        reason: "transaction-identity-unavailable",
+    const request = capture.events.items.find(({ kind }) => kind === "request");
+    if (request?.kind !== "request") throw new Error("Missing request");
+    const { transaction_id: _transactionId, ...requestWithoutId } = request;
+    const withoutTransactionId: unknown = {
+      ...capture,
+      events: {
+        ...capture.events,
+        items: capture.events.items.map((event) =>
+          event === request ? requestWithoutId : event,
+        ),
       },
-    });
+    };
+    expect(() => selectScriptCapture(withoutTransactionId)).toThrow(
+      "Expected a valid",
+    );
+
+    const {
+      redirected_from_transaction_id: _redirect,
+      ...requestWithoutRedirect
+    } = request;
+    const withoutRedirectMetadata: unknown = {
+      ...capture,
+      events: {
+        ...capture.events,
+        items: capture.events.items.map((event) =>
+          event === request ? requestWithoutRedirect : event,
+        ),
+      },
+    };
+    expect(() => selectScriptCapture(withoutRedirectMetadata)).toThrow(
+      "Expected a valid",
+    );
   });
 });

@@ -1,7 +1,7 @@
 # DOS MZ and COM analysis with Ghidra
 
 REA can analyze DOS MZ executables and explicitly selected COM images through the bring-your-own Ghidra adapter.
-The Linux x64 verification lane exercises actual 16-bit disassembly and
+The Linux x64 and macOS arm64 verification lanes exercise actual 16-bit disassembly and
 decompilation through the CLI and stdio MCP. Provider admission accepts Ghidra
 12.1.x and that installation's declared JDK range. The verification lane uses
 Ghidra 12.1.4 and JDK 21; no DOS emulator or cross-compiler is required.
@@ -87,6 +87,10 @@ address for subsequent lookups and leaves instruction decoding context with
 Ghidra. These coordinates are analysis load addresses, not file offsets or
 observations of a running DOS system.
 
+Offsets that Ghidra would truncate to a different address are rejected before
+reading or annotating a function. This also applies to explicit or encoded
+address-space names; leading zeros preserve the numeric offset.
+
 `procedure_info` and function dossiers include `body` evidence:
 
 ```json
@@ -126,8 +130,9 @@ range's file offset and analysis address; it does not locate the first differing
 byte inside that range. Mapping ends are **inclusive**, unlike the exclusive ends
 from `list_segments`. Appended overlays remain in source-file identity and are
 excluded from initialized module coverage. Uninitialized allocations are reported;
-their contents and DOS runtime semantics are not verified. Formats other than MZ and explicit COM return
-`unsupported` with measured observations, not a successful MZ verification.
+their contents and DOS runtime semantics are not verified. Independent verification
+also covers explicit [raw-binary imports](raw-binary.md); other formats return
+`unsupported` with measured observations.
 
 `read_bytes` returns initialized provider memory, including loader fixups; an
 unmapped or uninitialized byte ends the read with an explicit returned length and
@@ -146,11 +151,13 @@ For a packed executable, importing the original can analyze its unpacking
 stub. Analyze a separately prepared unpacked copy to inspect the original
 program's recovered code. Retain both artifact digests and the transformation
 evidence; REA never silently replaces the admitted target. Appended overlays
-are separate from the initialized MZ module. Raw COM files and DOS extenders
-without an admitted MZ real-mode entry are outside this import boundary.
+are separate from the initialized MZ module. Headerless COM requires the
+[explicit COM interpretation](#headerless-com-images); REA does not guess it
+from the filename or unrecognized bytes. DOS extenders without an admitted
+MZ real-mode entry remain outside this import boundary.
 
 DOS MZ is available through Ghidra, with no Hopper support claim. It is outside
-the Windows native PE P0 boundary. macOS DOS verification remains unverified.
+the Windows native PE P0 boundary. macOS x64 DOS verification remains unverified.
 
 ## Real verification
 

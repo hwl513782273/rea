@@ -1,5 +1,7 @@
-import { compareCodePoints, uniqueSorted } from "../canonicalOrdering.js";
-import { absenceClaimable, canonicalDigest } from "../comparisonSemantics.js";
+import { uniqueSorted } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import { absenceClaimable } from "../comparisonSemantics.js";
+import { digestCanonicalValue } from "../canonicalDigest.js";
 
 import type { JavaScriptApplicationGraph } from "./javascriptApplicationGraph.js";
 import type { HistoricalSourceGraph } from "../referenceSourceGraph.js";
@@ -12,6 +14,7 @@ import {
 } from "./sourceToBundleComparisonSchemas.js";
 import {
   buildSourceToBundleCandidateIndex,
+  candidateHasDigest,
   candidateIdsForSource,
   historicalSourceFiles,
   scoreSourceToBundleCandidate,
@@ -83,7 +86,7 @@ export const compareSourceToBundle = (
   };
   return sourceToBundleComparisonResultSchema.parse({
     ...semanticResult,
-    comparison_id: `stbc_${canonicalDigest(semanticResult, "Source-to-bundle comparison")}`,
+    comparison_id: `stbc_${digestCanonicalValue(semanticResult, "Source-to-bundle comparison")}`,
   });
 };
 
@@ -125,7 +128,12 @@ const compareMappings = (
         (candidate): candidate is SourceToBundleCandidate => candidate !== null,
       )
       .sort(compareCandidates);
-    const classification = classifyMapping(scored, projection.absenceComplete);
+    const classification = classifyMapping(
+      scored,
+      projection.absenceComplete,
+      (nodeId) =>
+        source.sha256 !== null && candidateHasDigest(projection.index, nodeId),
+    );
     const semantic = {
       source_path: source.path,
       source_sha256: source.sha256,
@@ -175,6 +183,7 @@ const scoringModel = (): SourceToBundleComparisonResult["scoring"] => ({
 const classifyMapping = (
   candidates: readonly SourceToBundleCandidate[],
   absenceComplete: boolean,
+  digestComparable: (nodeId: string) => boolean,
 ): ClassifiedMapping => {
   const exact = candidates.filter((candidate) =>
     hasSignal(candidate, "exact-source-digest"),
@@ -213,6 +222,15 @@ const classifyMapping = (
       : pathCandidates.filter(({ score }) => score === topScore);
   if (topPathCandidates.length === 1) {
     const candidate = topPathCandidates[0];
+    if (candidate !== undefined && digestComparable(candidate.current_node_id))
+      return {
+        status: "modified",
+        confidence: candidate.confidence === "high" ? "high" : "medium",
+        currentNodeIds: [candidate.current_node_id],
+        limitations: [
+          "Location evidence links the source to the current node, but their source digests differ.",
+        ],
+      };
     return {
       status: "unknown",
       confidence: "unknown",
@@ -240,7 +258,11 @@ const classifyMapping = (
       confidence: "unknown",
       currentNodeIds: [],
       limitations: [
-        "Only weak basename or extension signals were available; no mapping was forced.",
+        candidates.some((candidate) =>
+          hasSignal(candidate, "unicode-equivalent-path"),
+        )
+          ? "Unicode-equivalent paths are inferred candidates only; filesystem paths with distinct Unicode spellings may identify different files, so no mapping was forced."
+          : "Only weak basename or extension signals were available; no mapping was forced.",
       ],
     };
   return absenceComplete
@@ -300,7 +322,7 @@ const mappingId = (
   input: SourceToBundleComparisonInput,
   item: Omit<SourceToBundleComparisonItem, "mapping_id">,
 ): string =>
-  `stbc_item_${canonicalDigest(
+  `stbc_item_${digestCanonicalValue(
     {
       reference_root_sha256: input.reference.root_sha256,
       application_graph_id: input.application.graph.graph_id,
@@ -366,4 +388,4 @@ const compareCandidates = (
   right: SourceToBundleCandidate,
 ): number =>
   right.score - left.score ||
-  compareCodePoints(left.current_node_id, right.current_node_id);
+  compareUnicodeCodePoints(left.current_node_id, right.current_node_id);

@@ -15,10 +15,10 @@ import { buildRecoveryFixtures } from "../../fixtures/javascript-recovery/build.
 import { mcpTextValue } from "../../lib/mcp-verifier-results.mjs";
 
 const OFFICIAL_BINARY_SHA256 =
-  "e8c7ca052974604197389f6ace7464e4dd24dce64e2730971521bd6606ec9c9e";
+  "664fa06782a61eda7ed15885134b52525fd565dd77607e642062ceb6cd927c38";
 if (!process.env.REA_WAKARU_COMMAND)
   throw new Error(
-    "Provide REA_WAKARU_COMMAND for the official Wakaru 1.13.0 Linux x64 binary",
+    "Provide REA_WAKARU_COMMAND for the official Wakaru 1.14.0 Linux x64 binary",
   );
 const entrypoint =
   process.argv[2] ?? fileURLToPath(new URL("../../rea.mjs", import.meta.url));
@@ -41,21 +41,23 @@ const cli = async (...args) => {
   return parseEvidence(JSON.parse(stdout));
 };
 const call = async (name, args) => {
-  const result = await client.callTool({ name, arguments: args }, undefined, {
-    timeout: 150000,
-  });
+  const result = await client.callTool(
+    { name, arguments: args },
+    { timeout: 150000 },
+  );
   assert.notEqual(result.isError, true, mcpTextValue(result));
-  return parseEvidence(JSON.parse(mcpTextValue(result)).evidence);
+  return parseEvidence(JSON.parse(mcpTextValue(result)));
 };
 const fingerprint = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const counts = [];
+let finalReport;
 try {
   const fixtures = await buildRecoveryFixtures(
     root,
     process.env.REA_JAVASCRIPT_FIXTURE_TOOLS,
   );
   await client.connect(transport);
-  for (const fixture of fixtures.files) {
+  for (const fixture of [...fixtures.files, fixtures.codeSplit]) {
     for (const surface of ["cli", "stdio_mcp"]) {
       const output = join(root, `${fixture.name}-${surface}`);
       const flags =
@@ -74,11 +76,18 @@ try {
               fixture.path,
               output,
               ...flags,
+              ...(fixture.additional_paths ?? []).flatMap((path) => [
+                "--additional-path",
+                path,
+              ]),
             )
           : await call("recover_javascript_sources", {
               path: fixture.path,
               output_directory: output,
               ...fixture.options,
+              ...(fixture.additional_paths
+                ? { additional_paths: fixture.additional_paths }
+                : {}),
             });
       const result = javascriptRecoveryResultSchema.parse(
         evidence.normalized_result,
@@ -96,6 +105,25 @@ try {
         analysis.normalized_result.statistics.parsed_javascript_files,
         result.modules.length,
       );
+      const imports = analysis.normalized_result.graph.edges.filter(
+        (edge) =>
+          edge.relation === "imports" &&
+          edge.properties.resolution_status === "resolved",
+      );
+      if (fixture.additional_paths) {
+        assert.ok(
+          imports.length >= 4,
+          "Expected cross-chunk imports in the recovered application graph",
+        );
+        const recoveredPaths = new Set(
+          result.modules.map((module) => module.reported_filename),
+        );
+        for (const edge of imports)
+          assert.ok(
+            recoveredPaths.has(edge.properties.resolved_path),
+            `Expected an emitted import target: ${String(edge.properties.resolved_path)}`,
+          );
+      }
       const recoveredEntry =
         result.modules.find(
           (module) => module.reported_filename === "entry.js",
@@ -103,7 +131,8 @@ try {
       assert.ok(recoveredEntry);
       const oracle =
         'await import((await import("node:url")).pathToFileURL(process.argv[1])); const f=globalThis.recoveryFixture; console.log(JSON.stringify([f.greet(null),f.greet("REA"),f.total([1,2,3])]));';
-      for (const selected of fixture.options?.extraction_mode === "inspection"
+      for (const selected of fixture.additional_paths ||
+      fixture.options?.extraction_mode === "inspection"
         ? []
         : [fixture.path, recoveredEntry.artifact.path]) {
         const execution = await run(
@@ -124,23 +153,24 @@ try {
         maps: result.modules.filter((module) => module.source_map !== null)
           .length,
         finite_fixture_oracle:
+          !fixture.additional_paths &&
           fixture.options?.extraction_mode !== "inspection",
+        cross_chunk_imports: fixture.additional_paths ? imports.length : null,
       });
     }
   }
-  console.log(
-    JSON.stringify({
-      engine: "wakaru 1.13.0",
-      toolchains: fixtures.toolchains,
-      results: counts,
-      verified: true,
-    }),
-  );
+  finalReport = {
+    engine: "wakaru 1.14.0",
+    toolchains: fixtures.toolchains,
+    results: counts,
+    verified: true,
+  };
 } finally {
   await client.close();
   await transport.close();
   await rm(root, { recursive: true, force: true });
 }
+console.log(JSON.stringify(finalReport));
 
 async function assertRecoveredArtifacts(evidence, result, fixture) {
   assert.deepEqual(result.options, {
@@ -157,9 +187,15 @@ async function assertRecoveredArtifacts(evidence, result, fixture) {
   assert.equal(result.status, "complete");
   assert.equal(result.reported_format, fixture.expectedFormat);
   assert.equal(result.modules.length, fixture.expectedModules);
-  assert.equal(result.source.sha256, fingerprint(await readFile(fixture.path)));
+  const sources = [result.source, ...(result.additional_sources ?? [])];
+  assert.deepEqual(
+    sources.map((source) => source.path),
+    [fixture.path, ...(fixture.additional_paths ?? [])],
+  );
+  for (const source of sources)
+    assert.equal(source.sha256, fingerprint(await readFile(source.path)));
   for (const file of [
-    result.source.published_copy,
+    ...sources.map((source) => source.published_copy),
     result.report,
     result.provenance,
     result.manifest,
@@ -173,16 +209,27 @@ async function assertRecoveredArtifacts(evidence, result, fixture) {
     assert.equal(fingerprint(bytes), file.sha256);
   }
   for (const module of result.modules) {
-    assert.equal(module.provenance.original_sha256, result.source.sha256);
-    assert.equal(module.provenance.reported_input, result.source.snapshot_path);
-    for (const range of module.provenance.byte_ranges)
-      assert.ok(range.start <= range.end && range.end <= result.source.bytes);
+    const source = sources.find(
+      (source) => source.snapshot_path === module.provenance.reported_input,
+    );
+    assert.ok(source, "Module must name a selected input snapshot");
+    assert.equal(module.provenance.original_path, source.path);
+    assert.equal(module.provenance.original_sha256, source.sha256);
+    for (const range of [
+      ...module.provenance.byte_ranges,
+      ...module.provenance.context_byte_ranges,
+    ])
+      assert.ok(range.start <= range.end && range.end <= source.bytes);
     if (module.source_map) {
       const map = JSON.parse(await readFile(module.source_map.path, "utf8"));
       for (const source of map.sources)
-        assert.equal(
-          resolve(dirname(module.source_map.path), source),
-          result.source.published_copy.path,
+        assert.ok(
+          sources.some(
+            (selected) =>
+              selected.published_copy.path ===
+              resolve(dirname(module.source_map.path), source),
+          ),
+          "Map source must name a published input snapshot",
         );
     }
   }

@@ -1,4 +1,4 @@
-import { canonicalDigest } from "../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
 import type {
   ElectronPageInspection,
@@ -24,6 +24,7 @@ import {
 import { captureElectronScripts } from "./CdpElectronScripts.js";
 import { captureElectronWorkers } from "./CdpElectronWorkers.js";
 import { authorizedElectronFile } from "./ElectronFileScope.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 interface ElectronContext {
   readonly connection: CdpConnection;
@@ -56,6 +57,11 @@ export const inspectCdpElectronPage = async (
       "Local file paths exposed by the selected CDP target are retained in the observation.",
       "REA does not evaluate renderer JavaScript, invoke Electron APIs, navigate, click, or close the page.",
       "Select include_script_sources to retain script contents.",
+      ...(context.target.attached === null
+        ? [
+            "CDP discovery omitted the target attachment state; attached is reported as unknown.",
+          ]
+        : []),
     ],
     mainFrameId: undefined,
     navigationDuringCapture: false,
@@ -226,7 +232,7 @@ const navigatedFrameId = (event: CdpEvent): string | undefined => {
   return undefined;
 };
 
-const captureFrames = async (
+export const captureFrames = async (
   result: unknown,
   completeness: CdpCaptureCompleteness,
 ): Promise<ElectronPageInspection["frames"]> => {
@@ -239,8 +245,12 @@ const captureFrames = async (
   )) {
     const frame = recordValue(tree.frame);
     const frameId = cdpStringValue(frame?.id);
-    const path = await authorizedElectronFile(cdpStringValue(frame?.url) ?? "");
-    if (frameId === undefined || path === undefined) {
+    if (frame === undefined || frameId === undefined) {
+      completeness.exclude("frames", "invalid_protocol_value");
+      continue;
+    }
+    const path = await authorizedElectronFile(cdpStringValue(frame.url) ?? "");
+    if (path === undefined) {
       completeness.exclude("frames", "out_of_target_scope");
       continue;
     }
@@ -289,7 +299,7 @@ const captureResources = async (
             ? null
             : Math.max(0, numberValue(resource.contentSize) ?? 0),
       };
-      const resourceKey = `electron_resource_${canonicalDigest(item, "CDP capture")}`;
+      const resourceKey = `electron_resource_${digestCanonicalValue(item, "CDP capture")}`;
       if (seen.has(resourceKey)) continue;
       seen.add(resourceKey);
       resources.push({
@@ -300,7 +310,7 @@ const captureResources = async (
     pending.push(...recordsValue(tree.childFrames));
   }
   return resources.sort((left, right) =>
-    left.resource_key.localeCompare(right.resource_key),
+    compareUnicodeCodePoints(left.resource_key, right.resource_key),
   );
 };
 

@@ -27,7 +27,6 @@ const observedJavaScriptRuntimeKindSchema = javascriptRuntimeKindSchema.or(
   z.literal("unknown"),
 );
 
-/** Input for one bounded, attach-only V8 Inspector observation. */
 /** Input for one passive attach-only V8 Inspector observation. */
 export const observeJavaScriptRuntimeInputSchema = z.strictObject({
   ...runtimeEndpoint,
@@ -49,7 +48,6 @@ export const javascriptRuntimeLocationSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("file"),
     file_path: z.string().min(1),
-    authority: z.literal("scope-fallback").optional(),
   }),
   z.strictObject({
     kind: z.literal("url"),
@@ -68,8 +66,15 @@ export type JavaScriptRuntimeLocation = z.infer<
 /** Discovery metadata can identify an endpoint target without verifying its file location. */
 export const javascriptRuntimeUnresolvedLocationSchema = z.strictObject({
   kind: z.literal("unresolved"),
-  reported_url: z.string().min(1),
-  reason: z.literal("unverifiable-file-location"),
+  reported_url: z
+    .string()
+    .describe(
+      "Raw Inspector URL, which may be empty for anonymous or evaluated code.",
+    ),
+  reason: z.enum([
+    "unverifiable-file-location",
+    "location-authorization-not-attempted",
+  ]),
 });
 
 /** Verified locations and explicitly unresolved discovery metadata. */
@@ -84,7 +89,12 @@ export type JavaScriptRuntimeTargetLocation = z.infer<
 const javascriptRuntimeTargetSchema = z.strictObject({
   target_id: z.string().min(1),
   protocol_type: z.string().min(1),
-  attached: z.boolean(),
+  attached: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Discovery-reported debugger attachment state; null means unknown",
+    ),
   location: javascriptRuntimeTargetLocationSchema,
 });
 
@@ -104,11 +114,21 @@ export type JavaScriptRuntimeTargetList = z.infer<
 
 const javascriptRuntimeScriptSchema = z.strictObject({
   script_key: prefixedDigestSchema("v8_script"),
-  location: javascriptRuntimeLocationSchema,
+  location: javascriptRuntimeTargetLocationSchema,
   execution_context_key: z.string().nullable(),
   cdp_hash: z.string().nullable(),
-  length: z.number().int().min(0),
-  is_module: z.boolean(),
+  length: z
+    .number()
+    .int()
+    .min(0)
+    .nullable()
+    .describe("Producer-reported script length; null when unavailable."),
+  is_module: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Producer-reported module classification; null when unavailable.",
+    ),
   status: z.literal("observed-loaded"),
 });
 

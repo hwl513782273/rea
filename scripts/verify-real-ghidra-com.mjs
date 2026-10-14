@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { requireMcpOperationResult } from "./lib/mcp-verifier-results.mjs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -14,6 +15,7 @@ import { functionDossierSchema } from "../dist/domain/hopperValues.js";
 import { inspectGhidraInstallation } from "../dist/ghidra/GhidraInstallation.js";
 import { buildDosComFixture } from "../tests/conformance/ghidra/dos-com-fixture.mjs";
 import { createVerifierRun, completeVerifierRun } from "./lib/verifier-run.mjs";
+import { verifyGhidraAddressBoundaries } from "./lib/real-ghidra-address-boundaries.mjs";
 
 // This lane intentionally has no game paths, binary seeds or compiler dependency.
 if (process.argv.length !== 2)
@@ -27,6 +29,7 @@ if (process.env.GHIDRA_INSTALL_DIR === undefined)
     "verify:ghidra:com prerequisite missing: GHIDRA_INSTALL_DIR (bring your own Ghidra).",
   );
 const installation = inspectGhidraInstallation({
+  environment: process.env,
   installDir: process.env.GHIDRA_INSTALL_DIR,
   ...(process.env.JAVA_HOME === undefined
     ? {}
@@ -155,7 +158,7 @@ try {
     observations: {
       ...x.observations,
       source_files: x.observations.source_files.map(
-        ({ name, ...file }) => file,
+        ({ name: _name, ...file }) => file,
       ),
     },
   });
@@ -228,6 +231,7 @@ try {
   );
   assert.equal(retained.annotations.inline_comment, changes.inline_comment);
   assert.equal(retained.dossier.procedure.name, changes.name);
+  await verifyGhidraAddressBoundaries(client, fixture.entry, cli);
   const cleared = await call("annotate_native_function", {
     procedure: fixture.entry,
     comment: "",
@@ -294,6 +298,7 @@ try {
       cli_mcp_parity: true,
     },
     original_unchanged: true,
+    address_truncation_rejected: true,
     limitations: image.limitations,
   };
 } catch (error) {
@@ -328,12 +333,15 @@ async function call(name, args = {}) {
     { timeout: 240000 },
   );
   assert.notEqual(value.isError, true, JSON.stringify(value));
-  if (name === "open_binary") return value.structuredContent.result;
-  if (name === "close_binary") return value.structuredContent;
-  const evidence = parseEvidence(value.structuredContent.evidence);
+  const projected = requireMcpOperationResult(value, name);
+  if (name === "open_binary" || name === "close_binary") return projected;
+  const evidence = parseEvidence(value.structuredContent);
   assert.equal(evidence.subject.digest.sha256, sha256);
-  assert.deepEqual(evidence.normalized_result, value.structuredContent.result);
-  return value.structuredContent.result;
+  assert.deepEqual(
+    evidence.normalized_result,
+    value.structuredContent.normalized_result,
+  );
+  return projected;
 }
 async function cli(command, address, options = []) {
   const { stdout } = await promisify(execFile)(

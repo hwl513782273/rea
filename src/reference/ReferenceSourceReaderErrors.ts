@@ -1,7 +1,7 @@
-import {
-  type ReferenceSourceEntry,
-  type ReferenceSourceFailureCode,
-  type ReferenceSourceReaderError,
+import type {
+  ReferenceSourceEntry,
+  ReferenceSourceFailureCode,
+  ReferenceSourceReaderError,
 } from "./ReferenceSourceReaderTypes.js";
 
 export const failure = (
@@ -29,6 +29,9 @@ const FILESYSTEM_ERROR_CODES = new Set([
   "EISDIR",
   "ELOOP",
   "EMFILE",
+  // A traversed child can exceed the platform's absolute path limit even
+  // though the selected root and every component are valid.
+  "ENAMETOOLONG",
   "ENFILE",
   "ENOENT",
   "ENOTDIR",
@@ -44,9 +47,31 @@ export const filesystemFailureDetail = (
 ): string | undefined => {
   if (!(cause instanceof Error)) return undefined;
   const code: unknown = Reflect.get(cause, "code");
+  if (code === "ENAMETOOLONG")
+    return `${operation}: ENAMETOOLONG (entry path exceeds the operating system path limit)`;
   return typeof code === "string" && FILESYSTEM_ERROR_CODES.has(code)
     ? `${operation}: ${cause.message}`
     : undefined;
+};
+
+/** Preserve root I/O detail while separating bad selections from access failures. */
+export const rootFilesystemFailure = (
+  cause: unknown,
+  operation: string,
+):
+  | {
+      readonly code: "invalid-root" | "io";
+      readonly message: string;
+    }
+  | undefined => {
+  if (!(cause instanceof Error)) return undefined;
+  const code: unknown = Reflect.get(cause, "code");
+  if (typeof code !== "string" || !FILESYSTEM_ERROR_CODES.has(code))
+    return undefined;
+  return {
+    code: code === "ENOENT" || code === "ENOTDIR" ? "invalid-root" : "io",
+    message: `${operation}: ${cause.message}`,
+  };
 };
 
 export const entryFailure = (

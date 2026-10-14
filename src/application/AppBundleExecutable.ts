@@ -1,16 +1,22 @@
-import { execFile } from "node:child_process";
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
+import { parseBinary } from "plist";
 import { z } from "zod";
 
+import { preflightPropertyListDecode } from "../artifacts/apple/InterfaceBuilderDecodeBudget.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
 import { isPathWithinRoot } from "../domain/localPath.js";
-import { parseXmlPropertyList } from "../domain/propertyListKeys.js";
+import {
+  omitPrototypeKeys,
+  parseXmlPropertyList,
+} from "../domain/propertyListKeys.js";
+import { decodeXmlPlistText } from "../domain/propertyListXmlText.js";
+import { hasBinaryPlistSignature } from "../domain/apple/appleArchiveFormat.js";
 import { err, ok, type Result } from "../domain/result.js";
 
-const execFileAsync = promisify(execFile);
+/** Decoded representation bound for one binary Info.plist. */
+const BINARY_PLIST_DECODE_BYTES = 16 * 1024 * 1024;
 
 /** Where one app bundle layout keeps its Info.plist and program file. */
 interface BundleLayout {
@@ -36,6 +42,15 @@ export interface ResolvedAppBundle {
   readonly infoPlist?: string;
 }
 
+/** Filesystem operations used by the resolver, injectable for boundary tests. */
+export interface AppBundleFileSystem {
+  readonly readFile: (path: string) => Promise<Buffer>;
+  readonly realpath: (path: string) => Promise<string>;
+  readonly decodeBinaryPlist?: (path: string) => Promise<string>;
+}
+
+const defaultFileSystem: AppBundleFileSystem = { readFile, realpath };
+
 /**
  * Resolve an app bundle directory to its declared program file. macOS and
  * flat iOS-style layouts are read directly. An iOS app installed on a Mac is
@@ -44,21 +59,34 @@ export interface ResolvedAppBundle {
  */
 export const resolveAppBundleExecutable = async (
   path: string,
+  fileSystem: AppBundleFileSystem = defaultFileSystem,
 ): Promise<Result<ResolvedAppBundle, BinaryTargetError>> => {
-  const layout = await presentLayout(path);
-  if (layout !== undefined) return resolveLayoutExecutable(path, layout);
-  const wrapped = await wrappedBundle(path);
-  if (wrapped !== undefined) {
-    const wrappedLayout = await presentLayout(wrapped);
-    if (wrappedLayout !== undefined)
-      return resolveLayoutExecutable(wrapped, wrappedLayout);
+  try {
+    const layout = await presentLayout(path);
+    if (layout !== undefined)
+      return resolveLayoutExecutable(path, layout, fileSystem);
+    const wrapped = await wrappedBundle(path);
+    if (wrapped !== undefined) {
+      const wrappedLayout = await presentLayout(wrapped);
+      if (wrappedLayout !== undefined)
+        return resolveLayoutExecutable(wrapped, wrappedLayout, fileSystem);
+    }
+  } catch (cause: unknown) {
+    if (cause instanceof BinaryTargetError) return err(cause);
+    return err(
+      new BinaryTargetError(path, errorReason(cause, path), { cause }),
+    );
   }
   return err(
-    new BinaryTargetError(path, "app has no readable CFBundleExecutable", {
-      cause: new Error(
-        "No Contents/Info.plist, root Info.plist, or single Wrapper/*.app bundle was found",
-      ),
-    }),
+    new BinaryTargetError(
+      path,
+      `app Info.plist is missing or no supported bundle layout was found: ${path}`,
+      {
+        cause: new Error(
+          "No Contents/Info.plist, root Info.plist, or single Wrapper/*.app bundle was found",
+        ),
+      },
+    ),
   );
 };
 
@@ -80,15 +108,49 @@ const layoutPlistPresent = async (path: string): Promise<boolean> => {
     return (await stat(path)).isFile();
   } catch (cause: unknown) {
     if (isAbsence(cause)) return false;
+    if (isPermissionDenied(cause))
+      throw new BinaryTargetError(
+        path,
+        `permission denied inspecting app Info.plist ${path}`,
+        { cause },
+      );
     throw cause;
   }
 };
 
 const isAbsence = (cause: unknown): boolean => {
-  const code: unknown =
-    cause instanceof Error ? Reflect.get(cause, "code") : undefined;
+  const code = errorCode(cause);
   return code === "ENOENT" || code === "ENOTDIR";
 };
+
+const errorCode = (cause: unknown): unknown =>
+  cause instanceof Error ? Reflect.get(cause, "code") : undefined;
+
+const codeDescription = (cause: unknown): string => {
+  const code = errorCode(cause);
+  return typeof code === "string" || typeof code === "number"
+    ? ` (${String(code)})`
+    : "";
+};
+
+const isSystemErrorCode = (cause: unknown): boolean => {
+  const code = errorCode(cause);
+  return (
+    typeof code === "string" &&
+    /^[A-Z][A-Z0-9_]+$/u.test(code) &&
+    !code.startsWith("ERR_")
+  );
+};
+
+const isPermissionDenied = (cause: unknown): boolean =>
+  errorCode(cause) === "EACCES" || errorCode(cause) === "EPERM";
+
+const errorReason = (cause: unknown, path: string): string =>
+  isPermissionDenied(cause)
+    ? `permission denied accessing app bundle path ${path}`
+    : isAbsence(cause)
+      ? `app bundle path is missing: ${path}`
+      : `could not inspect app bundle path ${path}`;
 
 /** The single real `.app` directory inside an iOS-on-Mac `Wrapper`. */
 const wrappedBundle = async (bundle: string): Promise<string | undefined> => {
@@ -99,32 +161,56 @@ const wrappedBundle = async (bundle: string): Promise<string | undefined> => {
     if (isAbsence(cause)) return undefined;
     throw cause;
   }
-  const apps = (await readdir(wrapper, { withFileTypes: true })).filter(
-    (entry) => entry.isDirectory() && entry.name.toLowerCase().endsWith(".app"),
-  );
-  const [app] = apps;
-  return apps.length === 1 && app !== undefined
-    ? join(wrapper, app.name)
-    : undefined;
+  let app: string | undefined;
+  for await (const entry of await opendir(wrapper)) {
+    if (!entry.isDirectory() || !entry.name.toLowerCase().endsWith(".app"))
+      continue;
+    if (app !== undefined) return undefined;
+    app = join(wrapper, entry.name);
+  }
+  return app;
 };
 
 const resolveLayoutExecutable = async (
   bundle: string,
   layout: BundleLayout,
+  fileSystem: AppBundleFileSystem,
 ): Promise<Result<ResolvedAppBundle, BinaryTargetError>> => {
   const plistPath = join(bundle, ...layout.plist);
-  let name: string;
+  let plist: Buffer;
   try {
-    const plist = await readFile(plistPath);
-    name =
-      plist.subarray(0, 6).toString("ascii") === "bplist"
-        ? await readBinaryPlistExecutable(plistPath)
-        : parseXmlPlistExecutable(plist.toString("utf8"));
+    plist = await fileSystem.readFile(plistPath);
   } catch (cause: unknown) {
     return err(
-      new BinaryTargetError(bundle, "app has no readable CFBundleExecutable", {
-        cause,
-      }),
+      new BinaryTargetError(
+        plistPath,
+        isPermissionDenied(cause)
+          ? `permission denied reading app Info.plist ${plistPath}`
+          : isAbsence(cause)
+            ? `app Info.plist is missing: ${plistPath}`
+            : `could not read app Info.plist ${plistPath}${codeDescription(cause)}`,
+        { cause },
+      ),
+    );
+  }
+
+  let name: string;
+  try {
+    name = hasBinaryPlistSignature(plist)
+      ? await (fileSystem.decodeBinaryPlist?.(plistPath) ??
+          parseBinaryPlistExecutable(plist))
+      : parseXmlPlistExecutable(decodeXmlPlistText(plist));
+  } catch (cause: unknown) {
+    return err(
+      new BinaryTargetError(
+        plistPath,
+        isPermissionDenied(cause)
+          ? `permission denied decoding app Info.plist ${plistPath}${codeDescription(cause)}`
+          : isSystemErrorCode(cause)
+            ? `could not decode app Info.plist ${plistPath}${codeDescription(cause)}`
+            : `app Info.plist is malformed, unsupported, or lacks CFBundleExecutable: ${plistPath}${cause instanceof Error ? ` (${cause.message})` : ""}`,
+        { cause },
+      ),
     );
   }
   if (!isSafeExecutableName(name))
@@ -135,8 +221,8 @@ const resolveLayoutExecutable = async (
   const executable = join(programs, name);
   try {
     const [canonicalPrograms, canonicalExecutable] = await Promise.all([
-      realpath(programs),
-      realpath(executable),
+      fileSystem.realpath(programs),
+      fileSystem.realpath(executable),
     ]);
     if (!isPathWithinRoot(canonicalPrograms, canonicalExecutable))
       return err(
@@ -148,7 +234,15 @@ const resolveLayoutExecutable = async (
     return ok({ executable: canonicalExecutable, infoPlist: plistPath });
   } catch (cause: unknown) {
     return err(
-      new BinaryTargetError(bundle, "app program file is missing", { cause }),
+      new BinaryTargetError(
+        executable,
+        isPermissionDenied(cause)
+          ? `permission denied resolving app program file ${executable}`
+          : isAbsence(cause)
+            ? `app program file is missing: ${executable}`
+            : `could not resolve app program file ${executable}`,
+        { cause },
+      ),
     );
   }
 };
@@ -157,6 +251,10 @@ const resolveLayoutExecutable = async (
 const parseXmlPlistExecutable = (plist: string): string => {
   // An unrelated `__proto__` entry must not make the bundle unreadable.
   const { value } = parseXmlPropertyList(plist);
+  return executableName(value);
+};
+
+const executableName = (value: unknown): string => {
   const executable = executableEntrySchema.safeParse(value);
   if (!executable.success) throw new Error("CFBundleExecutable is missing");
   return executable.data.CFBundleExecutable;
@@ -164,19 +262,13 @@ const parseXmlPlistExecutable = (plist: string): string => {
 
 const executableEntrySchema = z.looseObject({ CFBundleExecutable: z.string() });
 
-const readBinaryPlistExecutable = async (plistPath: string): Promise<string> =>
-  // `-n` strips only the newline plutil appends; it requires macOS 12+.
-  (
-    await execFileAsync("/usr/bin/plutil", [
-      "-extract",
-      "CFBundleExecutable",
-      "raw",
-      "-n",
-      "-o",
-      "-",
-      plistPath,
-    ])
-  ).stdout;
+/** Decode a binary plist in-process, so no host plist tool is required. */
+const parseBinaryPlistExecutable = (plist: Buffer): string => {
+  preflightPropertyListDecode(plist, BINARY_PLIST_DECODE_BYTES);
+  // `plist` assigns a `__proto__` key as the prototype; copying drops it, as
+  // the XML path does.
+  return executableName(omitPrototypeKeys(parseBinary(plist)).value);
+};
 
 const isSafeExecutableName = (name: string): boolean =>
   name.length > 0 &&

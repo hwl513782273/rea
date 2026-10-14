@@ -7,7 +7,7 @@ import {
   writeFile,
   symlink,
 } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -100,7 +100,7 @@ describe("dependency install freshness", () => {
   it("checks installed dependencies before restoring a cached build", async () => {
     const root = await createBuildCacheFixture();
     const seeded = await runNpm(root, ["run", "build:cached"]);
-    expect(seeded.status, seeded.stderr).toBe(0);
+    expect(seeded.status, `${seeded.stdout}${seeded.stderr}`).toBe(0);
 
     const rootLock = asRecord(
       JSON.parse(await readFile(join(root, "package-lock.json"), "utf8")),
@@ -141,6 +141,39 @@ describe("dependency install freshness", () => {
     expect(cached.status, cached.stderr).toBe(0);
     expect(`${cached.stdout}${cached.stderr}`).toMatch(/cache hit/u);
   }, 60_000);
+
+  it("preserves caller resource controls in strict cached builds without hashing their values", async () => {
+    const root = await createBuildCacheFixture();
+    const environment = {
+      ...process.env,
+      TURBO_ENV_MODE: "strict",
+      GOMAXPROCS: "1",
+      GOMEMLIMIT: "384MiB",
+      UV_THREADPOOL_SIZE: "2",
+      REA_TEST_UNLISTED_ENV: "filtered",
+    };
+
+    const built = await runNpm(root, ["run", "build:cached"], environment);
+    expect(built.status, `${built.stdout}${built.stderr}`).toBe(0);
+    expect(
+      JSON.parse(await readFile(join(root, "resource-controls.json"), "utf8")),
+    ).toEqual({
+      GOMAXPROCS: "1",
+      GOMEMLIMIT: "384MiB",
+      UV_THREADPOOL_SIZE: "2",
+      REA_TEST_UNLISTED_ENV: null,
+    });
+
+    const cached = await runTurbo(root, {
+      ...environment,
+      GOMAXPROCS: "2",
+      GOMEMLIMIT: "512MiB",
+      UV_THREADPOOL_SIZE: "4",
+    });
+    expect(cached.status, `${cached.stdout}${cached.stderr}`).toBe(0);
+    expect(`${cached.stdout}${cached.stderr}`).toMatch(/cache hit/u);
+    expect(`${cached.stdout}${cached.stderr}`).not.toMatch(/cache miss/u);
+  }, 60_000);
 });
 
 const createBuildCacheFixture = async (): Promise<string> => {
@@ -151,6 +184,8 @@ const createBuildCacheFixture = async (): Promise<string> => {
   const scripts = asRecord(packageJson?.scripts);
   if (
     packageJson === undefined ||
+    typeof packageJson.name !== "string" ||
+    typeof packageJson.version !== "string" ||
     typeof scripts?.["build:cached"] !== "string"
   )
     throw new Error("package is missing its cached build command");
@@ -161,10 +196,13 @@ const createBuildCacheFixture = async (): Promise<string> => {
     "tsconfig.json",
     "tsconfig.build.json",
     "scripts/check-dependency-install.mjs",
+    "scripts/run-exclusive.mjs",
+    "scripts/run-exclusive-command.mjs",
+    "scripts/generate-skill-metadata.mjs",
     "scripts/clean-build-output.mjs",
     "scripts/generate-package-metadata.mjs",
     "scripts/lib/generated-file.mjs",
-    "skills/reverse-engineer-anything/SKILL.md",
+    ".agents/skills/reverse-engineer-anything/SKILL.md",
     "src/generatedPackageMetadata.ts",
   ];
   await Promise.all(
@@ -180,13 +218,19 @@ const createBuildCacheFixture = async (): Promise<string> => {
       ...packageJson,
       scripts: {
         ...scripts,
-        build: "node scripts/cache-fixture-build.mjs",
+        compile: "node scripts/cache-fixture-build.mjs",
       },
     }),
   );
   await writeFile(
     join(root, "scripts/cache-fixture-build.mjs"),
-    'import { mkdir, writeFile } from "node:fs/promises"; await mkdir("dist", { recursive: true }); await writeFile("dist/cache-fixture.js", "built");\n',
+    `import { mkdir, writeFile } from "node:fs/promises";
+await writeFile("resource-controls.json", JSON.stringify(Object.fromEntries(["GOMAXPROCS", "GOMEMLIMIT", "UV_THREADPOOL_SIZE", "REA_TEST_UNLISTED_ENV"].map((name) => [name, process.env[name] ?? null]))));
+await mkdir("dist", { recursive: true });
+await writeFile("dist/cache-fixture.js", "built");
+await writeFile("dist/catalogIdentity.js", "export const CATALOG_IDENTITY = { counts: { mcp_tools: 1 } };\\n");
+await writeFile("dist/identity.js", ${JSON.stringify(`export const PRODUCT_IDENTITY = ${JSON.stringify({ packageSpecifier: `${packageJson.name}@latest`, registrationPackageSpecifier: `${packageJson.name}@${packageJson.version}` })};\n`)});
+`,
   );
   await createNodeModulesLinks(root);
   await writeFile(
@@ -222,25 +266,30 @@ const createNodeModulesLinks = async (root: string): Promise<void> => {
   }
 };
 
-const runNpm = (cwd: string, arguments_: readonly string[]) =>
-  run("npm", arguments_, cwd);
+const runNpm = (
+  cwd: string,
+  arguments_: readonly string[],
+  environment: NodeJS.ProcessEnv = process.env,
+) => run("npm", arguments_, cwd, environment);
 
-const runTurbo = (cwd: string) =>
+const runTurbo = (cwd: string, environment: NodeJS.ProcessEnv = process.env) =>
   run(
     process.execPath,
     [
       join(cwd, "node_modules", "turbo", "bin", "turbo"),
       "run",
-      "build",
+      "artifacts:skills",
       "--output-logs=full",
     ],
     cwd,
+    environment,
   );
 
 const run = (
   command: string,
   arguments_: readonly string[],
   cwd: string,
+  environment: NodeJS.ProcessEnv,
 ): Promise<{
   readonly status: number;
   readonly stdout: string;
@@ -249,7 +298,7 @@ const run = (
   new Promise((resolve, reject) => {
     const child = spawn(command, [...arguments_], {
       cwd,
-      env: process.env,
+      env: environment,
       shell: process.platform === "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });

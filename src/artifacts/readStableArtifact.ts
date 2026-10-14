@@ -1,16 +1,60 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
+import type { ArtifactResourceScope } from "./ArtifactResourceScope.js";
+import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+
+/** Filesystem boundary for stable reads, including deterministic replacement probes. */
+export interface StableArtifactFileSystem {
+  lstat(path: string): Promise<BigIntStats>;
+  open(path: string, flags: number): Promise<FileHandle>;
+}
+
+const FILE_SYSTEM: StableArtifactFileSystem = {
+  lstat: (path) => lstat(path, { bigint: true }),
+  open,
+};
+
+const afterValidation = async <T>(
+  path: string,
+  stage: string,
+  read: () => Promise<T>,
+): Promise<T> => {
+  try {
+    return await read();
+  } catch (cause) {
+    if (
+      cause instanceof Error &&
+      "code" in cause &&
+      ["ENOENT", "ENOTDIR", "ELOOP"].includes(String(cause.code))
+    )
+      throw new ArtifactReaderFailure(
+        "integrity",
+        `Artifact changed ${stage}: ${path}`,
+        { cause },
+      );
+    throw cause;
+  }
+};
+
+const assertReadActive = (signal: AbortSignal | undefined): void => {
+  if (signal?.aborted)
+    throw new ArtifactReaderFailure("cancelled", "Artifact read cancelled", {
+      cause: signal.reason,
+    });
+};
 
 /** Read one bounded regular file and reject replacement or in-place changes. */
 export const readStableArtifact = async (
   path: string,
   maximumBytes: number,
   signal?: AbortSignal,
+  fileSystem: StableArtifactFileSystem = FILE_SYSTEM,
+  resourceScope?: ArtifactResourceScope,
 ): Promise<{ readonly bytes: Buffer; readonly sha256: string }> => {
-  signal?.throwIfAborted();
-  const before = await lstat(path, { bigint: true });
+  assertReadActive(signal);
+  const before = await fileSystem.lstat(path);
   if (!before.isFile() || before.isSymbolicLink())
     throw new ArtifactReaderFailure(
       "path",
@@ -21,10 +65,15 @@ export const readStableArtifact = async (
       "limit",
       `Selected artifact exceeds ${String(maximumBytes)} bytes: ${path}`,
     );
-  const file = await open(
-    path,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  const file = await afterValidation(path, "before open", () =>
+    fileSystem.open(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    ),
   );
+  const owner =
+    resourceScope === undefined ? undefined : new OwnedFileHandle(file);
+  let failure: unknown;
   try {
     const initial = await file.stat({ bigint: true });
     if (
@@ -42,7 +91,7 @@ export const readStableArtifact = async (
       autoClose: false,
       highWaterMark: 65536,
     })) {
-      signal?.throwIfAborted();
+      assertReadActive(signal);
       const value: unknown = chunk;
       if (!Buffer.isBuffer(value))
         throw new ArtifactReaderFailure(
@@ -59,7 +108,9 @@ export const readStableArtifact = async (
       chunks.push(bytes);
     }
     const after = await file.stat({ bigint: true });
-    const current = await lstat(path, { bigint: true });
+    const current = await afterValidation(path, "during read", () =>
+      fileSystem.lstat(path),
+    );
     if (
       [after, current].some(
         (stat) =>
@@ -76,9 +127,25 @@ export const readStableArtifact = async (
         "integrity",
         `Artifact changed during read: ${path}`,
       );
+    assertReadActive(signal);
     const bytes = Buffer.concat(chunks, count);
     return { bytes, sha256: createHash("sha256").update(bytes).digest("hex") };
+  } catch (cause: unknown) {
+    failure = cause;
+    throw cause;
   } finally {
-    await file.close();
+    if (owner === undefined || resourceScope === undefined) await file.close();
+    else {
+      const cleanup = await resourceScope.release({
+        kind: "file-handle",
+        resource: path,
+        handle: owner,
+      });
+      if (cleanup.kind === "failed")
+        throw ArtifactReaderFailure.withCleanup(
+          failure ?? cleanup.cause,
+          ArtifactReaderFailure.cleanupObservation(cleanup.cause, path),
+        );
+    }
   }
 };

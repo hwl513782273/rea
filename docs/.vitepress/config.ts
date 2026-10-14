@@ -6,6 +6,7 @@ export default defineConfig({
     "Reverse engineer binaries, applications, and runtime behavior with one CLI and MCP server.",
   lang: "en-US",
   base: "/rea/",
+  srcExclude: ["readme/**"],
   themeConfig: {
     nav: [
       { text: "Get started", link: "/installation" },
@@ -17,6 +18,8 @@ export default defineConfig({
         text: "Getting started",
         items: [
           { text: "Installation and setup", link: "/installation" },
+          { text: "Client configuration", link: "/client-configuration" },
+          { text: "CLI and Evidence", link: "/cli" },
           { text: "Agent prompts", link: "/mcp-prompts" },
           { text: "Roadmap", link: "/roadmap" },
         ],
@@ -25,6 +28,8 @@ export default defineConfig({
         text: "Investigation guides",
         items: [
           { text: "Native binaries", link: "/native-investigation" },
+          { text: "Go build metadata", link: "/go-binaries" },
+          { text: "Rust dependencies", link: "/rust-binaries" },
           {
             text: "JavaScript and Electron",
             link: "/javascript-artifact-reconstruction",
@@ -34,16 +39,20 @@ export default defineConfig({
             link: "/javascript-application-workflows",
           },
           { text: "Browser observation", link: "/browser-observation" },
+          {
+            text: "Web network captures",
+            link: "/web-network-captures",
+          },
           { text: "Electron observation", link: "/electron-observation" },
+          { text: "Electron fuses", link: "/electron-fuses" },
           { text: "Process capture", link: "/process-capture" },
           { text: ".NET assemblies", link: "/managed-code-analysis" },
           { text: "Android applications", link: "/android-analysis" },
           { text: "Apple applications", link: "/apple-application-analysis" },
           { text: "Firmware", link: "/firmware-analysis" },
-          {
-            text: "Reconstruction readiness",
-            link: "/reconstruction-readiness",
-          },
+          { text: "SQLite databases", link: "/sqlite-databases" },
+          { text: "Packet captures", link: "/packet-captures" },
+          { text: "Signal recordings", link: "/signal-recordings" },
         ],
       },
       {
@@ -53,8 +62,10 @@ export default defineConfig({
           { text: "IDA", link: "/ida-provider" },
           { text: "Ghidra on Windows", link: "/windows-ghidra-p0" },
           { text: "Ghidra DOS analysis", link: "/ghidra-dos" },
+          { text: "Ghidra raw binary", link: "/raw-binary" },
           { text: "Ghidra NativeAOT", link: "/ghidra-nativeaot" },
-          { text: "Provider evaluation", link: "/provider-evaluation" },
+          { text: "Ghidra PowerPC", link: "/ghidra-ppc" },
+          { text: "Ghidra semantics", link: "/ghidra-provider" },
         ],
       },
       {
@@ -64,7 +75,12 @@ export default defineConfig({
           { text: "MCP contracts", link: "/mcp-contracts" },
           { text: "Tool design", link: "/tool-design" },
           { text: "Testing", link: "/testing" },
-          { text: "Architecture decisions", link: "/adr/README" },
+          { text: "Client verification", link: "/client-verification" },
+          {
+            text: "Reconstruction readiness",
+            link: "/reconstruction-readiness",
+          },
+          { text: "Releasing", link: "/releasing" },
         ],
       },
     ],

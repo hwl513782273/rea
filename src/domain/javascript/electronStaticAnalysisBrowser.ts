@@ -9,22 +9,23 @@ import type {
   ElectronUtilityProcessFinding,
   ElectronWebPreference,
 } from "./electronStaticAnalysisTypes.js";
+import { contextBridgeExposureArguments } from "./javascriptContextBridgeExposure.js";
 import {
   boundedExpression,
   collectContextBridgeMembers,
+  electronCalleePath,
   electronStaticValue,
   objectProperty,
 } from "./electronStaticAnalysisValues.js";
-import { compareCodePoints } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import { addLocatedFinding } from "./javascriptStaticAnalysisFindings.js";
 import {
   argumentNode,
-  calleeName,
   range,
   staticPath,
   staticPathResolutionContext,
 } from "./javascriptStaticAnalysisHelpers.js";
-import { semanticStaticPropertyName } from "./javascriptAstValues.js";
+import { semanticStaticPropertyKey } from "./javascriptAstValues.js";
 import type { JavaScriptFindingContext } from "./javascriptStaticAnalysisState.js";
 
 /** Inspect BrowserWindow, contextBridge, and utility-process syntax. */
@@ -33,7 +34,7 @@ export const inspectElectronBrowserNode = (
   context: JavaScriptFindingContext,
 ): void => {
   if (t.isNewExpression(node)) inspectBrowserWindow(node, context);
-  if (!t.isCallExpression(node)) return;
+  if (!t.isCallExpression(node) && !t.isOptionalCallExpression(node)) return;
   inspectContextBridge(node, context);
   inspectUtilityProcess(node, context);
 };
@@ -42,8 +43,8 @@ const inspectBrowserWindow = (
   node: t.NewExpression,
   context: JavaScriptFindingContext,
 ): void => {
-  const name = calleeName(node.callee);
-  if (name !== "BrowserWindow" && !name.endsWith(".BrowserWindow")) return;
+  const path = electronCalleePath(node.callee, context);
+  if (path?.length !== 1 || path[0] !== "BrowserWindow") return;
   const options = argumentNode(node.arguments[0]);
   const collected = collectWindowOptions(context.source, options);
   context.accumulator.unknownFindings += collected.unknown;
@@ -62,7 +63,7 @@ const inspectBrowserWindow = (
   };
   addLocatedFinding(context, {
     collection: context.accumulator.browserWindows,
-    key: `electron-window\0${name}`,
+    key: "electron-window\0BrowserWindow",
     node,
     value: finding,
   });
@@ -102,10 +103,20 @@ const collectWebPreferences = (
 } => {
   const preferences: ElectronWebPreference[] = [];
   let unknown = 0;
-  let preload: ElectronBrowserWindowPreload = {
-    preload_path: null,
-    preload_resolution_context: null,
-  };
+  const effectivePreload = objectProperty(object, "preload");
+  const preloadPath =
+    effectivePreload.status === "explicit"
+      ? staticPath(effectivePreload.property.value)
+      : undefined;
+  const preload: ElectronBrowserWindowPreload =
+    effectivePreload.status === "explicit" && preloadPath !== undefined
+      ? {
+          preload_path: preloadPath,
+          preload_resolution_context: staticPathResolutionContext(
+            effectivePreload.property.value,
+          ),
+        }
+      : { preload_path: null, preload_resolution_context: null };
   for (const property of object.properties) {
     if (t.isSpreadElement(property)) {
       unknown += 1;
@@ -115,8 +126,8 @@ const collectWebPreferences = (
       });
       continue;
     }
-    const name = semanticStaticPropertyName(property.key, property.computed);
-    if (name === "" || property.computed) {
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) {
       unknown += 1;
       preferences.push({
         name: `[dynamic@${String(property.start ?? -1)}]`,
@@ -133,11 +144,6 @@ const collectWebPreferences = (
       continue;
     }
     const path = name === "preload" ? staticPath(property.value) : undefined;
-    if (path !== undefined)
-      preload = {
-        preload_path: path,
-        preload_resolution_context: staticPathResolutionContext(property.value),
-      };
     const value: ElectronStaticValue =
       path === undefined
         ? electronStaticValue(source, property.value)
@@ -145,7 +151,9 @@ const collectWebPreferences = (
     if (value.status === "dynamic") unknown += 1;
     preferences.push({ name, value });
   }
-  preferences.sort((left, right) => compareCodePoints(left.name, right.name));
+  preferences.sort((left, right) =>
+    compareUnicodeCodePoints(left.name, right.name),
+  );
   return {
     status: "object-literal",
     preferences,
@@ -155,24 +163,23 @@ const collectWebPreferences = (
 };
 
 const inspectContextBridge = (
-  node: t.CallExpression,
+  node: t.CallExpression | t.OptionalCallExpression,
   context: JavaScriptFindingContext,
 ): void => {
-  const name = calleeName(node.callee);
-  const main =
-    name === "contextBridge.exposeInMainWorld" ||
-    name.endsWith(".contextBridge.exposeInMainWorld");
-  const isolated =
-    name === "contextBridge.exposeInIsolatedWorld" ||
-    name.endsWith(".contextBridge.exposeInIsolatedWorld");
-  if (!main && !isolated) return;
-  const keyNode = argumentNode(node.arguments[isolated ? 1 : 0]);
-  const apiNode = argumentNode(node.arguments[isolated ? 2 : 1]);
+  const path = electronCalleePath(node.callee, context);
+  const exposure =
+    path?.length === 2 && path[0] === "contextBridge"
+      ? contextBridgeExposureArguments(path[1] ?? "", node.arguments)
+      : undefined;
+  if (exposure === undefined) return;
+  const keyNode = argumentNode(exposure.apiKey);
+  const apiNode = argumentNode(exposure.api);
   const key = electronStaticValue(context.source, keyNode);
   const api = collectContextBridgeMembers(apiNode);
-  const worldId = isolated
-    ? electronStaticValue(context.source, argumentNode(node.arguments[0]))
-    : null;
+  const worldId =
+    exposure.worldId === null
+      ? null
+      : electronStaticValue(context.source, argumentNode(exposure.worldId));
   const unknown =
     (key.status === "dynamic" ? 1 : 0) +
     (worldId?.status === "dynamic" ? 1 : 0) +
@@ -186,7 +193,7 @@ const inspectContextBridge = (
         : { api_key: null, api_key_expression: null };
   const finding: ElectronContextBridgeFinding = {
     ...apiKey,
-    world: isolated ? "isolated" : "main",
+    world: exposure.world,
     world_id: worldId,
     api_status: api.status,
     members: api.members,
@@ -196,18 +203,18 @@ const inspectContextBridge = (
   };
   addLocatedFinding(context, {
     collection: context.accumulator.contextBridgeApis,
-    key: `context-bridge\0${isolated ? "isolated" : "main"}\0${finding.api_key ?? finding.api_key_expression ?? "[missing]"}`,
+    key: `context-bridge\0${exposure.world}\0${finding.api_key ?? finding.api_key_expression ?? "[missing]"}`,
     node,
     value: finding,
   });
 };
 
 const inspectUtilityProcess = (
-  node: t.CallExpression,
+  node: t.CallExpression | t.OptionalCallExpression,
   context: JavaScriptFindingContext,
 ): void => {
-  const name = calleeName(node.callee);
-  if (name !== "utilityProcess.fork" && !name.endsWith(".utilityProcess.fork"))
+  const path = electronCalleePath(node.callee, context);
+  if (path?.length !== 2 || path[0] !== "utilityProcess" || path[1] !== "fork")
     return;
   const moduleNode = argumentNode(node.arguments[0]);
   const modulePath =

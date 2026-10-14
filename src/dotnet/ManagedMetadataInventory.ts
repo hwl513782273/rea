@@ -15,7 +15,12 @@ import {
   readResource,
 } from "./ManagedMetadataInventoryRows.js";
 import { metadataToken } from "./ManagedMetadataHeaps.js";
-import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
+import type { TypeMemberListFacts } from "./ManagedTypeMemberLists.js";
+import {
+  readManagedValue,
+  uniqueManagedParseIssues,
+} from "./ManagedReaderFailure.js";
+import type { ManagedPeLayout } from "./ManagedPeReader.js";
 
 type ModuleIdentity = NonNullable<ManagedArtifactInspection["module"]>;
 type AssemblyIdentity = NonNullable<ManagedArtifactInspection["assembly"]>;
@@ -27,6 +32,25 @@ export interface ManagedResourceDirectory {
   readonly size: number;
 }
 
+/** Map optional embedded resources without discarding admitted CLI metadata. */
+export const readManagedResourceDirectory = (
+  pe: ManagedPeLayout,
+  issues: ManagedParseIssue[],
+): ManagedResourceDirectory | null => {
+  const resources = pe.cli?.resources;
+  if (resources === undefined || (resources.rva === 0 && resources.size === 0))
+    return null;
+  return (
+    readManagedValue(
+      () => ({
+        offset: pe.rvaToOffset(resources.rva, resources.size, "cli.resources"),
+        size: resources.size,
+      }),
+      issues,
+    ) ?? null
+  );
+};
+
 export interface ManagedMetadataInventory {
   readonly module: ModuleIdentity | null;
   readonly assembly: AssemblyIdentity | null;
@@ -37,19 +61,6 @@ export interface ManagedMetadataInventory {
   readonly attributes: readonly CustomAttribute[];
   readonly issues: readonly ManagedParseIssue[];
 }
-
-const safeRead = <Value>(
-  operation: () => Value,
-  issues: ManagedParseIssue[],
-): Value | undefined => {
-  try {
-    return operation();
-  } catch (cause: unknown) {
-    if (!(cause instanceof ManagedReaderFailure)) throw cause;
-    issues.push(cause.issue);
-    return undefined;
-  }
-};
 
 const readRows = <Item>(
   descriptor: MetadataTableLayout | undefined,
@@ -63,12 +74,6 @@ const readRows = <Item>(
   }
   return items;
 };
-
-const uniqueIssues = (
-  issues: readonly ManagedParseIssue[],
-): readonly ManagedParseIssue[] => [
-  ...new Map(issues.map((issue) => [JSON.stringify(issue), issue])).values(),
-];
 
 const heapExtent = (layout: ManagedMetadataLayout): number =>
   Math.max(layout.strings.size, layout.blob.size);
@@ -105,7 +110,7 @@ const readReferences = (
   readonly referenceNames: readonly string[];
 } => {
   const references = readRows(layout.table(35), (row) =>
-    safeRead(
+    readManagedValue(
       () => readAssemblyReference(bytes, layout, row, heapExtent(layout)),
       issues,
     ),
@@ -128,7 +133,7 @@ const readResources = ({
   readonly issues: ManagedParseIssue[];
 }): readonly ManagedResource[] =>
   readRows(layout.table(40), (row) =>
-    safeRead(
+    readManagedValue(
       () =>
         readResource({
           bytes,
@@ -145,13 +150,22 @@ const readAttributes = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   issues: ManagedParseIssue[],
+  memberLists: TypeMemberListFacts,
 ): {
   readonly attributes: readonly CustomAttribute[];
   readonly targetFrameworks: readonly string[];
 } => {
   const attributes = readRows(layout.table(12), (row) =>
-    safeRead(
-      () => readCustomAttribute(bytes, layout, row, heapExtent(layout)),
+    readManagedValue(
+      () =>
+        readCustomAttribute(
+          bytes,
+          layout,
+          row,
+          heapExtent(layout),
+          issues,
+          memberLists,
+        ),
       issues,
     ),
   );
@@ -173,15 +187,20 @@ export const readManagedMetadataInventory = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   resourceDirectory: ManagedResourceDirectory | null,
+  memberLists: TypeMemberListFacts,
 ): ManagedMetadataInventory => {
-  const issues: ManagedParseIssue[] = [];
+  const issues: ManagedParseIssue[] = [...memberLists.issues];
   validateIdentityTableCounts(layout, issues);
   const module =
-    safeRead(() => readModule(bytes, layout, heapExtent(layout)), issues) ??
-    null;
+    readManagedValue(
+      () => readModule(bytes, layout, heapExtent(layout)),
+      issues,
+    ) ?? null;
   const assembly =
-    safeRead(() => readAssembly(bytes, layout, heapExtent(layout)), issues) ??
-    null;
+    readManagedValue(
+      () => readAssembly(bytes, layout, heapExtent(layout)),
+      issues,
+    ) ?? null;
   const { references, referenceNames } = readReferences(bytes, layout, issues);
   const resources = readResources({
     bytes,
@@ -193,6 +212,7 @@ export const readManagedMetadataInventory = (
     bytes,
     layout,
     issues,
+    memberLists,
   );
   return {
     module,
@@ -202,7 +222,7 @@ export const readManagedMetadataInventory = (
     references,
     resources,
     attributes,
-    issues: uniqueIssues(issues),
+    issues: uniqueManagedParseIssues(issues),
   };
 };
 

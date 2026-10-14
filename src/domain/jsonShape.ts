@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { compareCodePoints } from "./canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 
 const jsonValueTypeSchema = z.enum([
   "object",
@@ -12,6 +12,12 @@ const jsonValueTypeSchema = z.enum([
 ]);
 type JsonValueType = z.infer<typeof jsonValueTypeSchema>;
 
+const jsonShapePathSegmentSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("property"), name: z.string() }),
+  z.object({ kind: z.literal("array-element") }),
+]);
+type JsonShapePathSegment = z.infer<typeof jsonShapePathSegmentSchema>;
+
 /** Value-free structural summary of one approved JSON payload. */
 export const jsonShapeSchema = z.object({
   root_type: jsonValueTypeSchema,
@@ -19,13 +25,22 @@ export const jsonShapeSchema = z.object({
   max_depth_observed: z.number().int().min(0),
   properties: z.array(
     z.object({
-      path: z.string(),
+      path: z.array(jsonShapePathSegmentSchema).min(1),
       types: z.array(jsonValueTypeSchema).min(1),
       observations: z.number().int().min(1),
     }),
   ),
 });
 export type JsonShape = z.infer<typeof jsonShapeSchema>;
+
+const arrayElementKey = Symbol("array-element");
+
+interface ShapeNode {
+  readonly path: JsonShapePathSegment[];
+  readonly types: Set<JsonValueType>;
+  observations: number;
+  children?: Map<string | typeof arrayElementKey, ShapeNode>;
+}
 
 /** Parse approved JSON and immediately discard values after iterative shape inference. */
 export const inferJsonShape = (text: string): JsonShape | null => {
@@ -37,29 +52,50 @@ export const inferJsonShape = (text: string): JsonShape | null => {
     void cause;
     return null;
   }
-  const properties = new Map<
-    string,
-    { readonly types: Set<JsonValueType>; observations: number }
-  >();
+  const rootShape: ShapeNode = {
+    path: [],
+    types: new Set(),
+    observations: 0,
+  };
+  // Each structural path owns one accumulator, shared by all matching array rows.
+  const childShape = (
+    parent: ShapeNode,
+    key: string | typeof arrayElementKey,
+  ): ShapeNode => {
+    const children = (parent.children ??= new Map());
+    const existing = children.get(key);
+    if (existing !== undefined) return existing;
+    const node: ShapeNode = {
+      path: [
+        ...parent.path,
+        typeof key === "string"
+          ? { kind: "property", name: key }
+          : { kind: "array-element" },
+      ],
+      types: new Set(),
+      observations: 0,
+    };
+    children.set(key, node);
+    return node;
+  };
   const pending: Array<{
     readonly value: unknown;
-    readonly path: string;
-    readonly depth: number;
-  }> = [{ value: root, path: "", depth: 0 }];
+    readonly shape: ShapeNode;
+  }> = [{ value: root, shape: rootShape }];
   let nodeCount = 0;
   let maxDepthObserved = 0;
   while (pending.length > 0) {
     const current = pending.pop();
     if (current === undefined) break;
     nodeCount += 1;
-    maxDepthObserved = Math.max(maxDepthObserved, current.depth);
+    maxDepthObserved = Math.max(maxDepthObserved, current.shape.path.length);
+    current.shape.types.add(jsonValueType(current.value));
+    current.shape.observations += 1;
     if (Array.isArray(current.value)) {
+      if (current.value.length === 0) continue;
+      const shape = childShape(current.shape, arrayElementKey);
       for (let index = current.value.length - 1; index >= 0; index -= 1)
-        pending.push({
-          value: current.value[index],
-          path: `${current.path}/*`,
-          depth: current.depth + 1,
-        });
+        pending.push({ value: current.value[index], shape });
       continue;
     }
     if (!isRecord(current.value)) continue;
@@ -68,34 +104,29 @@ export const inferJsonShape = (text: string): JsonShape | null => {
       const entry = allEntries[index];
       if (entry === undefined) continue;
       const [name, value] = entry;
-      const path = `${current.path}/${pointerName(name)}`;
-      const type = jsonValueType(value);
-      const existing = properties.get(path);
-      if (existing === undefined)
-        properties.set(path, { types: new Set([type]), observations: 1 });
-      else {
-        existing.types.add(type);
-        existing.observations += 1;
-      }
-      pending.push({ value, path, depth: current.depth + 1 });
+      pending.push({ value, shape: childShape(current.shape, name) });
     }
   }
-  return jsonShapeSchema.parse({
+  // Preorder over sorted siblings gives canonical paths without repeatedly
+  // comparing their shared prefixes. Each returned path owns its segments.
+  const properties: JsonShape["properties"] = [];
+  const shapes = orderedChildren(rootShape);
+  while (shapes.length > 0) {
+    const shape = shapes.pop();
+    if (shape === undefined) break;
+    properties.push({
+      path: shape.path.map((segment) => ({ ...segment })),
+      types: [...shape.types].sort(),
+      observations: shape.observations,
+    });
+    for (const child of orderedChildren(shape)) shapes.push(child);
+  }
+  return {
     root_type: jsonValueType(root),
     node_count: nodeCount,
     max_depth_observed: maxDepthObserved,
-    properties: [...properties.entries()]
-      .map(([path, value]) => ({
-        path,
-        types: [...value.types].sort(),
-        observations: value.observations,
-      }))
-      .sort(
-        (left, right) =>
-          left.path.localeCompare(right.path) ||
-          compareCodePoints(left.path, right.path),
-      ),
-  });
+    properties,
+  };
 };
 
 const jsonValueType = (value: unknown): JsonValueType => {
@@ -116,5 +147,16 @@ const jsonValueType = (value: unknown): JsonValueType => {
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const pointerName = (value: string): string =>
-  value.replaceAll("~", "~0").replaceAll("/", "~1");
+/** Reverse sibling order for the traversal stack; array elements sort first. */
+const orderedChildren = (node: ShapeNode): ShapeNode[] =>
+  [...(node.children ?? [])]
+    .sort(([left], [right]) =>
+      left === right
+        ? 0
+        : left === arrayElementKey
+          ? 1
+          : right === arrayElementKey
+            ? -1
+            : compareUnicodeCodePoints(right, left),
+    )
+    .map(([, child]) => child);

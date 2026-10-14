@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it } from "vitest";
@@ -23,7 +22,7 @@ it.skipIf(process.platform === "win32")(
     );
     const snapshotModule = fileURLToPath(
       new URL(
-        "../../../dist/application/FilesystemSnapshot.js",
+        "../../../dist/process/capture/FilesystemSnapshot.js",
         import.meta.url,
       ),
     );

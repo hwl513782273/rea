@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { BinaryTarget } from "../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../src/domain/binaryTargetTypes.js";
 import { ok } from "../../src/domain/result.js";
 import type {
   NativeCommandCapture,
@@ -37,11 +38,11 @@ const outputFor = async (
       arguments_[0] === "-imports" ? "dyld-imports.txt" : "dyld-exports.txt",
     );
   if (tool === "dwarfdump")
-    return "UUID: 01234567-89AB-CDEF-0123-456789ABCDEF (arm64) fixture\n";
+    return `UUID: 01234567-89AB-CDEF-0123-456789ABCDEF (arm64) ${arguments_.at(-1)}\n`;
   if (tool === "file")
     return arguments_.at(-1)?.endsWith(".plist") === true
       ? "XML 1.0 document text\n"
-      : "Mach-O 64-bit executable arm64, little-endian\n";
+      : "Mach-O 64-bit executable arm64\n";
   if (tool === "vtool") return "Load command 3 LC_BUILD_VERSION\n";
   if (tool === "swift-demangle") return nativeFixture("demangle.txt");
   if (tool === "plutil") return nativeFixture("plist.json");
@@ -96,7 +97,10 @@ const capture = (
 export const nativeMachoTarget = (
   path: string,
   sourcePath?: string,
-): BinaryTarget => ({
+): BinaryTarget & {
+  readonly kind: "executable";
+  readonly format: "mach-o";
+} => ({
   path,
   ...(sourcePath === undefined ? {} : { sourcePath }),
   sha256: "0".repeat(64),
@@ -106,6 +110,34 @@ export const nativeMachoTarget = (
   availableArchitectures: ["x86_64", "arm64"],
 });
 
+/** Register the actual bytes of a filesystem-backed native test target. */
+export const nativeMachoTargetForFile = async (
+  path: string,
+  sourcePath?: string,
+): Promise<ReturnType<typeof nativeMachoTarget>> => ({
+  ...nativeMachoTarget(path, sourcePath),
+  sha256: createHash("sha256")
+    .update(await readFile(path))
+    .digest("hex"),
+});
+
 /** Load one captured native tool output. */
 export const nativeFixture = (name: string): Promise<string> =>
   readFile(new URL(`./native-macos/${name}`, import.meta.url), "utf8");
+
+/** Add consistent Mach command-count metadata to a command-only test capture. */
+export const withOtoolMachHeader = (output: string): string => {
+  const count = [...output.matchAll(/^Load command (\d+)$/gmu)].length;
+  const sizes = [...output.matchAll(/^\s*cmdsize\s+(\d+)\s*$/gmu)].map(
+    ([, size]) => Number(size),
+  );
+  if (sizes.length !== count)
+    throw new TypeError("command-only fixture must provide every cmdsize");
+  const bytes = sizes.reduce((sum, size) => sum + size, 0);
+  return [
+    "Mach header",
+    "      magic cputype cpusubtype caps filetype ncmds sizeofcmds flags",
+    ` 0xfeedfacf 16777228 0 0x00 2 ${count} ${bytes} 0x00000000`,
+    output,
+  ].join("\n");
+};

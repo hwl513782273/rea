@@ -4,8 +4,10 @@ import { javascriptDisplayText } from "../../domain/javascript/javascriptAstValu
 import {
   createJavaScriptSemanticGraphNode,
   createJavaScriptSemanticGraphRelation,
-  type JavaScriptSemanticGraphNode,
+  JavaScriptSemanticEvidenceContextRegistry,
+  javaScriptSemanticNodeId,
 } from "../../domain/javascript/javascriptSemanticGraph.js";
+import type { JavaScriptSemanticGraphNode } from "../../domain/javascript/javascriptSemanticGraphSchemas.js";
 import type { ApplicationGraphEvidence } from "../../domain/javascript/javascriptApplicationEvidenceSchemas.js";
 import type {
   JavaScriptSemanticGraphRelation,
@@ -24,8 +26,26 @@ export interface SemanticGraphProjectionState {
   readonly nodes: Map<string, JavaScriptSemanticGraphNode>;
   readonly relations: Map<string, JavaScriptSemanticGraphRelation>;
   readonly unknowns: Map<string, JavaScriptSemanticGraphUnknown>;
+  readonly evidenceContexts: JavaScriptSemanticEvidenceContextRegistry;
   readonly roots: Set<string>;
-  readonly applicationNodeIdsByLocation: ReadonlyMap<string, readonly string[]>;
+  /**
+   * Remaining node budget for the file currently being projected.
+   *
+   * The projection emits one node per AST expression, call site, binding and
+   * property slot, which is unbounded in file size: one bundled vendor library
+   * measured 135,286 nodes on its own. `null` means unbounded; a number is the
+   * number of nodes this file may still add. Exhausting it stops node creation
+   * for that file and is reported through the graph's `coverage` fields.
+   */
+  fileNodeBudget?: number | null;
+  /**
+   * Whether the file currently being projected lost any nodes to its budget.
+   *
+   * A file that exactly fills its share ends with a zero budget without
+   * dropping anything, so callers must consult this flag rather than the
+   * remaining budget to decide whether coverage is truncated.
+   */
+  fileNodesDropped?: boolean;
 }
 
 /** Input for one exact artifact-version semantic node. */
@@ -48,18 +68,38 @@ export interface SemanticRelationConstructionInput {
   readonly properties?: Readonly<Record<string, JsonValue>>;
 }
 
-/** Create empty projection state with structural application-node mappings. */
-export const createSemanticGraphProjectionState = (
-  applicationGraph: Pick<JavaScriptApplicationGraph, "nodes">,
-): SemanticGraphProjectionState => {
-  const index = indexApplicationNodes(applicationGraph.nodes);
-  return {
+/** Create empty projection state; application-node links are bound at finish. */
+export const createSemanticGraphProjectionState =
+  (): SemanticGraphProjectionState => ({
     nodes: new Map(),
     relations: new Map(),
     unknowns: new Map(),
+    evidenceContexts: new JavaScriptSemanticEvidenceContextRegistry(),
     roots: new Set(),
-    applicationNodeIdsByLocation: index.identifiers,
-  };
+  });
+
+/** Bind retained semantic identities after all application observations exist. */
+export const bindSemanticGraphApplicationNodes = (
+  state: SemanticGraphProjectionState,
+  applicationGraph: Pick<JavaScriptApplicationGraph, "nodes">,
+): void => {
+  const applicationNodeIdsByLocation = indexApplicationNodes(
+    applicationGraph.nodes,
+  );
+  for (const [identifier, node] of state.nodes) {
+    state.nodes.set(identifier, {
+      ...node,
+      application_node_ids: [
+        ...(applicationNodeIdsByLocation.get(
+          applicationLocationKey(
+            node.identity.artifact_sha256,
+            node.identity.module_path,
+            node.identity.source_range,
+          ),
+        ) ?? []),
+      ],
+    });
+  }
 };
 
 /** Construct one canonical semantic node backed by an exact artifact file. */
@@ -68,7 +108,31 @@ export const constructSemanticGraphNode = (
   input: SemanticNodeConstructionInput,
   state: SemanticGraphProjectionState,
 ): JavaScriptSemanticGraphNode =>
-  createJavaScriptSemanticGraphNode({
+  createJavaScriptSemanticGraphNode(
+    {
+      kind: input.kind,
+      identity: {
+        artifact_sha256: file.sha256,
+        module_path: file.path,
+        source_range: input.location,
+        role_key: input.roleKey,
+      },
+      function_node_id: input.functionNodeId,
+      application_node_ids: [],
+      label: input.label === null ? null : javascriptDisplayText(input.label),
+      properties: input.properties ?? {},
+      evidence: observedSemanticEvidence(file, input.location),
+    },
+    state.evidenceContexts,
+  );
+
+/** Reuse retained identities and reject exhausted budgets before allocation. */
+export const retainSemanticGraphNode = (
+  state: SemanticGraphProjectionState,
+  file: JavaScriptArtifactFile,
+  input: SemanticNodeConstructionInput,
+): JavaScriptSemanticGraphNode | null => {
+  const identifier = javaScriptSemanticNodeId({
     kind: input.kind,
     identity: {
       artifact_sha256: file.sha256,
@@ -76,12 +140,18 @@ export const constructSemanticGraphNode = (
       source_range: input.location,
       role_key: input.roleKey,
     },
-    function_node_id: input.functionNodeId,
-    application_node_ids: matchingApplicationNodeIds(file, input, state),
-    label: input.label === null ? null : javascriptDisplayText(input.label),
-    properties: input.properties ?? {},
-    evidence: observedSemanticEvidence(file, input.location),
   });
+  const existing = state.nodes.get(identifier);
+  if (existing !== undefined) return existing;
+  if (typeof state.fileNodeBudget === "number" && state.fileNodeBudget <= 0) {
+    state.fileNodesDropped = true;
+    return null;
+  }
+  return addSemanticGraphNode(
+    state,
+    constructSemanticGraphNode(file, input, state),
+  );
+};
 
 /** Retain one canonical semantic node. */
 export const addSemanticGraphNode = (
@@ -90,6 +160,14 @@ export const addSemanticGraphNode = (
 ): JavaScriptSemanticGraphNode | null => {
   const existing = state.nodes.get(node.node_id);
   if (existing !== undefined) return existing;
+  const budget = state.fileNodeBudget;
+  if (typeof budget === "number") {
+    if (budget <= 0) {
+      state.fileNodesDropped = true;
+      return null;
+    }
+    state.fileNodeBudget = budget - 1;
+  }
   state.nodes.set(node.node_id, node);
   return node;
 };
@@ -107,14 +185,21 @@ export const addSemanticGraphRelation = (
     input.source.node_id === input.target.node_id
   )
     return;
-  const value = createJavaScriptSemanticGraphRelation({
-    source_node_id: input.source.node_id,
-    target_node_id: input.target.node_id,
-    relation: input.relation,
-    resolution: input.resolution ?? "candidate",
-    properties: input.properties ?? {},
-    evidence: input.evidence ?? inferredSemanticEvidence(input.source),
-  });
+  const value = createJavaScriptSemanticGraphRelation(
+    {
+      source_node_id: input.source.node_id,
+      target_node_id: input.target.node_id,
+      relation: input.relation,
+      resolution: input.resolution ?? "candidate",
+      properties: input.properties ?? {},
+      evidence:
+        input.evidence ??
+        inferredSemanticEvidence(
+          state.evidenceContexts.resolve(input.source.evidence),
+        ),
+    },
+    state.evidenceContexts,
+  );
   if (state.relations.has(value.relation_id)) return;
   state.relations.set(value.relation_id, value);
 };
@@ -135,29 +220,30 @@ export const addSemanticFallbackRoot = (
 ): void => {
   const node = addSemanticGraphNode(
     state,
-    createJavaScriptSemanticGraphNode({
-      kind: "module",
-      identity: {
-        artifact_sha256: rootArtifactSha256,
-        module_path: "unknown-semantic-root",
-        source_range: null,
-        role_key: "artifact-root",
+    createJavaScriptSemanticGraphNode(
+      {
+        kind: "module",
+        identity: {
+          artifact_sha256: rootArtifactSha256,
+          module_path: "unknown-semantic-root",
+          source_range: null,
+          role_key: "artifact-root",
+        },
+        function_node_id: null,
+        application_node_ids: [],
+        label: "unavailable semantic root",
+        properties: {},
+        evidence: unavailableSemanticRootEvidence(rootArtifactSha256),
       },
-      function_node_id: null,
-      application_node_ids: [],
-      label: "unavailable semantic root",
-      properties: {},
-      evidence: unavailableSemanticRootEvidence(rootArtifactSha256),
-    }),
+      state.evidenceContexts,
+    ),
   );
   if (node !== null) state.roots.add(node.node_id);
 };
 
 const indexApplicationNodes = (
   nodes: JavaScriptApplicationGraph["nodes"],
-): {
-  readonly identifiers: ReadonlyMap<string, readonly string[]>;
-} => {
+): ReadonlyMap<string, readonly string[]> => {
   const identifiers = new Map<string, Set<string>>();
   for (const node of nodes) {
     for (const observation of node.observations) {
@@ -188,18 +274,8 @@ const indexApplicationNodes = (
       return [key, sorted];
     }),
   );
-  return { identifiers: indexed };
+  return indexed;
 };
-
-const matchingApplicationNodeIds = (
-  file: JavaScriptArtifactFile,
-  input: SemanticNodeConstructionInput,
-  state: SemanticGraphProjectionState,
-): string[] => [
-  ...(state.applicationNodeIdsByLocation.get(
-    applicationLocationKey(file.sha256, file.path, input.location),
-  ) ?? []),
-];
 
 const addApplicationNodeIdentifier = (
   identifiers: Map<string, Set<string>>,

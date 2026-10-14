@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+
 /** Stable browser sections used by coverage and omission accounting. */
 const browserSectionSchema = z.enum([
   "frames",
@@ -36,6 +38,7 @@ const browserExclusionReasonSchema = z.enum([
   "out_of_target_scope",
   "provider_unavailable",
   "invalid_protocol_value",
+  "resource_budget_exhausted",
 ]);
 export type BrowserExclusionReason = z.infer<
   typeof browserExclusionReasonSchema
@@ -137,6 +140,6 @@ const canonicalExclusions = (
 ): BrowserExclusion[] =>
   [...exclusions].sort(
     (left, right) =>
-      left.section.localeCompare(right.section) ||
-      left.reason.localeCompare(right.reason),
+      compareUnicodeCodePoints(left.section, right.section) ||
+      compareUnicodeCodePoints(left.reason, right.reason),
   );

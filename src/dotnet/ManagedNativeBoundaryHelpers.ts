@@ -1,10 +1,14 @@
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import {
+  admitManagedProjection,
+  managedDecodeBudget,
+} from "./ManagedDecodeBudget.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   managedNativeBoundaryInspectionSchema,
   type ManagedNativeBoundaryInspection,
   type ManagedParseIssue,
 } from "../domain/managed/managedArtifact.js";
-import { type ManagedMetadataLayout } from "./ManagedMetadataLayout.js";
+import type { ManagedMetadataLayout } from "./ManagedMetadataLayout.js";
 import {
   metadataRowCursor,
   metadataCodedToken,
@@ -14,7 +18,11 @@ import {
 } from "./ManagedMetadataHeaps.js";
 import { managedTableRowCounts } from "./ManagedMetadataInventory.js";
 import type { ManagedMetadataInventory } from "./ManagedMetadataInventory.js";
-import type { ManagedPeLayout } from "./ManagedPeReader.js";
+import {
+  managedCli32BitRequirement,
+  type ManagedPeLayout,
+} from "./ManagedPeReader.js";
+import { readManagedValue } from "./ManagedReaderFailure.js";
 
 type ModuleRef = ManagedNativeBoundaryInspection["module_refs"][number];
 type NativeImport = ManagedNativeBoundaryInspection["pinvoke_imports"][number];
@@ -38,21 +46,24 @@ export const parseModuleRefs = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   heapExtent: number,
+  issues: ManagedParseIssue[],
 ): readonly ModuleRef[] => {
   const refs: ModuleRef[] = [];
   const table = layout.table(26);
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
-    const cursor = metadataRowCursor(bytes, layout, 26, row);
-    refs.push({
-      token: metadataToken(26, row),
-      row_offset: cursor.start,
-      name: readMetadataString(
-        bytes,
-        layout,
-        cursor.readIndex(layout.stringIndexSize),
-        heapExtent,
-      ),
-    });
+    readManagedValue(() => {
+      const cursor = metadataRowCursor(bytes, layout, 26, row);
+      refs.push({
+        token: metadataToken(26, row),
+        row_offset: cursor.start,
+        name: readMetadataString(
+          bytes,
+          layout,
+          cursor.readIndex(layout.stringIndexSize),
+          heapExtent,
+        ),
+      });
+    }, issues);
   }
   return refs;
 };
@@ -61,29 +72,32 @@ export const parseFields = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   heapExtent: number,
+  issues: ManagedParseIssue[],
 ): ReadonlyMap<string, MemberCore> => {
   const fields = new Map<string, MemberCore>();
   const table = layout.table(4);
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
-    const cursor = metadataRowCursor(bytes, layout, 4, row);
-    const flags = cursor.readUInt16();
-    const name = readMetadataString(
-      bytes,
-      layout,
-      cursor.readIndex(layout.stringIndexSize),
-      heapExtent,
-    );
-    cursor.readIndex(layout.blobIndexSize);
-    const token = metadataToken(4, row);
-    fields.set(token, {
-      token,
-      rowOffset: cursor.start,
-      kind: "field",
-      name,
-      flags,
-      implFlags: null,
-      rva: null,
-    });
+    readManagedValue(() => {
+      const cursor = metadataRowCursor(bytes, layout, 4, row);
+      const flags = cursor.readUInt16();
+      const name = readMetadataString(
+        bytes,
+        layout,
+        cursor.readIndex(layout.stringIndexSize),
+        heapExtent,
+      );
+      cursor.readIndex(layout.blobIndexSize);
+      const token = metadataToken(4, row);
+      fields.set(token, {
+        token,
+        rowOffset: cursor.start,
+        kind: "field",
+        name,
+        flags,
+        implFlags: null,
+        rva: null,
+      });
+    }, issues);
   }
   return fields;
 };
@@ -92,32 +106,35 @@ export const parseMethods = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   heapExtent: number,
+  issues: ManagedParseIssue[],
 ): ReadonlyMap<string, MemberCore> => {
   const methods = new Map<string, MemberCore>();
   const table = layout.table(6);
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
-    const cursor = metadataRowCursor(bytes, layout, 6, row);
-    const rva = cursor.readUInt32();
-    const implFlags = cursor.readUInt16();
-    const flags = cursor.readUInt16();
-    const name = readMetadataString(
-      bytes,
-      layout,
-      cursor.readIndex(layout.stringIndexSize),
-      heapExtent,
-    );
-    cursor.readIndex(layout.blobIndexSize);
-    cursor.readIndex(layout.tableIndexSize(8));
-    const token = metadataToken(6, row);
-    methods.set(token, {
-      token,
-      rowOffset: cursor.start,
-      kind: "method",
-      name,
-      flags,
-      implFlags,
-      rva,
-    });
+    readManagedValue(() => {
+      const cursor = metadataRowCursor(bytes, layout, 6, row);
+      const rva = cursor.readUInt32();
+      const implFlags = cursor.readUInt16();
+      const flags = cursor.readUInt16();
+      const name = readMetadataString(
+        bytes,
+        layout,
+        cursor.readIndex(layout.stringIndexSize),
+        heapExtent,
+      );
+      cursor.readIndex(layout.blobIndexSize);
+      cursor.readIndex(layout.tableIndexSize(8));
+      const token = metadataToken(6, row);
+      methods.set(token, {
+        token,
+        rowOffset: cursor.start,
+        kind: "method",
+        name,
+        flags,
+        implFlags,
+        rva,
+      });
+    }, issues);
   }
   return methods;
 };
@@ -143,66 +160,81 @@ export const parseImplMaps = ({
   const imports: NativeImport[] = [];
   const table = layout.table(28);
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
-    const cursor = metadataRowCursor(bytes, layout, 28, row);
-    const mappingFlags = cursor.readUInt16();
-    const memberForwardedOffset = cursor.offset;
-    const memberForwardedRaw = cursor.readIndex(
-      layout.codedIndexSize("MemberForwarded"),
-    );
-    const memberForwardedReason = metadataCodedTokenInvalidReason(
-      memberForwardedRaw,
-      1,
-      [4, 6],
-      layout.rowCounts,
-    );
-    if (memberForwardedReason !== null || memberForwardedRaw === 0)
-      issues.push({
-        code: "invalid-row",
-        scope: `metadata.ImplMap:${metadataToken(28, row)}`,
-        offset: memberForwardedOffset,
-        detail:
-          memberForwardedReason === null
-            ? "ImplMap MemberForwarded coded index 0x0 is null, but the column must reference a Field or MethodDef row"
-            : `ImplMap MemberForwarded coded index 0x${memberForwardedRaw.toString(16)} is invalid: ${memberForwardedReason}`,
+    readManagedValue(() => {
+      const cursor = metadataRowCursor(bytes, layout, 28, row);
+      const mappingFlags = cursor.readUInt16();
+      const memberForwardedOffset = cursor.offset;
+      const memberForwardedRaw = cursor.readIndex(
+        layout.codedIndexSize("MemberForwarded"),
+      );
+      const memberForwardedReason = metadataCodedTokenInvalidReason(
+        memberForwardedRaw,
+        1,
+        [4, 6],
+        layout.rowCounts,
+      );
+      if (memberForwardedReason !== null || memberForwardedRaw === 0)
+        issues.push({
+          code: "invalid-row",
+          scope: `metadata.ImplMap:${metadataToken(28, row)}`,
+          offset: memberForwardedOffset,
+          detail:
+            memberForwardedReason === null
+              ? "ImplMap MemberForwarded coded index 0x0 is null, but the column must reference a Field or MethodDef row"
+              : `ImplMap MemberForwarded coded index 0x${memberForwardedRaw.toString(16)} is invalid: ${memberForwardedReason}`,
+        });
+      const memberToken = metadataCodedToken(
+        memberForwardedRaw,
+        1,
+        [4, 6],
+        layout.rowCounts,
+      );
+      const importName = readMetadataString(
+        bytes,
+        layout,
+        cursor.readIndex(layout.stringIndexSize),
+        heapExtent,
+      );
+      const importScopeOffset = cursor.offset;
+      const importScopeRow = cursor.readIndex(layout.tableIndexSize(26));
+      const moduleCount = layout.table(26)?.rowCount ?? 0;
+      const validImportScope =
+        importScopeRow > 0 && importScopeRow <= moduleCount;
+      if (!validImportScope)
+        issues.push({
+          code: "invalid-row",
+          scope: `metadata.ImplMap:${metadataToken(28, row)}`,
+          offset: importScopeOffset,
+          detail: `ImplMap ImportScope row ${String(importScopeRow)} must reference a ModuleRef row between 1 and ${String(moduleCount)}`,
+        });
+      const importScopeToken = validImportScope
+        ? metadataToken(26, importScopeRow)
+        : null;
+      const member =
+        memberToken === null ? undefined : members.get(memberToken);
+      imports.push({
+        token: metadataToken(28, row),
+        row_offset: cursor.start,
+        mapping_flags: mappingFlags,
+        mapping_flags_hex: flagsHex(mappingFlags),
+        member_token: memberToken,
+        member_kind: member?.kind ?? "unknown",
+        member_name: member?.name ?? null,
+        import_name: importName,
+        import_scope_token: importScopeToken,
+        import_scope_name:
+          importScopeToken === null
+            ? null
+            : (moduleNames.get(importScopeToken)?.name ?? null),
+        no_mangle: (mappingFlags & 0x0001) !== 0,
+        char_set: charSet(mappingFlags),
+        call_convention: callConvention(mappingFlags),
+        supports_last_error: (mappingFlags & 0x0040) !== 0,
+        best_fit: bestFit(mappingFlags),
+        throw_on_unmappable_char: throwOnUnmappable(mappingFlags),
+        verification: "managed-declaration-only",
       });
-    const memberToken = metadataCodedToken(
-      memberForwardedRaw,
-      1,
-      [4, 6],
-      layout.rowCounts,
-    );
-    const importName = readMetadataString(
-      bytes,
-      layout,
-      cursor.readIndex(layout.stringIndexSize),
-      heapExtent,
-    );
-    const importScopeRow = cursor.readIndex(layout.tableIndexSize(26));
-    const importScopeToken =
-      importScopeRow === 0 ? null : metadataToken(26, importScopeRow);
-    const member = memberToken === null ? undefined : members.get(memberToken);
-    imports.push({
-      token: metadataToken(28, row),
-      row_offset: cursor.start,
-      mapping_flags: mappingFlags,
-      mapping_flags_hex: flagsHex(mappingFlags),
-      member_token: memberToken,
-      member_kind: member?.kind ?? "unknown",
-      member_name: member?.name ?? null,
-      import_name: importName,
-      import_scope_token: importScopeToken,
-      import_scope_name:
-        importScopeToken === null
-          ? null
-          : (moduleNames.get(importScopeToken)?.name ?? null),
-      no_mangle: (mappingFlags & 0x0001) !== 0,
-      char_set: charSet(mappingFlags),
-      call_convention: callConvention(mappingFlags),
-      supports_last_error: (mappingFlags & 0x0040) !== 0,
-      best_fit: bestFit(mappingFlags),
-      throw_on_unmappable_char: throwOnUnmappable(mappingFlags),
-      verification: "managed-declaration-only",
-    });
+    }, issues);
   }
   return imports;
 };
@@ -275,6 +307,7 @@ export const nativeImplementations = (
 ): readonly NativeImplementation[] => {
   const implementations: NativeImplementation[] = [];
   for (const method of methods) {
+    if (method.kind !== "method") continue;
     const implFlags = method.implFlags ?? 0;
     const codeType = codeTypeFor(implFlags);
     const managedKind = managedKindFor(implFlags);
@@ -344,24 +377,13 @@ const boundaryKind = (
   return "mixed-or-unknown";
 };
 
-/** CLI header facets of a PE without an admitted CLI header. */
-export const NO_CLI_NATIVE: ManagedNativeBoundaryInspection["cli_native"] = {
-  il_only: false,
-  requires_32bit: false,
-  strong_name_signed: false,
-  native_entry_point: false,
-  ready_to_run_signature: false,
-  managed_native_header_rva: 0,
-  managed_native_header_size: 0,
-};
-
 export const cliNative = (
   pe: ManagedPeLayout,
 ): ManagedNativeBoundaryInspection["cli_native"] => {
-  if (pe.cli === null) return NO_CLI_NATIVE;
+  if (pe.cli === null) return null;
   return {
     il_only: (pe.cli.flags & 0x0000_0001) !== 0,
-    requires_32bit: (pe.cli.flags & 0x0000_0002) !== 0,
+    requires_32bit: managedCli32BitRequirement(pe.cli.flags) === "required",
     strong_name_signed: (pe.cli.flags & 0x0000_0008) !== 0,
     native_entry_point: (pe.cli.flags & 0x0000_0010) !== 0,
     ready_to_run_signature: pe.cli.readyToRunSignature,
@@ -379,11 +401,13 @@ export const nativeBoundarySummary = (
   >,
 ): ManagedNativeBoundaryInspection["summary"] => ({
   ...counts,
-  ready_to_run: native.ready_to_run_signature,
+  ready_to_run: native?.ready_to_run_signature ?? null,
   mixed_mode_or_native_header:
-    native.managed_native_header_rva !== 0 ||
-    native.managed_native_header_size !== 0 ||
-    native.native_entry_point,
+    native === null
+      ? null
+      : native.managed_native_header_rva !== 0 ||
+        native.managed_native_header_size !== 0 ||
+        native.native_entry_point,
 });
 
 interface BoundaryInspectionContext {
@@ -410,40 +434,45 @@ export const buildNativeBoundaryInspection = ({
   native,
   issues,
 }: BoundaryInspectionContext): ManagedNativeBoundaryInspection =>
-  managedNativeBoundaryInspectionSchema.parse({
-    artifact: {
-      path: target.path,
-      sha256: target.sha256,
-      byte_length: bytes.length,
-      format: "pe",
-    },
-    module: inventory.module,
-    metadata: {
-      status: issues.length === 0 ? "complete" : "partial",
-      version: layout.version,
-      table_row_counts: managedTableRowCounts(layout),
-    },
-    identity_scope: {
-      token_identity: "build-local",
-      requires_artifact_sha256: target.sha256,
-      requires_mvid: inventory.module?.mvid ?? null,
-    },
-    cli_native: native,
-    module_refs: moduleRefs,
-    pinvoke_imports: imports,
-    native_implementations: implementations,
-    summary: nativeBoundarySummary(native, {
-      module_ref_count: moduleRefs.length,
-      pinvoke_import_count: imports.length,
-      native_implementation_count: implementations.length,
-    }),
-    coverage: {
-      state: issues.length === 0 ? "complete" : "partial",
-      issues,
-    },
-    limitations: [
-      "P/Invoke rows prove managed import declarations only; this inspection does not verify that a native library, export, thunk, or provider-qualified function exists.",
-      "Managed metadata tokens are build-local coordinates and are only meaningful with the reported artifact SHA-256 and MVID.",
-      "ReadyToRun, NativeAOT, C++/CLI, and IL2CPP native semantics require separately selected native-provider evidence; this tool does not translate managed tokens into native addresses.",
-    ],
-  });
+  managedNativeBoundaryInspectionSchema.parse(
+    admitManagedProjection(
+      {
+        artifact: {
+          path: target.path,
+          sha256: target.sha256,
+          byte_length: bytes.length,
+          format: "pe",
+        },
+        module: inventory.module,
+        metadata: {
+          status: issues.length === 0 ? "complete" : "partial",
+          version: layout.version,
+          table_row_counts: managedTableRowCounts(layout),
+        },
+        identity_scope: {
+          token_identity: "build-local",
+          requires_artifact_sha256: target.sha256,
+          requires_mvid: inventory.module?.mvid ?? null,
+        },
+        cli_native: native,
+        module_refs: moduleRefs,
+        pinvoke_imports: imports,
+        native_implementations: implementations,
+        summary: nativeBoundarySummary(native, {
+          module_ref_count: moduleRefs.length,
+          pinvoke_import_count: imports.length,
+          native_implementation_count: implementations.length,
+        }),
+        coverage: {
+          state: issues.length === 0 ? "complete" : "partial",
+          issues,
+        },
+        limitations: [
+          "P/Invoke rows prove managed import declarations only; this inspection does not verify that a native library, export, thunk, or provider-qualified function exists.",
+          "Managed metadata tokens are build-local coordinates and are only meaningful with the reported artifact SHA-256 and MVID.",
+          "ReadyToRun, NativeAOT, C++/CLI, and IL2CPP native semantics require separately selected native-provider evidence; this tool does not translate managed tokens into native addresses.",
+        ],
+      },
+      managedDecodeBudget(layout),
+    ),
+  );

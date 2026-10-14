@@ -6,7 +6,7 @@ import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { AndroidOperation } from "../domain/android/androidAnalysis.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 
@@ -99,13 +99,20 @@ export const registerAndroidCommands = (
       }),
   });
   cli.command(CLI_COMMANDS.traceAndroidReferences, {
-    description: "Trace incoming APK class or unique-method references",
+    description:
+      "Trace incoming APK using nodes for a class or selected method",
     args: z.object({ path, className }),
     options: z.object({
       methodName: z
         .string()
         .optional()
-        .describe("Unique declared method name; omit for class references"),
+        .describe("Declared method name; omit for class references"),
+      overloadIndex: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Index among same-name methods from inspect-android-class"),
     }),
     run: ({ args, options }) =>
       execute(CLI_COMMANDS.traceAndroidReferences, "trace_android_references", {
@@ -114,6 +121,9 @@ export const registerAndroidCommands = (
         ...(options.methodName === undefined
           ? {}
           : { method_name: options.methodName }),
+        ...(options.overloadIndex === undefined
+          ? {}
+          : { overload_index: options.overloadIndex }),
       }),
   });
 };

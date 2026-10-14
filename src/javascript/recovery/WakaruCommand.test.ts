@@ -1,8 +1,29 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { expect, it } from "vitest";
-import { runWakaruCommand, type WakaruLauncher } from "./WakaruCommand.js";
+import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
+import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
+import {
+  resolveWakaruCommand,
+  runWakaruCommand,
+  type WakaruLauncher,
+} from "./WakaruCommand.js";
 import { RECOVERY_LIMITS } from "./WakaruRelease.js";
+
+it("names the Wakaru configuration requirement when it is not configured", async () => {
+  const refusal: unknown = await resolveWakaruCommand({}).catch(
+    (cause: unknown) => cause,
+  );
+
+  if (!(refusal instanceof AnalysisCapabilityUnavailableError))
+    throw new Error("Expected a capability refusal");
+  expect(refusal.reason).toContain("REA_WAKARU_COMMAND");
+  expect(projectAnalysisError(refusal)).toMatchObject({
+    code: "capability_unavailable",
+    message: refusal.reason,
+    remediation: { action: refusal.reason },
+  });
+});
 
 it("rejects an exhausted shared execution budget before launching the next command", async () => {
   await expect(
@@ -12,7 +33,7 @@ it("rejects an exhausted shared execution budget before launching the next comma
       arguments: ["--version"],
       cwd: "/tmp/unused",
       environment: {},
-      deadline: Date.now() - 1,
+      deadline: performance.now() - 1,
       launcher: async () => {
         throw new Error("An expired budget must not launch");
       },
@@ -31,7 +52,7 @@ it("preserves caller cancellation before acquiring an expired execution budget",
       arguments: ["--version"],
       cwd: "/tmp/unused",
       environment: {},
-      deadline: Date.now() - 1,
+      deadline: performance.now() - 1,
       signal: AbortSignal.abort(),
       launcher: async () => {
         throw new Error("A cancelled request must not launch");
@@ -65,7 +86,7 @@ const commandFixture = (
       arguments: ["--version"],
       cwd: "/tmp/unused",
       environment: {},
-      deadline: Date.now() + 5_000,
+      deadline: performance.now() + 5_000,
       launcher,
     },
   };
@@ -119,7 +140,7 @@ it("enforces the shared deadline while exited output streams remain open", async
   });
   try {
     await expect(
-      runWakaruCommand({ ...context, deadline: Date.now() + 50 }),
+      runWakaruCommand({ ...context, deadline: performance.now() + 50 }),
     ).rejects.toMatchObject({
       _tag: "AnalysisTimeoutError",
       operation: "recover_javascript_sources",

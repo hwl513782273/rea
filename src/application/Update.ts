@@ -3,49 +3,69 @@ import { gt, valid } from "semver";
 import { PRODUCT_IDENTITY } from "../identity.js";
 import type { Result } from "../domain/result.js";
 import type { IntegrationMaintenance } from "./UpdateMaintenance.js";
+export { isUpdateFailure } from "./UpdateFailure.js";
 
 /** Global npm installation that owns the running package and its entry point. */
 export interface NpmInstallation {
+  readonly manager: "npm";
   readonly prefix: string;
   readonly packageRoot: string;
 }
 
+/** Bun global installation that owns the running package and its entry point. */
+export interface BunInstallation {
+  readonly manager: "bun";
+  /** Bun's global project directory, which owns `node_modules/rea-agents`. */
+  readonly globalDirectory: string;
+  readonly packageRoot: string;
+}
+
+/** Global package-manager installation that owns the running package. */
+export type UpdateInstallation = NpmInstallation | BunInstallation;
+
 /** Output policy for the package manager subprocess. */
 export type UpdateOutput = "human" | "structured";
 
+/** Why release lookup failed before a version could be compared. */
+export type ReleaseLookupFailure =
+  | { readonly kind: "unavailable"; readonly detail: string }
+  | { readonly kind: "unsupported-package-manager"; readonly detail: string }
+  | { readonly kind: "invalid-metadata"; readonly detail: string };
+
 /** Effects used to update and verify one identified REA installation. */
 export interface UpdateHost {
-  installation(): Promise<NpmInstallation | undefined>;
+  installation(): Promise<UpdateInstallation | undefined>;
   latestVersion(
-    installation: NpmInstallation | undefined,
-  ): Promise<Result<string, string>>;
+    installation: UpdateInstallation | undefined,
+  ): Promise<Result<string, ReleaseLookupFailure>>;
   installVersion(
-    installation: NpmInstallation,
+    installation: UpdateInstallation,
     version: string,
     output: UpdateOutput,
   ): Promise<Result<void, string>>;
   installedVersion(
-    installation: NpmInstallation,
+    installation: UpdateInstallation,
   ): Promise<Result<string, string>>;
   planMaintenance(
-    installation: NpmInstallation,
+    installation: UpdateInstallation,
   ): Promise<IntegrationMaintenance>;
+  close?(): Promise<string | undefined>;
 }
 
 /** Verified update outcome, separate from the unapplied integration plan. */
-export type UpdateResult =
+export type UpdateResult = (
   | {
       readonly status: "current";
       readonly currentVersion: string;
       readonly latestVersion: string;
-      readonly installMethod: "npm" | "unknown";
+      readonly installMethod: UpdateInstallation["manager"] | "unknown";
     }
   | {
       readonly status: "updated";
       readonly previousVersion: string;
       readonly latestVersion: string;
       readonly installedVersion: string;
-      readonly installMethod: "npm";
+      readonly installMethod: UpdateInstallation["manager"];
       readonly command: readonly string[];
       readonly maintenance: IntegrationMaintenance;
       readonly remediation: string;
@@ -61,45 +81,101 @@ export type UpdateResult =
         | "verification";
       readonly installedVersion?: string;
       readonly remediation: string;
-    };
+    }
+) & { readonly cleanupFailure?: string };
 
-/** Whether the update command left the requested release unapplied. */
-export const isUpdateFailure = (result: UpdateResult): boolean => {
-  const status = result.status;
-  switch (status) {
-    case "current":
-    case "updated":
-      return false;
-    case "failed":
-      return true;
+/** Resolve the exact package-manager command for the identified installation and release. */
+export const updateInstallCommand = (
+  installation: UpdateInstallation,
+  version: string,
+): readonly string[] => {
+  const release = `${PRODUCT_IDENTITY.packageName}@${version}`;
+  const manager = installation.manager;
+  switch (manager) {
+    case "npm":
+      return [
+        "npm",
+        "install",
+        "--global",
+        "--ignore-scripts",
+        "--prefix",
+        installation.prefix,
+        release,
+      ];
+    case "bun":
+      // The host pins Bun's global directory and working directory for this command.
+      return ["bun", "add", "--global", "--ignore-scripts", release];
     default: {
-      const exhaustive: never = status;
+      const exhaustive: never = manager;
       throw new TypeError(
-        `Unhandled update result status: ${String(exhaustive)}`,
+        `Unhandled installation manager: ${String(exhaustive)}`,
       );
     }
   }
 };
 
-/** Resolve the exact npm command for the identified prefix and release. */
-export const updateInstallCommand = (
-  installation: NpmInstallation,
-  version: string,
-): readonly string[] => [
-  "npm",
-  "install",
-  "--global",
-  "--ignore-scripts",
-  "--prefix",
-  installation.prefix,
-  `${PRODUCT_IDENTITY.packageName}@${version}`,
-];
+const versionCheckRemediation = (
+  release: Result<string, ReleaseLookupFailure>,
+): string => {
+  if (release.ok) {
+    return "REA received invalid version metadata. Check the installed version and npm registry, then rerun rea update.";
+  }
+  const failure = release.error;
+  const kind = failure.kind;
+  switch (kind) {
+    case "unsupported-package-manager":
+      return failure.detail;
+    case "unavailable":
+      return `REA could not resolve the latest release: ${failure.detail}. Retry rea update when registry access is available.`;
+    case "invalid-metadata":
+      return `REA could not resolve the latest release: ${failure.detail}. Check the npm release metadata, then rerun rea update.`;
+    default: {
+      const exhaustive: never = kind;
+      throw new TypeError(
+        `Unhandled release lookup failure: ${String(exhaustive)}`,
+      );
+    }
+  }
+};
 
 /** Identify, resolve, install, and verify REA without applying setup changes. */
 export const runUpdate = async (
   currentVersion: string,
   host: UpdateHost,
   output: UpdateOutput = "human",
+): Promise<UpdateResult> => {
+  let result: UpdateResult | undefined;
+  let primaryFailure: unknown;
+  let failed = false;
+  try {
+    result = await runUpdateWorkflow(currentVersion, host, output);
+  } catch (cause: unknown) {
+    failed = true;
+    primaryFailure = cause;
+  }
+  let cleanupFailure: string | undefined;
+  try {
+    cleanupFailure = await host.close?.();
+  } catch (cause: unknown) {
+    cleanupFailure = `Update resource cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+  }
+  if (failed) {
+    if (cleanupFailure !== undefined)
+      throw new AggregateError(
+        [primaryFailure, new Error(cleanupFailure)],
+        "Update failed and its resource cleanup remains incomplete.",
+        { cause: primaryFailure },
+      );
+    throw primaryFailure;
+  }
+  if (result === undefined) throw new Error("Update result was not produced.");
+  return cleanupFailure === undefined ? result : { ...result, cleanupFailure };
+};
+
+const runUpdateWorkflow = async (
+  currentVersion: string,
+  host: UpdateHost,
+  output: UpdateOutput,
 ): Promise<UpdateResult> => {
   const installation = await host.installation();
   const release = await host.latestVersion(installation);
@@ -111,16 +187,14 @@ export const runUpdate = async (
       currentVersion,
       latestVersion,
       reason: "version-check",
-      remediation: release.ok
-        ? "REA received invalid version metadata. Check the installed version and npm registry, then rerun rea update."
-        : `REA could not resolve the latest release: ${release.error}. Retry rea update when registry access is available.`,
+      remediation: versionCheckRemediation(release),
     };
   if (!gt(targetVersion, currentVersion))
     return {
       status: "current",
       currentVersion,
       latestVersion: targetVersion,
-      installMethod: installation === undefined ? "unknown" : "npm",
+      installMethod: installation?.manager ?? "unknown",
     };
   if (installation === undefined)
     return {
@@ -142,7 +216,7 @@ export const runUpdate = async (
       currentVersion,
       latestVersion: targetVersion,
       reason: "install",
-      remediation: `REA could not install ${targetVersion} in ${installation.prefix}: ${installed.error}. Repair this npm installation, then rerun rea update.`,
+      remediation: `REA could not install ${targetVersion} in ${installation.manager === "npm" ? installation.prefix : installation.globalDirectory}: ${installed.error}. Repair this ${installation.manager} installation, then rerun rea update.`,
     };
   const verified = await host.installedVersion(installation);
   if (!verified.ok || verified.value !== targetVersion)
@@ -152,7 +226,7 @@ export const runUpdate = async (
       latestVersion: targetVersion,
       reason: "verification",
       ...(verified.ok ? { installedVersion: verified.value } : {}),
-      remediation: `npm completed, but REA could not verify ${targetVersion} in ${installation.packageRoot}: ${verified.ok ? `the executable reported ${verified.value}` : verified.error}. The installation may have changed; repair it before retrying.`,
+      remediation: `${installation.manager} completed, but REA could not verify ${targetVersion} in ${installation.packageRoot}: ${verified.ok ? `the executable reported ${verified.value}` : verified.error}. The installation may have changed; repair it before retrying.`,
     };
   const maintenance = await host.planMaintenance(installation);
   return {
@@ -160,7 +234,7 @@ export const runUpdate = async (
     previousVersion: currentVersion,
     latestVersion: targetVersion,
     installedVersion: verified.value,
-    installMethod: "npm",
+    installMethod: installation.manager,
     command: updateInstallCommand(installation, targetVersion),
     maintenance,
     remediation:

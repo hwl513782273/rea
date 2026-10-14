@@ -1,8 +1,9 @@
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
-import { createEvidence, type Evidence } from "../../domain/evidence.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
+import type { Evidence } from "../../domain/evidence.js";
 import type { EvidenceBundle } from "../../domain/evidenceBundle.js";
 import type { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisInputError } from "../../domain/analysisErrorCore.js";
 import type { UnknownRegistryError } from "../../domain/unknownRegistryError.js";
 import type {
   RecordUnknownInput,
@@ -12,16 +13,14 @@ import type {
 } from "../../domain/residualUnknown.js";
 import type { Result } from "../../domain/result.js";
 import { EvidenceLedger, type EvidenceImportDelta } from "./EvidenceLedger.js";
-import {
-  UNKNOWN_REGISTRY_PROVIDER,
-  unknownEvidenceLinks,
-  unknownMutationEvidence,
-} from "./UnknownEvidence.js";
+import { unknownMutationEvidence } from "./UnknownEvidence.js";
 import type {
   EvidenceReader,
   EvidenceWriter,
   EvidenceUnknownWriter,
   UnknownRegistryPort,
+  UnknownPage,
+  UnknownQuery,
 } from "./InvestigationRecordPort.js";
 
 /** One investigation's validated record owner, independent of binary execution. */
@@ -51,15 +50,25 @@ export class InvestigationRecords
     return this.#evidence.get(evidenceId);
   }
 
+  /** Borrow an immutable authenticated record for a read-only application workflow. */
+  evidenceForAnalysis(evidenceId: string): Evidence | undefined {
+    return this.#evidence.forAnalysis(evidenceId);
+  }
+
   /** Export a detached deterministic bundle of Evidence and Unknown revisions. */
   exportEvidenceBundle(): EvidenceBundle {
     return this.#evidence.export();
   }
 
+  /** Borrow a sealed bundle snapshot for complete JSON serialization. */
+  evidenceBundleForSerialization(): EvidenceBundle {
+    return this.#evidence.forSerialization();
+  }
+
   /** Atomically merge a bundle and report changes for the owner's post-commit observers. */
   mergeEvidenceBundle(
     bundle: unknown,
-  ): Result<EvidenceImportDelta, EvidenceIntegrityError> {
+  ): Result<EvidenceImportDelta, EvidenceIntegrityError | AnalysisInputError> {
     return this.#evidence.import(bundle);
   }
 
@@ -73,11 +82,10 @@ export class InvestigationRecords
     input: RecordUnknownInput,
     target?: BinaryTarget,
   ): Result<ResidualUnknown, AnalysisError> {
-    const recorded = this.#evidence.recordUnknown(
+    return this.#evidence.recordUnknown(
       input,
-      unknownMutationEvidence(target, input),
+      unknownMutationEvidence(target, { operation: "record_unknown", input }),
     );
-    return recorded;
   }
 
   /** Commit derived Evidence and its Unknown atomically without an implicit subject. */
@@ -85,12 +93,14 @@ export class InvestigationRecords
     evidence: Evidence,
     input: RecordUnknownInput,
   ): Result<ResidualUnknown | null, AnalysisError> {
-    const recorded = this.#evidence.recordWithUnknown(
+    return this.#evidence.recordWithUnknown(
       evidence,
       input,
-      unknownMutationEvidence(undefined, input),
+      unknownMutationEvidence(undefined, {
+        operation: "record_unknown",
+        input,
+      }),
     );
-    return recorded;
   }
 
   /** Update an optimistic revision with an explicitly supplied Evidence subject. */
@@ -98,23 +108,11 @@ export class InvestigationRecords
     input: UpdateUnknownInput,
     target?: BinaryTarget,
   ): Result<ResidualUnknown, AnalysisError> {
-    const evidence = createEvidence(target, UNKNOWN_REGISTRY_PROVIDER, {
-      predicateType: "rea.residual-unknown-mutation",
+    const evidence = unknownMutationEvidence(target, {
       operation: "update_unknown",
-      parameters: {
-        unknown_id: input.unknown_id,
-        expected_revision: input.expected_revision,
-      },
-      result: { action: "update", status: input.status },
-      confidence: "derived",
-      authority: "analyst-inference",
-      evidenceLinks: unknownEvidenceLinks(input),
-      limitations: [
-        "Registry mutation evidence records analyst intent, not proof of the answer.",
-      ],
+      input,
     });
-    const updated = this.#evidence.updateUnknown(input, evidence);
-    return updated;
+    return this.#evidence.updateUnknown(input, evidence);
   }
 
   /** Return detached current Unknown revisions matching the selected filters. */
@@ -126,6 +124,10 @@ export class InvestigationRecords
     } = {},
   ): ResidualUnknown[] {
     return this.#evidence.listUnknowns(filters);
+  }
+
+  listUnknownsPage(query: UnknownQuery = {}): UnknownPage {
+    return this.#evidence.listUnknownsPage(query);
   }
 
   /** Verify registry consistency without asserting the answer is true. */

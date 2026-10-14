@@ -1,5 +1,4 @@
 import type { ApplicationGraphEvidence } from "../../domain/javascript/javascriptApplicationEvidenceSchemas.js";
-import type { JavaScriptSemanticGraphNode } from "../../domain/javascript/javascriptSemanticGraph.js";
 import type { JavaScriptSourceRange } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
 
@@ -44,9 +43,9 @@ export const observedSemanticEvidence = (
 
 /** Conservative static relationship evidence derived from one syntax node. */
 export const inferredSemanticEvidence = (
-  source: JavaScriptSemanticGraphNode,
+  source: ApplicationGraphEvidence,
 ): ApplicationGraphEvidence => ({
-  ...source.evidence,
+  ...source,
   authority: "static-relationship-inference",
   state: "inferred",
   confidence: "high",
@@ -101,7 +100,7 @@ export const unavailableSemanticRootEvidence = (
 /** Explicit unknown evidence at one unresolved dynamic syntax location. */
 export const unknownSemanticEvidence = (
   file: JavaScriptArtifactFile,
-  location: JavaScriptSourceRange,
+  location: JavaScriptSourceRange | null,
 ): ApplicationGraphEvidence => ({
   ...observedSemanticEvidence(file, location),
   authority: "unknown",

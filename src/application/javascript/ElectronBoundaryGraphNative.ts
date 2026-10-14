@@ -7,6 +7,8 @@ import {
   type JavaScriptArtifactGraphCoverage,
 } from "./JavaScriptArtifactGraphContext.js";
 import { astObservationEvidence } from "./JavaScriptArtifactGraphEvidence.js";
+import { compositeKey } from "../../domain/unicodeCodePointOrder.js";
+import { javascriptDisplayText } from "../../domain/javascript/javascriptAstValues.js";
 import {
   addElectronInferenceEdge,
   electronFindingSourceNode,
@@ -36,13 +38,19 @@ export const addElectronNativeBoundaries = (
 
 const addNativeBinding = (input: NativeBindingInput): void => {
   const { context, file, value, coverage } = input;
-  const source = electronFindingSourceNode(context, file, value.module_key);
+  const source = electronFindingSourceNode(
+    context,
+    file,
+    value.module_key,
+    value.module_runtime,
+  );
   if (source === undefined) return;
   const resolved = resolveArtifactPath(
     value.specifier,
     file.path,
     context.filesByPath,
     value.module_kind,
+    context.directoryPaths,
   );
   const addon = resolved === null ? undefined : context.fileNodes.get(resolved);
   const binding = context.accumulator.addNode({
@@ -50,15 +58,27 @@ const addNativeBinding = (input: NativeBindingInput): void => {
     identity: electronObservationIdentity(
       context,
       "javascript-requested-native-export",
-      `${file.path}:${value.specifier}:${value.binding_kind}:${value.members.join("\0")}:${electronRangeKey(value.location)}`,
+      compositeKey([
+        file.path,
+        value.specifier,
+        value.binding_kind,
+        value.members,
+        value.namespace_access ?? null,
+        value.dynamic_member_access ?? null,
+        electronRangeKey(value.location),
+      ]),
     ),
     observations: [
       {
-        label: value.members.join(", "),
+        label:
+          value.members.map(javascriptDisplayText).join(", ") ||
+          value.specifier,
         properties: {
           specifier: value.specifier,
           binding_kind: value.binding_kind,
           requested_members: value.members,
+          namespace_access: value.namespace_access ?? null,
+          dynamic_member_access: value.dynamic_member_access ?? null,
           resolved_path: resolved,
           native_export_verification: "not-performed",
         },
@@ -87,6 +107,8 @@ const addNativeBinding = (input: NativeBindingInput): void => {
       specifier: value.specifier,
       binding_kind: value.binding_kind,
       requested_members: value.members,
+      namespace_access: value.namespace_access ?? null,
+      dynamic_member_access: value.dynamic_member_access ?? null,
     },
     limitations: [
       "Requested JavaScript members are not verified native exports.",
@@ -104,6 +126,8 @@ const addNativeBinding = (input: NativeBindingInput): void => {
     properties: {
       resolved_path: resolved,
       requested_members: value.members,
+      namespace_access: value.namespace_access ?? null,
+      dynamic_member_access: value.dynamic_member_access ?? null,
       verified: false,
     },
     confidence: "medium",

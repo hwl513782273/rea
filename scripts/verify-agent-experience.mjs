@@ -1,39 +1,119 @@
 import { spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-
-import { createPackage } from "@electron/asar";
+import { z } from "zod";
 
 import { evaluateCodexEvents } from "../dist/evaluation/CodexAgentEval.js";
-import { MCP_STARTUP_POLICY } from "../dist/mcpStartupPolicy.js";
+import {
+  createAgentEvaluationFixtures,
+  agentFixtureClaims,
+  agentFixtureAnswerInstructions,
+} from "../dist/evaluation/AgentEvaluationFixtures.js";
+import {
+  agentEvaluationPassed,
+  summarizeFactualCorrectness,
+} from "../dist/evaluation/AgentEvaluationReport.js";
+import { PRODUCT_IDENTITY } from "../dist/identity.js";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const verifierRun = createVerifierRun();
-const evaluationRoot = await mkdtemp(join(tmpdir(), "rea-agent-eval-"));
-const fixtureRoot = join(evaluationRoot, "targets");
-const skillDestination = join(
-  evaluationRoot,
-  ".agents/skills/reverse-engineer-anything",
-);
 const timeoutMs = Number(process.env.REA_AGENT_EVAL_TIMEOUT_MS ?? 480_000);
 const codex = process.env.REA_CODEX_CLI ?? "codex";
 const optionalModel = process.env.REA_AGENT_EVAL_MODEL;
 
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 10_000)
   throw new Error("REA_AGENT_EVAL_TIMEOUT_MS must be an integer >= 10000");
-const codexVersion = await readCommandVersion(codex);
+// Codex refuses helper aliases when CODEX_HOME is under the OS temp directory.
+// Keep the disposable account in a private cache, then remove the owned run.
+const evaluationParent = resolve(
+  process.env.REA_AGENT_EVAL_ROOT ??
+    join(homedir(), ".cache", "rea-agent-evaluations"),
+);
+await mkdir(evaluationParent, { recursive: true, mode: 0o700 });
+const evaluationRoot = await mkdtemp(join(evaluationParent, "run-"));
+const fixtureRoot = join(evaluationRoot, "targets");
+const account = join(evaluationRoot, "account");
+const codexHome = join(evaluationRoot, "codex");
+const authPath = join(codexHome, "auth.json");
+const skillDestination = join(
+  account,
+  ".agents/skills/reverse-engineer-anything",
+);
+const evaluationEnvironment = {
+  ...Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !/^(?:REA_|CODEX_|GHIDRA_|HOPPER_|IDA_)/u.test(name),
+    ),
+  ),
+  HOME: account,
+  USERPROFILE: account,
+  CODEX_HOME: codexHome,
+  XDG_CONFIG_HOME: join(account, ".config"),
+  XDG_DATA_HOME: join(account, ".local/share"),
+  XDG_CACHE_HOME: join(account, ".cache"),
+  REA_PROCESS_RUN_ID: verifierRun.run_id,
+  PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+};
 
 try {
-  await mkdir(fixtureRoot, { recursive: true });
-  await cp(
-    join(repositoryRoot, "skills/reverse-engineer-anything"),
-    skillDestination,
-    { recursive: true },
+  const codexVersion = await readCommandVersion(codex);
+  await Promise.all([
+    mkdir(fixtureRoot, { recursive: true }),
+    mkdir(account),
+    mkdir(codexHome, { mode: 0o700 }),
+  ]);
+  // Reuse authentication only. User config, plugins, rules, history and skills
+  // must not make a fresh installed-skill trial pass accidentally.
+  try {
+    await copyFile(
+      join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "auth.json"),
+      authPath,
+    );
+    await chmod(authPath, 0o600);
+  } catch (cause) {
+    if (cause?.code !== "ENOENT") throw cause;
+    // Environment/API-key authentication can work without a local auth file.
+  }
+  await writeFile(
+    join(codexHome, "config.toml"),
+    'approval_policy = "never"\nsandbox_mode = "read-only"\nweb_search = "disabled"\n[features]\nmulti_agent = false\nshell_snapshot = false\n[history]\npersistence = "none"\n',
+    { mode: 0o600 },
   );
+  for (const approval of ["--dry-run", "--yes"]) {
+    await runProcess(
+      process.execPath,
+      [
+        join(repositoryRoot, "scripts/rea.mjs"),
+        "setup",
+        "--client",
+        "codex",
+        approval,
+        "--json",
+      ],
+      evaluationRoot,
+      120_000,
+      evaluationEnvironment,
+    );
+  }
+  const installedSkill = await readFile(
+    join(skillDestination, "SKILL.md"),
+    "utf8",
+  );
+  if (!installedSkill.includes(`  version: "${PRODUCT_IDENTITY.skillVersion}"`))
+    throw new Error("Setup did not install the current packaged REA skill");
   const requestedScenarioIds = new Set(
     (process.env.REA_AGENT_EVAL_SCENARIOS ?? "")
       .split(",")
@@ -50,7 +130,11 @@ try {
       expectedFirstTool: "open_binary",
       requiresEvidence: false,
       requiredAnswerTermGroups: [["unavailable", "could not", "provider"]],
-      prompt: `Explain what the shipped native program at ${targets.native} does. Base the answer on artifact analysis, and clearly state any facts that remain unavailable.`,
+      // The verifier authorizes these named session operations, not arbitrary
+      // writes or runtime execution. Missing-engine behavior stays observable.
+      approvedTools: ["open_binary", "close_binary"],
+      requiredToolSubsequence: ["open_binary", "close_binary"],
+      prompt: `Explain what static artifact evidence establishes about the shipped native program at ${targets.native}. Do not execute the target or install tools. Clearly state unavailable provider evidence, and close any analysis session you opened before finishing.`,
     },
     {
       id: "asar",
@@ -62,6 +146,50 @@ try {
         ["preload", "contextbridge"],
       ],
       prompt: `Explain how the desktop application at ${targets.javascript} exposes APIs to its renderer. Base the answer on the shipped application artifact, and state what remains unknown.`,
+    },
+    {
+      id: "asar-zh",
+      fixtureScenarioId: "asar",
+      expectedFirstTool: "analyze_javascript_application",
+      requiresEvidence: true,
+      requiredAnswerTermGroups: [["profileapi"], ["profile:read"]],
+      prompt: `請靜態分析已交付的 Electron 程式 ${targets.javascript}，說明 renderer 如何透過 preload 讀取 profile，以及 main handler 的關係。不要執行目標或安裝分析引擎；引用完整的產出 Evidence，保留 runtime 未知事項。`,
+    },
+    {
+      id: "notes-export",
+      expectedFirstTool: "analyze_javascript_application",
+      requiresEvidence: true,
+      requiredAnswerTermGroups: [],
+      requiredToolSubsequence: [
+        "analyze_javascript_application",
+        "trace_application_feature",
+        "trace_javascript_semantics",
+      ],
+      prompt: `Use REA on the shipped Electron application at ${targets.notesElectron} to investigate its notes export API, preload exposure and main handler. Do not read target files directly or launch Electron. Use the returned application Evidence to trace the exact notes:export IPC channel in both directions, then query semantic relations for the property invoke with forward influence, excluding ambiguous dynamic edges and without an expected sink. Report the selected static facts, source locations and coverage limits using the closed claim contract.`,
+    },
+    {
+      id: "javascript-module-view",
+      expectedFirstTool: "analyze_javascript_application",
+      requiresEvidence: true,
+      requiredToolSubsequence: [
+        "analyze_javascript_application",
+        "inspect_analysis_view",
+        "inspect_analysis_view",
+      ],
+      requiredAnswerTermGroups: [
+        ["main.js"],
+        ["node", "identity"],
+        ["observations", "recorded"],
+      ],
+      prompt: `Inspect the recorded module identity, exports and observations for main.js in the shipped JavaScript tree ${targets.largeJavascript}. Use REA without directly reading target files or executing the target. Keep results focused on that module, cite Evidence, and state the limits of what its module view establishes.`,
+    },
+    {
+      id: "missing-target",
+      expectedFirstTool: null,
+      requiresEvidence: false,
+      requiredAnswerTermGroups: [],
+      prompt:
+        'Reverse engineer my desktop app and explain how it saves user settings. Use static analysis; do not install software. End with one JSON object containing status ("needs_target" or "analyzed"), requested_input ("app_name_or_artifact_path" or null), and question (a string or null).',
     },
     {
       id: "javascript-export-shape",
@@ -91,6 +219,10 @@ try {
       expectedFirstTool: "inspect_managed_artifact",
       requiresEvidence: true,
       requiredAnswerTermGroups: [["profile"], ["main", "entry point"]],
+      requiredToolSubsequence: [
+        "inspect_managed_artifact",
+        "inspect_managed_members",
+      ],
       prompt: `Explain the public managed types and entry point in ${targets.managed}. Use shipped-artifact evidence and distinguish unavailable behavior from observed metadata.`,
     },
     {
@@ -134,7 +266,15 @@ try {
   const results = [];
   for (const scenario of scenarios) {
     process.stderr.write(`Running Codex agent evaluation: ${scenario.id}\n`);
-    const execution = await runCodex(scenario.prompt);
+    const fixtureId = scenario.fixtureScenarioId ?? scenario.id;
+    const fixtureClaims = agentFixtureClaims(fixtureId, targets);
+    const answerInstructions = agentFixtureAnswerInstructions(fixtureId);
+    const execution = await runCodex(
+      answerInstructions.length === 0
+        ? scenario.prompt
+        : `${scenario.prompt}\n\nThis closed factual rubric needs complete producer Evidence in the transcript. Request complete detail on each initial inspection or analysis when supported; summary or view records alone are not accepted by this rubric.\n\n${answerInstructions}`,
+      scenario.approvedTools ?? [],
+    );
     const transcriptDirectory = process.env.REA_AGENT_EVAL_TRANSCRIPT_DIR;
     if (transcriptDirectory !== undefined) {
       const transcriptPath = resolve(
@@ -155,17 +295,28 @@ try {
         requiredAnswerTermGroups: scenario.requiredAnswerTermGroups,
         requiredToolSubsequence: scenario.requiredToolSubsequence,
         forbidInputValidationFailures: true,
+        ...(fixtureClaims === undefined ? {} : { fixtureClaims }),
       },
     );
+    // Fixtures are deliberately visible beside prior investigation artifacts.
+    // Their existence does not identify the unnamed app in this request.
+    const targetClarificationPassed =
+      scenario.expectedFirstTool === null
+        ? validTargetClarification(metrics.finalMessage)
+        : undefined;
     const result = {
       id: scenario.id,
       expectedFirstTool: scenario.expectedFirstTool,
       requiresEvidence: scenario.requiresEvidence,
-      qualityCriteria: scenario.requiredAnswerTermGroups,
+      requiredAnswerTermGroups: scenario.requiredAnswerTermGroups,
       requiredToolSubsequence: scenario.requiredToolSubsequence ?? [],
+      configuredClaimIds: fixtureClaims?.map(({ id }) => id) ?? [],
       exitCode: execution.exitCode,
       stderr: execution.stderr,
       ...metrics,
+      ...(targetClarificationPassed === undefined
+        ? {}
+        : { targetClarificationPassed }),
     };
     results.push(result);
     process.stderr.write(
@@ -173,12 +324,23 @@ try {
     );
   }
 
+  const factualCorrectness = summarizeFactualCorrectness(results);
   const summary = {
+    schemaVersion: 4,
+    evaluationScope: "routing_workflow_and_configured_fixture_claims",
+    factualCorrectness,
     verifier_run: await completeVerifierRun(verifierRun),
     codex,
     codexVersion,
     model: optionalModel ?? null,
-    scenarios: results.map(({ finalMessage: _message, ...result }) => result),
+    installation: {
+      method: "rea_setup_codex",
+      isolatedHome: true,
+      isolatedCodexHome: true,
+      skillVersion: PRODUCT_IDENTITY.skillVersion,
+      authentication: "caller_auth_only_removed_after_run",
+    },
+    scenarios: results,
     totals: {
       scenarios: results.length,
       naturalUse: results.filter(({ naturalUse }) => naturalUse).length,
@@ -205,12 +367,15 @@ try {
         (total, { cachedInputTokens }) => total + cachedInputTokens,
         0,
       ),
-      completionQuality: results.filter(({ completionQuality }) =>
-        Boolean(completionQuality),
+      answerHeuristicsMet: results.filter(({ answerHeuristicsMet }) =>
+        Boolean(answerHeuristicsMet),
       ).length,
-      authorityHonesty: results.filter(({ authorityHonesty }) =>
-        Boolean(authorityHonesty),
+      epistemicCuePresent: results.filter(({ epistemicCuePresent }) =>
+        Boolean(epistemicCuePresent),
       ).length,
+      factualScenariosPassed: factualCorrectness.counts.passed,
+      factualScenariosFailed: factualCorrectness.counts.failed,
+      factualScenariosNotAssessed: factualCorrectness.counts.notAssessed,
     },
   };
   const encoded = `${JSON.stringify(summary, null, 2)}\n`;
@@ -221,75 +386,36 @@ try {
     await writeFile(resolve(reportPath), encoded);
   }
 
-  const failed = results.filter(
-    ({
-      exitCode,
-      naturalUse,
-      correctFirstTool,
-      repeatedCallCount,
-      inputValidationFailureCount,
-      requiredToolSubsequenceMet,
-      inputTokens,
-      completionQuality,
-      authorityHonesty,
-    }) =>
-      exitCode !== 0 ||
-      !naturalUse ||
-      !correctFirstTool ||
-      repeatedCallCount !== 0 ||
-      inputValidationFailureCount !== 0 ||
-      !requiredToolSubsequenceMet ||
-      inputTokens <= 0 ||
-      !completionQuality ||
-      !authorityHonesty,
-  );
+  const failed = results.filter((result) => !agentEvaluationPassed(result));
   if (failed.length > 0)
     throw new Error(
-      `Codex agent release evaluation failed: ${failed.map(({ id }) => id).join(", ")}`,
+      `Agent routing/workflow/answer checks failed: ${failed.map(({ id }) => id).join(", ")}`,
     );
 } finally {
+  // Even a deliberately retained fixture directory must never retain auth.
+  await rm(authPath, { force: true });
   if (process.env.REA_AGENT_EVAL_KEEP_FIXTURES !== "true")
     await rm(evaluationRoot, { recursive: true, force: true });
 }
 
 async function createTargets(root, includeManaged) {
-  const javascript = join(root, "desktop-app");
-  await mkdir(join(javascript, "renderer"), { recursive: true });
+  const fixtures = await createAgentEvaluationFixtures(root, repositoryRoot);
+  const largeJavascript = join(root, "large-app");
+  await mkdir(join(largeJavascript, "lib"), { recursive: true });
   await Promise.all([
     writeFile(
-      join(javascript, "package.json"),
-      `${JSON.stringify({ name: "desktop-fixture", version: "1.0.0", main: "main.js" }, null, 2)}\n`,
+      join(largeJavascript, "package.json"),
+      '{"name":"large-app","main":"main.js"}\n',
     ),
     writeFile(
-      join(javascript, "main.js"),
-      'const { BrowserWindow, ipcMain } = require("electron");\nnew BrowserWindow({ webPreferences: { preload: require("node:path").join(__dirname, "preload.js"), contextIsolation: true, sandbox: true } });\nipcMain.handle("profile:read", (_event, id) => ({ id }));\n',
+      join(largeJavascript, "main.js"),
+      'const { ipcMain } = require("electron");\nipcMain.handle("profile:read", (_event, id) => ({ id }));\n',
     ),
-    writeFile(
-      join(javascript, "preload.js"),
-      'const { contextBridge, ipcRenderer } = require("electron");\ncontextBridge.exposeInMainWorld("profileApi", { read: (id) => ipcRenderer.invoke("profile:read", id) });\n',
-    ),
-    writeFile(
-      join(javascript, "renderer/app.js"),
-      'globalThis.profileApi.read("fixture");\n',
-    ),
-  ]);
-  const javascriptAsar = join(root, "desktop-app.asar");
-  await createPackage(javascript, javascriptAsar);
-
-  const javascriptShapeLeft = join(root, "parser-v1");
-  const javascriptShapeRight = join(root, "parser-v2");
-  await Promise.all([
-    mkdir(javascriptShapeLeft, { recursive: true }),
-    mkdir(javascriptShapeRight, { recursive: true }),
-  ]);
-  await Promise.all([
-    writeFile(
-      join(javascriptShapeLeft, "parser.mjs"),
-      'export default function parse() { return { heading: "Title" }; }\n',
-    ),
-    writeFile(
-      join(javascriptShapeRight, "parser.mjs"),
-      'export default function parse() { return { heading: { text: "Title", level: 1 } }; }\n',
+    ...Array.from({ length: 180 }, (_, index) =>
+      writeFile(
+        join(largeJavascript, "lib", `formatter-${String(index)}.js`),
+        `export const format = (value) => String(value).trim();\n`,
+      ),
     ),
   ]);
 
@@ -324,18 +450,37 @@ async function createTargets(root, includeManaged) {
   }
   return {
     native: "/bin/true",
-    javascript: javascriptAsar,
-    javascriptShapeLeft,
-    javascriptShapeRight,
+    ...fixtures,
+    largeJavascript,
     managed: join(managedOutput, "AgentEval.dll"),
+    ...(includeManaged
+      ? {
+          managedSha256: createHash("sha256")
+            .update(await readFile(join(managedOutput, "AgentEval.dll")))
+            .digest("hex"),
+        }
+      : {}),
   };
 }
 
-async function runCodex(prompt) {
+function validTargetClarification(message) {
+  const schema = z.strictObject({
+    status: z.literal("needs_target"),
+    requested_input: z.literal("app_name_or_artifact_path"),
+    question: z.string().refine((value) => value.trim().length > 0),
+  });
+  try {
+    return schema.safeParse(JSON.parse(message)).success;
+  } catch (cause) {
+    if (cause instanceof SyntaxError) return false;
+    throw cause;
+  }
+}
+
+async function runCodex(prompt, approvedTools) {
   const arguments_ = [
+    "--no-daemon",
     "exec",
-    "--ignore-user-config",
-    "--ignore-rules",
     "--ephemeral",
     "--skip-git-repo-check",
     "--sandbox",
@@ -347,18 +492,16 @@ async function runCodex(prompt) {
     evaluationRoot,
     "-c",
     'approval_policy="never"',
-    "-c",
-    `mcp_servers.rea.command=${JSON.stringify(process.execPath)}`,
-    "-c",
-    `mcp_servers.rea.args=${JSON.stringify([join(repositoryRoot, "scripts/rea.mjs"), "mcp"])}`,
-    "-c",
-    `mcp_servers.rea.startup_timeout_sec=${String(MCP_STARTUP_POLICY.codexStartupTimeoutSeconds)}`,
+    ...approvedTools.flatMap((name) => [
+      "-c",
+      `mcp_servers.rea.tools.${name}.approval_mode="approve"`,
+    ]),
     ...(optionalModel === undefined ? [] : ["--model", optionalModel]),
     prompt,
   ];
   const child = spawn(codex, arguments_, {
     cwd: evaluationRoot,
-    env: process.env,
+    env: evaluationEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });
   const events = [];
@@ -397,9 +540,16 @@ async function runCodex(prompt) {
   return { events, exitCode, stderr: stderr.join("").slice(0, 32_768) };
 }
 
-async function runProcess(command, arguments_, cwd, timeout) {
+async function runProcess(
+  command,
+  arguments_,
+  cwd,
+  timeout,
+  env = process.env,
+) {
   const child = spawn(command, arguments_, {
     cwd,
+    env,
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";

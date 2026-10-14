@@ -56,7 +56,7 @@ it("retains exact empty method names and environment keys", () => {
   ]);
 });
 
-it("retains exact empty require paths without dynamic-key links", () => {
+it("retains exact empty require paths and dependencies without dynamic-key bindings", () => {
   const ir = analyzeJavaScriptSemantics(`
     const { '': fromPattern } = require("./table.js");
     const fromMember = require("./table.js")[''];
@@ -85,6 +85,18 @@ it("retains exact empty require paths without dynamic-key links", () => {
       exportedName: null,
     },
     {
+      kind: "require",
+      importedName: null,
+      localName: null,
+      exportedName: null,
+    },
+    {
+      kind: "require",
+      importedName: null,
+      localName: null,
+      exportedName: null,
+    },
+    {
       kind: "commonjs-export",
       importedName: "",
       localName: null,
@@ -102,4 +114,19 @@ it("retains exact empty request field names without dynamic fields", () => {
       fields.map(({ name }) => name),
     ),
   ).toEqual(["", "body"]);
+});
+
+it("retains the exact empty CommonJS export name", () => {
+  const ir = analyzeJavaScriptSemantics(`
+    exports[''] = 1;
+    module.exports[''] = 2;
+    exports['ok'] = 3;
+    exports[key] = 4;
+  `);
+  expect(ir.moduleLinks.map(({ exportedName }) => exportedName)).toEqual([
+    "",
+    "",
+    "ok",
+    "*",
+  ]);
 });

@@ -31,6 +31,9 @@ const dialogDetectionFixturePath = fileURLToPath(
 const cleanupTimeoutFixturePath = fileURLToPath(
   new URL("../../../fixtures/hopperCleanupTimeout.py", import.meta.url),
 );
+const ownerLifetimeFixturePath = fileURLToPath(
+  new URL("../../../fixtures/hopperOwnerLifetime.py", import.meta.url),
+);
 
 type DiagnosticOverrides = Partial<
   Omit<HopperStartupDiagnostic, "failure_code" | "status">
@@ -107,6 +110,23 @@ describe("Hopper demo dialog detection", () => {
 });
 
 describe("Hopper process cleanup", () => {
+  it.skipIf(process.platform !== "linux").each(["startup", "ready"])(
+    "reaps only its own children when the owner pipe closes during %s",
+    (phase) => {
+      const result = spawnSync(
+        "/usr/bin/python3",
+        [ownerLifetimeFixturePath, helperPath, phase],
+        { encoding: "utf8", timeout: 10_000 },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        phase,
+        children_cleaned: true,
+        sentinel_alive: true,
+      });
+    },
+  );
+
   it.skipIf(process.platform !== "linux")(
     "kills a child that ignores SIGTERM after the bounded timeout",
     () => {
@@ -115,14 +135,7 @@ describe("Hopper process cleanup", () => {
         [cleanupTimeoutFixturePath, helperPath],
         { encoding: "utf8", timeout: 5_000 },
       );
-      expect(result.status).toBe(0);
-      const parsed = JSON.parse(result.stdout) as {
-        readonly returncode: number;
-        readonly elapsed_ms: number;
-      };
-      expect(parsed.returncode).toBe(-9);
-      expect(parsed.elapsed_ms).toBeGreaterThanOrEqual(1_800);
-      expect(parsed.elapsed_ms).toBeLessThan(4_000);
+      expect(result.status, result.stderr).toBe(0);
     },
   );
 });

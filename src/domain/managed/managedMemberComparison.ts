@@ -18,6 +18,7 @@ import {
   buildMethodItems,
 } from "./managedMemberComparisonItems.js";
 import { keyMembers, sha256 } from "./managedMemberComparisonMatch.js";
+import { hasSignatureResolution } from "./managedMemberSignatureIdentity.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
 
@@ -213,23 +214,27 @@ export interface ManagedMemberComparisonSide {
   readonly result: ManagedMemberInspection;
 }
 
+const selectedTypes = (
+  result: ManagedMemberInspection,
+): ReadonlySet<string> | null =>
+  result.selection === null ? null : new Set(result.selection.type_names);
+
 /** Compare managed members with constrained exact and structural identities. */
 export const compareManagedMembers = (
   left: ManagedMemberComparisonSide,
   right: ManagedMemberComparisonSide,
 ): ManagedMemberComparisonResult => {
-  const leftCoverage = {
-    sourceComplete: left.result.coverage.state === "complete",
-  };
-  const rightCoverage = {
-    sourceComplete: right.result.coverage.state === "complete",
-  };
   const { methodMatches, fieldMatches } = keyMembers(left, right);
   const itemContext = {
     leftEvidenceId: left.evidenceId,
     rightEvidenceId: right.evidenceId,
-    leftComplete: leftCoverage.sourceComplete,
-    rightComplete: rightCoverage.sourceComplete,
+    leftComplete: left.result.metadata.status === "complete",
+    rightComplete: right.result.metadata.status === "complete",
+    leftSelection: selectedTypes(left.result),
+    rightSelection: selectedTypes(right.result),
+    signatureResolutionExamined:
+      hasSignatureResolution(left.result) &&
+      hasSignatureResolution(right.result),
   };
   const methodItems = buildMethodItems(methodMatches, itemContext);
   const fieldItems = buildFieldItems(fieldMatches, itemContext);
@@ -265,5 +270,3 @@ export const compareManagedMembers = (
   } satisfies ManagedMemberComparisonResult;
   return managedMemberComparisonResultSchema.parse(result);
 };
-
-export { parseManagedMemberEvidence } from "./managedMemberComparisonMatch.js";

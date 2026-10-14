@@ -1,9 +1,8 @@
+import type { JavaScriptSemanticGraph } from "./javascriptSemanticGraph.js";
 import type {
-  JavaScriptSemanticGraph,
   JavaScriptSemanticGraphNode,
   JavaScriptSemanticGraphRelation,
-} from "./javascriptSemanticGraph.js";
-import { compareCodePoints } from "../canonicalOrdering.js";
+} from "./javascriptSemanticGraphSchemas.js";
 import type { JavaScriptSemanticGraphUnknown } from "./javascriptSemanticGraphSchemas.js";
 import { isJavaScriptSemanticOwnershipRelation as ownershipRelation } from "./javascriptSemanticQueryRelations.js";
 import {
@@ -30,10 +29,6 @@ interface Traversal {
   readonly modules: Set<string>;
 }
 
-interface SeedAdmission {
-  readonly nodeIds: string[];
-}
-
 interface QueryResult {
   readonly retainedNodes: JavaScriptSemanticGraphNode[];
   readonly retainedRelations: JavaScriptSemanticGraphRelation[];
@@ -47,17 +42,15 @@ export const queryJavaScriptSemanticGraph = (
   const input = javaScriptSemanticQueryInputSchema.parse(rawInput);
   const queryId = queryIdentifier(graph, input);
   const seeds = resolveSeeds(graph, input);
-  const admission = admitSeeds(graph, seeds);
-  const retainedSeeds = admission.nodeIds;
+  const nodes = new Map(graph.nodes.map((node) => [node.node_id, node]));
   const adjacency = buildAdjacency(graph.relations, input);
-  const traversal = traverse(graph, retainedSeeds, adjacency);
+  const traversal = traverse(nodes, seeds, adjacency);
   const result = createQueryResult(graph, traversal);
-  const allRelevantUnknowns = relevantUnknownFrontiers(
+  const relevantUnknowns = relevantUnknownFrontiers(
     graph,
     traversal.nodeIds,
     input,
   );
-  const relevantUnknowns = allRelevantUnknowns;
   const candidateRelations = relevantCandidateRelationCount(
     graph,
     traversal.nodeIds,
@@ -68,6 +61,11 @@ export const queryJavaScriptSemanticGraph = (
     result.retainedRelations,
     input,
   );
+  const retainedContextIds = new Set([
+    ...result.retainedNodes.map(({ evidence }) => evidence.context_id),
+    ...result.retainedRelations.map(({ evidence }) => evidence.context_id),
+    ...relevantUnknowns.map(({ evidence }) => evidence.context_id),
+  ]);
   const assessment = assessJavaScriptSemanticQuery({
     graph,
     totalSeeds: seeds.length,
@@ -82,7 +80,10 @@ export const queryJavaScriptSemanticGraph = (
     seed: input.seed,
     direction: input.direction,
     status: assessment.status,
-    seed_node_ids: retainedSeeds,
+    seed_node_ids: seeds,
+    evidence_contexts: graph.evidence_contexts.filter(({ context_id }) =>
+      retainedContextIds.has(context_id),
+    ),
     nodes: result.retainedNodes,
     relations: result.retainedRelations,
     unknowns: relevantUnknowns,
@@ -93,7 +94,7 @@ export const queryJavaScriptSemanticGraph = (
       traversed_relations: traversal.relationIds.size,
       traversed_functions: traversal.functionIds.size,
       traversed_modules: traversal.modules.size,
-      relevant_unknowns: allRelevantUnknowns.length,
+      relevant_unknowns: relevantUnknowns.length,
     },
     coverage: assessment.coverage,
     limitations: assessment.limitations,
@@ -111,20 +112,6 @@ const createQueryResult = (
     traversal.relationIds.has(relation_id),
   );
   return { retainedNodes, retainedRelations };
-};
-
-const admitSeeds = (
-  graph: JavaScriptSemanticGraph,
-  seeds: readonly string[],
-): SeedAdmission => {
-  const nodes = new Map(graph.nodes.map((node) => [node.node_id, node]));
-  const retained: string[] = [];
-  for (const nodeId of seeds) {
-    const node = nodes.get(nodeId);
-    if (node === undefined) continue;
-    retained.push(nodeId);
-  }
-  return { nodeIds: retained };
 };
 
 const buildAdjacency = (
@@ -145,13 +132,6 @@ const buildAdjacency = (
       continue;
     addDirectedEntries(adjacency, relation, input.direction);
   }
-  for (const entries of adjacency.values())
-    entries.sort((left, right) =>
-      compareCodePoints(
-        `${left.relation.relation_id}\0${left.nextNodeId}`,
-        `${right.relation.relation_id}\0${right.nextNodeId}`,
-      ),
-    );
   return adjacency;
 };
 
@@ -214,11 +194,10 @@ const addEntry = (
 };
 
 const traverse = (
-  graph: JavaScriptSemanticGraph,
+  nodes: ReadonlyMap<string, JavaScriptSemanticGraphNode>,
   seeds: readonly string[],
   adjacency: ReadonlyMap<string, TraversalEntry[]>,
 ): Traversal => {
-  const nodes = new Map(graph.nodes.map((node) => [node.node_id, node]));
   const nodeIds = new Set(seeds);
   const relationIds = new Set<string>();
   const functionIds = new Set<string>();
@@ -271,25 +250,55 @@ const relevantUnknownFrontiers = (
   return graph.unknowns.filter(
     (unknown) =>
       (unknown.node_id === null || nodeIds.has(unknown.node_id)) &&
-      (allowed === null ||
-        unknown.relation_kinds.some((relation) => allowed.has(relation))),
+      unknown.relation_kinds.some(
+        (relation) =>
+          directionAllowsRelation(input.direction, relation) &&
+          (allowed === null || allowed.has(relation)),
+      ),
   );
 };
+
+const directionAllowsRelation = (
+  direction: JavaScriptSemanticQueryInput["direction"],
+  relation: JavaScriptSemanticGraphRelation["relation"],
+): boolean =>
+  direction === "callers"
+    ? relation === "calls"
+    : direction === "ownership"
+      ? ownershipRelation(relation)
+      : true;
 
 const relevantCandidateRelationCount = (
   graph: JavaScriptSemanticGraph,
   nodeIds: ReadonlySet<string>,
   input: JavaScriptSemanticQueryInput,
 ): number => {
-  const adjacency = buildAdjacency(
-    graph.relations.filter(({ resolution }) => resolution === "candidate"),
-    { ...input, include_ambiguous_dynamic_edges: true },
-  );
-  const relevant = new Set<string>();
-  for (const nodeId of nodeIds)
-    for (const { relation } of adjacency.get(nodeId) ?? [])
-      relevant.add(relation.relation_id);
-  return relevant.size;
+  const allowed =
+    input.allowed_relations === undefined
+      ? null
+      : new Set(input.allowed_relations);
+  let relevant = 0;
+  for (const relation of graph.relations) {
+    if (
+      relation.resolution !== "candidate" ||
+      (allowed !== null && !allowed.has(relation.relation))
+    )
+      continue;
+    const sourceIsRelevant = nodeIds.has(relation.source_node_id);
+    const targetIsRelevant = nodeIds.has(relation.target_node_id);
+    if (
+      (input.direction === "callers" &&
+        relation.relation === "calls" &&
+        targetIsRelevant) ||
+      (input.direction === "ownership" &&
+        ownershipRelation(relation.relation) &&
+        (sourceIsRelevant || targetIsRelevant)) ||
+      (input.direction === "backward-provenance" && targetIsRelevant) ||
+      (input.direction === "forward-influence" && sourceIsRelevant)
+    )
+      relevant += 1;
+  }
+  return relevant;
 };
 
 const expectedMatchesFor = (

@@ -2,11 +2,10 @@ import { createHash } from "node:crypto";
 
 import canonicalize from "canonicalize";
 
-import type {
-  JavaScriptSemanticGraph,
-  JavaScriptSemanticGraphNode,
-} from "./javascriptSemanticGraph.js";
-import { compareCodePoints, uniqueSorted } from "../canonicalOrdering.js";
+import type { JavaScriptSemanticGraph } from "./javascriptSemanticGraph.js";
+import type { JavaScriptSemanticGraphNode } from "./javascriptSemanticGraphSchemas.js";
+import { uniqueSorted } from "../canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { JavaScriptSemanticQueryInput } from "./javascriptSemanticQuerySchemas.js";
 
 /** Canonical JSON used by semantic query commitments and ordering. */
@@ -68,7 +67,7 @@ export const resolveJavaScriptSemanticQuerySeeds = (
   return graph.nodes
     .filter((node) => seedMatches(node, input, fingerprintFunctions))
     .map(({ node_id }) => node_id)
-    .sort(compareCodePoints);
+    .sort(compareUnicodeCodePoints);
 };
 
 const seedMatches = (
@@ -82,11 +81,7 @@ const seedMatches = (
     return node.application_node_ids.includes(seed.node_id);
   if (seed.kind === "function") return fingerprintFunctions.has(node.node_id);
   if (seed.kind === "literal")
-    return (
-      node.kind === "literal" &&
-      canonicalJavaScriptSemanticQueryJson(node.properties.value) ===
-        canonicalJavaScriptSemanticQueryJson(seed.value)
-    );
+    return node.kind === "literal" && node.properties.value === seed.value;
   if (seed.kind === "property")
     return node.kind === "property-slot" && node.properties.name === seed.name;
   if (seed.kind === "endpoint")

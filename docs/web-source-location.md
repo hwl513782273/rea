@@ -72,9 +72,18 @@ One owned Node subprocess decodes the map. Its private request directory is
 removed before success is returned. Only this child's inherited `NODE_OPTIONS`
 is removed; explicit V8 flags set a 192 MiB old-generation and 8 MiB semi-space
 budget, one V8 worker and a 20-second deadline. Reported actual V8 heap limits
-are checked. These are heap limits, not an aggregate process RSS limit. Cleanup
-may extend the deadline and an unconfirmed cleanup overrides success with
-`cleanup_incomplete` and the owning operation/resources.
+are checked. These are heap limits, not an aggregate process RSS limit. When
+REA runs on Bun, the subprocess is Bun, which ignores these V8 flags: `runtime`
+records `id: "bun"`, the Bun version, its Node.js compatibility version and a
+null `v8_heap_limit_bytes`. On Windows, the codec's owned Job Object then
+limits its committed memory to 704 MiB, the 192 MiB budget plus a 512 MiB
+reserve for Bun itself; `process_memory_limit_bytes` records that limit, the
+limitations state it, and reaching it returns `resource_constraint` with
+`codec_process_memory_limit_bytes`. Elsewhere Bun has no enforced codec limit:
+`process_memory_limit_bytes` is null and the limitations state that no codec
+heap limit is established. Cleanup may extend the deadline and an unconfirmed
+cleanup overrides success with `cleanup_incomplete` and the owning
+operation/resources.
 
 Complete evidence is bounded by a 4 MiB map, 32 MiB codec reply, 262144 decoded
 rows/segments and 64 nested section levels. Exceeding a budget returns an explicit
@@ -83,6 +92,33 @@ script boundaries also apply. No global toolchain or browser configuration chang
 are made.
 
 ## Verification
+
+Browser bundle collection uses absolute section offsets for nested inline maps.
+An enclosing column offset contributes only when the nested section starts on
+that enclosing section's first generated line. Parent boundaries still clip
+preceding browser mappings when a nested section starts with a gap or has no
+child leaves. Raw map text, original source identities and the dedicated decoder
+profile are preserved.
+
+Browser collection accepts up to 64 MiB of map responses per inspection and
+preflights indexed sections, sources, names, generated rows and mapping segments
+against a 262144-record decode budget before upstream flattening. Indexed maps
+are limited to 64 nested levels. These structural limits bound decoded object
+growth while preserving large embedded `sourcesContent` strings within the
+response-byte budget. It also bounds the expanded inline evidence to 32 MiB
+across the inspection, checking resolved source identities and mapping rows
+before publishing them, and bounds raw resolved-source identities to 64 MiB
+before upstream materializes their arrays. Exceeding either decoder budget
+returns a `fetch_failed` item while retaining other maps. Decoded coordinates
+and source/name indexes are validated per map; a malformed map is reported as
+`invalid` without discarding earlier or later maps.
+Collection reserves each requested map's failure context before fetching it.
+When the aggregate inline-result budget cannot reserve another item, remaining
+requests are left unprocessed and reported as unknown through the top-level
+`limitation`; `requested` retains the full count and `processed` counts returned
+items.
+Malformed UTF-8 map responses are reported as invalid rather than repaired with
+replacement characters.
 
 Focused tests cover duplicate mappings, indexed offsets/overlap/local indexes,
 32-bit VLQ overflow, nullable content, UTF-16/CRLF positions, immutable artifact

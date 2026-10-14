@@ -5,6 +5,59 @@ import { observeWebExecutionInputSchema } from "../../../src/domain/webExecution
 import { inspectWebEventListenersInputSchema } from "../../../src/domain/webEventListeners.js";
 import { startRuntimeBrowser } from "../../fixtures/webRuntime.js";
 
+it("invalidates retained sources when their execution context is reused during another source read", async () => {
+  let emit: ((event: CdpEvent) => void) | undefined;
+  const browser = await startRuntimeBrowser({
+    commandResult: (command, origin) => {
+      if (
+        command.method === "Debugger.getScriptSource" &&
+        command.params.scriptId === "script-b"
+      )
+        emit?.({
+          sessionId: "session-1",
+          method: "Runtime.executionContextCreated",
+          params: {
+            context: {
+              id: 1,
+              uniqueId: "replacement-context",
+              origin,
+              name: "",
+              auxData: {
+                frameId: "runtime-main",
+                isDefault: true,
+                type: "default",
+              },
+            },
+          },
+        });
+      return undefined;
+    },
+  });
+  emit = browser.emitEvent;
+  onTestFinished(() => browser.close());
+  const result = await new CdpWebRuntimeProvider().observeExecution(
+    observeWebExecutionInputSchema.parse({
+      cdp_endpoint: browser.endpoint,
+      target_id: "allowed-page",
+      observation_ms: 5,
+    }),
+  );
+  if (!result.ok) throw result.error;
+  expect(result.value.coverage.scripts).toEqual([]);
+  expect(result.value.coverage.excluded_scripts).toBe(3);
+  expect(result.value.script_inventory.main_document_scripts).toBe(0);
+  for (const scriptId of ["script-a", "script-b"])
+    expect(
+      result.value.sources.find(({ script_id }) => script_id === scriptId),
+    ).toMatchObject({ frame_id: null, source: { state: "excluded" } });
+  expect(browser.commands.map(({ method }) => method)).toEqual(
+    expect.arrayContaining([
+      "Profiler.stopPreciseCoverage",
+      "Target.detachFromTarget",
+    ]),
+  );
+});
+
 it.each(
   ["listeners", "execution"].flatMap((operation) =>
     ["source_read", "other_source_read", "final_assertion"].map((phase) => ({
@@ -82,7 +135,12 @@ it.each(
       });
     } else {
       const result = await provider.observeExecution(
-        observeWebExecutionInputSchema.parse({ ...scope, observation_ms: 5 }),
+        observeWebExecutionInputSchema.parse({
+          ...scope,
+          // This fixture sends a real WebSocket event after the armed receipt.
+          // Leave room for transport delivery on a shared CI runner.
+          observation_ms: 100,
+        }),
         {
           progress: {
             report: async (update) => {
@@ -124,8 +182,17 @@ it.each(
           ({ script_id }) => script_id === "script-a",
         ),
       ).toBe(false);
-      expect(result.value.requests[0]?.callsites[0]?.source_association).toBe(
-        "unknown",
+      expect(result.value.window.end_reason).toBe("window_elapsed");
+      expect(result.value.requests).toContainEqual(
+        expect.objectContaining({
+          request_id: "source-completion-request",
+          callsites: expect.arrayContaining([
+            expect.objectContaining({
+              script_id: "script-a",
+              source_association: "unknown",
+            }),
+          ]),
+        }),
       );
       expect(result.value.script_inventory.main_document_scripts).toBe(1);
       expect(

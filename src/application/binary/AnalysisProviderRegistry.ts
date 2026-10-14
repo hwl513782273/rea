@@ -4,8 +4,9 @@ import {
   type AnalysisProviderSelector,
 } from "../../contracts/providerSelection.js";
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   ProviderSelectionError,
   type ProviderSelectionFailureReason,
@@ -24,6 +25,7 @@ import {
   evaluateAnalysisProviderCandidate,
   type AnalysisProviderCandidateEvaluation,
 } from "./AnalysisProviderEvaluation.js";
+import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 
 /** Deterministic discovery truth for one configured deep provider. */
 export interface AnalysisProviderCandidateStatus {
@@ -48,7 +50,8 @@ export interface AnalysisProviderBinding {
   readonly identity: ProviderIdentity & { readonly version: string };
   readonly selectionSource: "request" | "environment" | "auto-single-candidate";
   readonly profile: AnalysisProfileCommitment;
-  readonly compatibility: Readonly<Record<string, JsonValue>>;
+  /** The provider's capabilities, attributed to its resolved identity. */
+  readonly capabilities: readonly CapabilityDescriptor[];
 }
 
 /** Complete result used for both a bound and intentionally unbound target. */
@@ -109,12 +112,14 @@ export class AnalysisProviderRegistry {
     }
     this.#providers = Object.freeze(
       [...providers].sort((left, right) =>
-        left.identity().id.localeCompare(right.identity().id),
+        compareUnicodeCodePoints(left.identity().id, right.identity().id),
       ),
     );
     this.#byId = byId;
     this.#declaredOperations = Object.freeze(
-      [...declaredOperations].sort((left, right) => left.localeCompare(right)),
+      [...declaredOperations].sort((left, right) =>
+        compareUnicodeCodePoints(left, right),
+      ),
     );
   }
 
@@ -147,12 +152,7 @@ export class AnalysisProviderRegistry {
     target: BinaryTarget,
     requestedSelector?: AnalysisProviderSelector,
     options: { readonly signal?: AbortSignal } = {},
-  ): Promise<
-    Result<
-      AnalysisProviderSelection,
-      ProviderSelectionError | AnalysisCancelledError
-    >
-  > {
+  ): Promise<Result<AnalysisProviderSelection, AnalysisError>> {
     if (signalIsAborted(options.signal))
       return err(new AnalysisCancelledError("open_binary"));
     const parsedRequest =
@@ -176,7 +176,7 @@ export class AnalysisProviderRegistry {
       return err(new AnalysisCancelledError("open_binary"));
     if (
       request === undefined &&
-      selector !== "auto" &&
+      this.#byId.has(selector) &&
       baseline.length > 0 &&
       baseline.every(
         ({ targetSupport }) => targetSupport.status === "unsupported",
@@ -224,12 +224,7 @@ export class AnalysisProviderRegistry {
     context: TargetSelectionContext,
     providerId: string,
     source: AnalysisProviderBinding["selectionSource"],
-  ): Promise<
-    Result<
-      AnalysisProviderSelection,
-      ProviderSelectionError | AnalysisCancelledError
-    >
-  > {
+  ): Promise<Result<AnalysisProviderSelection, AnalysisError>> {
     const { baseline, signal, target } = context;
     const provider = this.#byId.get(providerId);
     if (provider === undefined)
@@ -253,11 +248,10 @@ export class AnalysisProviderRegistry {
     );
     if (!evaluation.ok) return evaluation;
     const evaluated = evaluation.value;
+    if (evaluated.profileError !== undefined)
+      return err(evaluated.profileError);
     const statuses = replaceCandidate(baseline, evaluated.status);
-    if (
-      evaluated.profile === undefined ||
-      evaluated.compatibility === undefined
-    )
+    if (evaluated.profile === undefined)
       return err(selectionError("provider_unavailable", providerId, statuses));
     return ok(
       selectedResult(
@@ -266,7 +260,6 @@ export class AnalysisProviderRegistry {
         {
           ...evaluated,
           profile: evaluated.profile,
-          compatibility: evaluated.compatibility,
         },
         statuses,
       ),
@@ -275,12 +268,7 @@ export class AnalysisProviderRegistry {
 
   async #selectAutomatically(
     context: TargetSelectionContext,
-  ): Promise<
-    Result<
-      AnalysisProviderSelection,
-      ProviderSelectionError | AnalysisCancelledError
-    >
-  > {
+  ): Promise<Result<AnalysisProviderSelection, AnalysisError>> {
     const { baseline, signal, target } = context;
     const results = await Promise.all(
       this.#providers.map(
@@ -318,16 +306,17 @@ export class AnalysisProviderRegistry {
         throw new TypeError("Cancelled candidate evaluation disappeared");
       return result.value;
     });
+    const cleanupFailure = evaluations.find(
+      ({ profileError }) => profileError?.cleanupIncomplete === true,
+    )?.profileError;
+    if (cleanupFailure !== undefined) return err(cleanupFailure);
     const statuses = evaluations.map(({ status }) => status);
     const usable = evaluations.filter(
       (
         evaluation,
       ): evaluation is AnalysisProviderCandidateEvaluation & {
         readonly profile: AnalysisProfileCommitment;
-        readonly compatibility: Readonly<Record<string, JsonValue>>;
-      } =>
-        evaluation.profile !== undefined &&
-        evaluation.compatibility !== undefined,
+      } => evaluation.profile !== undefined,
     );
     if (usable.length === 0)
       return ok({
@@ -349,23 +338,29 @@ export class AnalysisProviderRegistry {
 const candidateStatus = (
   provider: AnalysisProviderCandidate,
   target: BinaryTarget | undefined,
-): AnalysisProviderCandidateStatus => ({
-  provider: structuredClone(provider.identity()),
-  availability: cloneAvailability(provider.inspectAvailability()),
-  targetSupport:
-    target === undefined
-      ? {
-          status: "unknown",
-          code: null,
-          reason: "No target is open.",
-          diagnostics: {},
-        }
-      : cloneTargetSupport(provider.inspectTargetSupport(target)),
-  selected: false,
-  capabilities: provider
-    .capabilities()
-    .map((capability) => structuredClone(capability)),
-});
+): AnalysisProviderCandidateStatus => {
+  const readiness = provider.inspectReadinessSnapshot?.() ?? {
+    availability: provider.inspectAvailability(),
+    capabilities: provider.capabilities(),
+  };
+  return {
+    provider: structuredClone(provider.identity()),
+    availability: cloneAvailability(readiness.availability),
+    targetSupport:
+      target === undefined
+        ? {
+            status: "unknown",
+            code: null,
+            reason: "No target is open.",
+            diagnostics: {},
+          }
+        : cloneTargetSupport(provider.inspectTargetSupport(target)),
+    selected: false,
+    capabilities: readiness.capabilities.map((capability) =>
+      structuredClone(capability),
+    ),
+  };
+};
 
 const signalIsAborted = (signal: AbortSignal | undefined): boolean =>
   signal?.aborted === true;
@@ -375,23 +370,28 @@ const selectedResult = (
   source: AnalysisProviderBinding["selectionSource"],
   evaluated: AnalysisProviderCandidateEvaluation & {
     readonly profile: AnalysisProfileCommitment;
-    readonly compatibility: Readonly<Record<string, JsonValue>>;
   },
   statuses: readonly AnalysisProviderCandidateStatus[],
 ): AnalysisProviderSelection => {
+  const identity = evaluated.profile.provider;
+  const capabilities = evaluated.status.capabilities.map((capability) => ({
+    ...capability,
+    provider: structuredClone(identity),
+  }));
   const selectedStatus = {
     ...evaluated.status,
-    provider: structuredClone(evaluated.profile.provider),
+    provider: structuredClone(identity),
     selected: true,
+    capabilities,
   } satisfies AnalysisProviderCandidateStatus;
   return {
     requestedProviderId,
     binding: {
       provider: evaluated.candidate,
-      identity: structuredClone(evaluated.profile.provider),
+      identity: structuredClone(identity),
       selectionSource: source,
       profile: structuredClone(evaluated.profile),
-      compatibility: structuredClone(evaluated.compatibility),
+      capabilities,
     },
     candidates: replaceCandidate(statuses, selectedStatus),
   };

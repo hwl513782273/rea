@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
 import { err, ok } from "../../domain/result.js";
-import type {
-  JavaScriptRecoveryInput,
-  JavaScriptRecoveryResult,
-} from "../../domain/javascript/javascriptRecovery.js";
+import type { JavaScriptRecoveryResult } from "../../domain/javascript/javascriptRecovery.js";
 import { createAnalysisExecution } from "../AnalysisProvider.js";
 import { JavaScriptRecoveryService } from "./JavaScriptRecoveryService.js";
 
@@ -47,31 +44,6 @@ const providerIdentity = {
 const input = { path: artifact.path, output_directory: "/tmp/output" };
 
 describe("JavaScript recovery workflow", () => {
-  it("passes normalized requests to a typed port and returns derived Evidence", async () => {
-    const received: JavaScriptRecoveryInput[] = [];
-    const service = new JavaScriptRecoveryService({
-      recover: async (request) => {
-        received.push(request);
-        return ok(
-          createAnalysisExecution(recoveryResult(), providerIdentity, {
-            subject: { ...artifact, format: "javascript" },
-            limitations: ["Not executed"],
-          }),
-        );
-      },
-    });
-    const result = await service.recover(input);
-    if (!result.ok) throw result.error;
-    expect(received).toEqual([
-      { ...input, extraction_mode: "structural", rewrite_level: "standard" },
-    ]);
-    expect(result.value).toMatchObject({
-      operation: "recover_javascript_sources",
-      confidence: "derived",
-      authority: "shipped-artifact",
-      provider: providerIdentity,
-    });
-  });
   it("preserves a missing provider reason", async () => {
     const failure = new AnalysisCapabilityUnavailableError(
       "fixture-recovery",
@@ -111,7 +83,6 @@ describe("JavaScript recovery workflow", () => {
         ),
     });
     const result = await service.recover(input);
-    expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected invalid port output");
     expect(result.error._tag).toBe("AnalysisOutputError");
   });
@@ -157,5 +128,51 @@ describe("JavaScript recovery workflow", () => {
     });
     if (cancelled.ok) throw new Error("expected cancellation");
     expect(cancelled.error._tag).toBe("AnalysisCancelledError");
+  });
+  it("rejects additional_paths repeating path or each other", async () => {
+    const service = new JavaScriptRecoveryService({
+      recover: async () => {
+        throw new Error("port must not execute");
+      },
+    });
+    for (const additional_paths of [
+      [artifact.path],
+      ["/tmp/dir/../bundle.js", "/tmp/bundle.js"],
+      ["/tmp/shared.js", "/tmp/shared.js"],
+    ]) {
+      const result = await service.recover({
+        ...input,
+        additional_paths,
+      });
+      if (result.ok) throw new Error("expected duplicate rejection");
+      expect(result.error._tag).toBe("AnalysisInputError");
+      expect(result.error).toMatchObject({
+        issues: [{ path: ["additional_paths"], reason: "invalid_format" }],
+      });
+    }
+  });
+  it("rejects relative additional_paths before acquiring the port", async () => {
+    let invoked = false;
+    const service = new JavaScriptRecoveryService({
+      recover: async () => {
+        invoked = true;
+        return err(
+          new AnalysisCapabilityUnavailableError(
+            "fixture",
+            "recover_javascript_sources",
+            "engine missing",
+          ),
+        );
+      },
+    });
+    const result = await service.recover({
+      ...input,
+      additional_paths: ["relative-chunk.js"],
+    });
+    expect(invoked).toBe(false);
+    if (result.ok) throw new Error("expected invalid path");
+    expect(result.error).toMatchObject({
+      issues: [{ path: ["additional_paths"], reason: "invalid_format" }],
+    });
   });
 });

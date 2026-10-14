@@ -3,7 +3,7 @@ import { enhancedInputSchemas } from "./enhancedInputs.js";
 import { TOOL_EXAMPLE_OVERRIDES } from "./toolContractExamples.js";
 import type { ToolContract } from "./toolContractTypes.js";
 import { toolContractMetadata } from "./toolEffects.js";
-import { enhancedOutputSchemas } from "./toolOutputSchemas.js";
+import { enhancedOutputSchemas } from "./toolOutputSchemaGroups.js";
 import { requireOutputSchema } from "./toolOutputSchemaPrimitives.js";
 
 type FunctionWorkflowName = "analyze_function" | "inspect_native_api";
@@ -36,7 +36,7 @@ const functionWorkflow = <Name extends FunctionWorkflowName>(
 export const FUNCTION_WORKFLOW_TOOL_CONTRACTS = [
   functionWorkflow(
     "analyze_function",
-    "Build a dossier for one native function identified by symbol or provider-returned address. Returns identity with complete inclusive body ranges or explicit unknown, provider-specific pseudocode and assembly, comments, calls, references, referenced strings/names, local CFG blocks, and available native API boundary observations.",
+    "Build a dossier for one native function identified by symbol or provider-returned address. Returns identity with complete inclusive analyzed body ranges or explicit unknown, provider-specific pseudocode and assembly, comments, calls, references, referenced strings/names, local CFG blocks, and available native API boundary observations. Ghidra terminal-call assumptions that may cut the analyzed body are reported in limitations with available callee identities.",
   ),
   functionWorkflow(
     "inspect_native_api",

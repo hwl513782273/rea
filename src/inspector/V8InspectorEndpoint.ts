@@ -5,7 +5,8 @@ import type {
   JavaScriptRuntimeTargetLocation,
 } from "../domain/javascript/javascriptRuntimeObservation.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import { urlDeclaresQueryOrFragment } from "../domain/urlComponents.js";
 import { parseCdpEndpointValue, readCdpJson } from "../browser/CdpEndpoint.js";
 
 const versionSchema = z
@@ -21,8 +22,11 @@ const targetSchema = z
     id: z.string().min(1),
     type: z.string().min(1),
     url: z.string(),
-    attached: z.boolean().default(false),
-    webSocketDebuggerUrl: z.string().min(1),
+    attached: z.boolean().nullable().optional(),
+    // Node may publish anonymous/evaluated targets without a direct socket.
+    // Keep malformed values local to their target so one row cannot discard
+    // otherwise usable siblings from the endpoint inventory.
+    webSocketDebuggerUrl: z.unknown().optional(),
   })
   .passthrough();
 const targetsSchema = z.array(targetSchema);
@@ -31,8 +35,8 @@ export interface V8InspectorTarget {
   readonly id: string;
   readonly type: string;
   readonly url: string;
-  readonly attached: boolean;
-  readonly webSocketUrl: string;
+  readonly attached: boolean | null;
+  readonly webSocketUrl: string | null;
 }
 
 export interface V8InspectorDiscovery {
@@ -62,12 +66,11 @@ export const discoverV8Inspector = async (
       id: target.id,
       type: target.type,
       url: target.url,
-      attached: target.attached,
+      attached: target.attached ?? null,
       webSocketUrl: validatedInspectorWebSocket(
         endpoint,
         target.id,
         target.webSocketDebuggerUrl,
-        operation,
       ),
     })),
   };
@@ -76,16 +79,14 @@ export const discoverV8Inspector = async (
 const validatedInspectorWebSocket = (
   endpoint: string,
   targetId: string,
-  reported: string,
-  operation: BrowserObservationOperation,
-): string => {
+  reported: unknown,
+): string | null => {
+  if (typeof reported !== "string" || reported.length === 0) return null;
   let socket: URL;
   try {
     socket = new URL(reported);
-  } catch (cause: unknown) {
-    throw new BrowserObservationError(operation, "invalid_endpoint_response", {
-      cause,
-    });
+  } catch {
+    return null;
   }
   const trusted = new URL(endpoint);
   const allowedPaths = new Set([
@@ -98,16 +99,19 @@ const validatedInspectorWebSocket = (
     socket.port !== trusted.port ||
     socket.username !== "" ||
     socket.password !== "" ||
-    socket.search !== "" ||
-    socket.hash !== "" ||
+    urlDeclaresQueryOrFragment(socket) ||
     !allowedPaths.has(socket.pathname)
   )
-    throw new BrowserObservationError(operation, "invalid_endpoint_response");
+    return null;
   socket.hostname = trusted.hostname;
   return socket.href;
 };
 
 /** Authorized target plus its durable location. */
-export interface AuthorizedV8InspectorTarget extends V8InspectorTarget {
+export interface AuthorizedV8InspectorTarget extends Omit<
+  V8InspectorTarget,
+  "webSocketUrl"
+> {
+  readonly webSocketUrl: string;
   readonly location: JavaScriptRuntimeTargetLocation;
 }

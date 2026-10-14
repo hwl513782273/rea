@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
 import { registerTraceFeatureTool } from "./registerApplicationTools/traceFeature.js";
 import { registerTraceJavaScriptSemanticsTool } from "./registerApplicationTools/traceSemantics.js";
@@ -10,11 +10,9 @@ import { registerReconstructionObligationLedgerTool } from "./registerApplicatio
 import { registerProjectMobileApplicationGraphTools } from "./registerApplicationTools/projectMobileApplicationGraph.js";
 import type { ApplicationToolRegistration } from "./registerApplicationTools/types.js";
 
-export type { ApplicationToolRegistration };
-
 /** Register provider-neutral JavaScript application graph workflows. */
 export const registerApplicationTools = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   options: ApplicationToolRegistration,
 ): void => {
   registerTraceFeatureTool(server, options);

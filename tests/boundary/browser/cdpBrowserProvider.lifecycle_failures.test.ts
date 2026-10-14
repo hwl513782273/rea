@@ -1,19 +1,50 @@
-import { expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
 import {
   inspectWebPageInputSchema,
   listBrowserTargetsInputSchema,
 } from "../../../src/domain/browserObservation.js";
+import { AnalysisInputError } from "../../../src/domain/analysisErrorCore.js";
 import { analyzeWebBundleInputSchema } from "../../../src/domain/webBundleAnalysis.js";
 import { observeWebSessionInputSchema } from "../../../src/domain/browserSession.js";
 import {
   startFakeCdpBrowser,
   type FakeCdpBrowser,
 } from "../../fixtures/fakeCdpBrowser.js";
-import { describeBrowser, trackBrowser } from "./cdpBrowserProvider.support.js";
+import { trackBrowser } from "./cdpBrowserProvider.support.js";
 
-describeBrowser("CdpBrowserProvider: lifecycle failures 1", () => {
+describe("CdpBrowserProvider: cancellation and session events", () => {
+  it("honors cancellation during the final progress callback before publishing inspection", async () => {
+    const browser = await startFakeCdpBrowser();
+    trackBrowser(browser);
+    const controller = new AbortController();
+    const result = await new CdpBrowserProvider().inspectPage(
+      inspectWebPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        allowed_origins: [browser.allowedOrigin],
+        target_id: "allowed-page",
+        observation_ms: 0,
+      }),
+      {
+        signal: controller.signal,
+        progress: {
+          report(update) {
+            if (update.completed === 3) controller.abort();
+            return Promise.resolve();
+          },
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisCancelledError",
+        operation: "inspect_web_page",
+      },
+    });
+  });
+
   it("projects direct-session cancellation onto the requested operation", async () => {
     const browser = await startFakeCdpBrowser({
       pageScopedVersionWebSocket: true,
@@ -132,7 +163,7 @@ describeBrowser("CdpBrowserProvider: lifecycle failures 1", () => {
   });
 });
 
-describeBrowser("CdpBrowserProvider: lifecycle failures 2", () => {
+describe("CdpBrowserProvider: session termination and scope changes", () => {
   it("ends a browser session when its flat target session detaches", async () => {
     const browser = await startFakeCdpBrowser({
       sessionTimeline: "target_detached",
@@ -243,7 +274,7 @@ describeBrowser("CdpBrowserProvider: lifecycle failures 2", () => {
   });
 });
 
-describeBrowser("CdpBrowserProvider: lifecycle failures 3", () => {
+describe("CdpBrowserProvider: protocol failures and cancellation cleanup", () => {
   it("degrades optional domains but propagates protocol and payload failures", async () => {
     const optional = await startFakeCdpBrowser({
       unsupportedMethods: ["Accessibility.getFullAXTree"],
@@ -268,6 +299,32 @@ describeBrowser("CdpBrowserProvider: lifecycle failures 3", () => {
     expect(degraded.value.limitations).toContain(
       "Accessibility.getFullAXTree was unavailable from this browser target.",
     );
+
+    const invalidAccessibilityParams = await startFakeCdpBrowser({
+      commandError: (command) =>
+        command.method === "Accessibility.getFullAXTree"
+          ? { code: -32_602, message: "Invalid params" }
+          : undefined,
+    });
+    trackBrowser(invalidAccessibilityParams);
+    const invalidParamsResult = await new CdpBrowserProvider().inspectPage(
+      inspectWebPageInputSchema.parse({
+        cdp_endpoint: invalidAccessibilityParams.endpoint,
+        allowed_origins: [invalidAccessibilityParams.allowedOrigin],
+        target_id: "allowed-page",
+        observation_ms: 0,
+      }),
+    );
+    expect(invalidParamsResult).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "BrowserObservationError",
+        reason: "protocol_error",
+        command: "Accessibility.getFullAXTree",
+        code: -32_602,
+        reportedMessage: "Invalid params",
+      },
+    });
 
     for (const [options, reason] of [
       [{ oversizedDiscovery: true }, "invalid_endpoint_response"],
@@ -373,7 +430,7 @@ describeBrowser("CdpBrowserProvider: lifecycle failures 3", () => {
   });
 });
 
-describeBrowser("CdpBrowserProvider: lifecycle failures 4", () => {
+describe("CdpBrowserProvider: navigation commit and target identity", () => {
   it("waits for navigation commit and rechecks the attached main-frame origin", async () => {
     const transitioning = await startFakeCdpBrowser({
       transitionalFrameReads: 2,
@@ -455,6 +512,71 @@ describeBrowser("CdpBrowserProvider: lifecycle failures 4", () => {
       ok: false,
       error: { _tag: "BrowserObservationError", reason: "target_not_allowed" },
     });
+  });
+});
+
+describe("CdpBrowserProvider: source-map cancellation", () => {
+  it("classifies an AnalysisError abort reason as cancellation", async () => {
+    const browser = await startFakeCdpBrowser({
+      sourceMapBody: JSON.stringify({
+        version: 3,
+        sources: ["app.ts"],
+        names: [],
+        mappings: "",
+      }),
+    });
+    trackBrowser(browser);
+    const controller = new AbortController();
+    const reason = new AnalysisInputError("caller_operation");
+    let markSourceMapRequested!: () => void;
+    const sourceMapRequested = new Promise<void>((resolve) => {
+      markSourceMapRequested = resolve;
+    });
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((resource, init) => {
+        if (String(resource).includes("/app.js.map")) {
+          markSourceMapRequested();
+          return new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted === true) {
+              reject(signal.reason);
+              return;
+            }
+            signal?.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            });
+          });
+        }
+        return originalFetch(resource, init);
+      });
+    try {
+      const pending = new CdpBrowserProvider().analyzeBundle(
+        analyzeWebBundleInputSchema.parse({
+          cdp_endpoint: browser.endpoint,
+          allowed_origins: [browser.allowedOrigin],
+          target_id: "allowed-page",
+          observation_ms: 0,
+          fetch_source_maps: true,
+        }),
+        { signal: controller.signal },
+      );
+      await sourceMapRequested;
+      controller.abort(reason);
+      const result = await pending;
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          _tag: "AnalysisCancelledError",
+          operation: "analyze_web_bundle",
+        },
+      });
+      if (result.ok) throw new Error("Expected source-map cancellation");
+      expect(result.error.cause).toBe(reason);
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });
 

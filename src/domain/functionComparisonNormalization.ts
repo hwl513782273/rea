@@ -1,16 +1,13 @@
 import { canonicalJson } from "./comparisonSemantics.js";
-import { compareCodePoints } from "./canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 
-import type {
-  FunctionCollection,
-  FunctionSnapshot,
-} from "./functionDossierEvidence.js";
+import type { FunctionSnapshot } from "./functionDossierEvidence.js";
 import type { FunctionComparisonResult } from "./functionComparisonSchemas.js";
 
 export const identityProjection = (snapshot: FunctionSnapshot) => ({
-  name: snapshot.procedure.name,
-  signature: snapshot.procedure.signature,
-  locals: snapshot.procedure.locals
+  name: snapshot.dossier.procedure.name,
+  signature: snapshot.dossier.procedure.signature,
+  locals: snapshot.dossier.procedure.locals
     .map(({ description }) => description)
     .sort(),
 });
@@ -19,27 +16,26 @@ export const functionMatch = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
 ): FunctionComparisonResult["function_match"] => {
-  if (
-    !isAutoName(left.procedure.name) &&
-    left.procedure.name === right.procedure.name
-  )
+  const leftName = left.dossier.procedure.name;
+  const rightName = right.dossier.procedure.name;
+  const stableNames = !isAutoName(leftName) && !isAutoName(rightName);
+  if (stableNames && leftName === rightName)
     return {
       status: "matched",
       method: "symbol",
-      left_name: left.procedure.name,
-      right_name: right.procedure.name,
+      left_name: leftName,
+      right_name: rightName,
     };
   return {
-    status:
-      left.procedure.name === right.procedure.name ? "ambiguous" : "mismatched",
+    status: stableNames ? "mismatched" : "ambiguous",
     method: "explicit",
-    left_name: left.procedure.name,
-    right_name: right.procedure.name,
+    left_name: leftName,
+    right_name: rightName,
   };
 };
 
 export const normalizeCfg = (
-  blocks: FunctionSnapshot["collections"]["basic_blocks"]["items"],
+  blocks: FunctionSnapshot["dossier"]["basic_blocks"],
 ): readonly unknown[] | null => {
   const parsed: {
     block: (typeof blocks)[number];
@@ -78,12 +74,12 @@ export const normalizeCfg = (
 
 export const referenceProjection = (snapshot: FunctionSnapshot) =>
   sorted([
-    ...snapshot.collections.incoming_references.items.map((item) => ({
+    ...snapshot.dossier.incoming_references.map((item) => ({
       direction: "in",
       source: item.source_procedure?.name ?? null,
       target: item.target_procedure?.name ?? null,
     })),
-    ...snapshot.collections.outgoing_references.items.map((item) => ({
+    ...snapshot.dossier.outgoing_references.map((item) => ({
       direction: "out",
       source: item.source_procedure?.name ?? null,
       target: item.target_procedure?.name ?? null,
@@ -94,11 +90,11 @@ export const referenceKindProjection = (
   snapshot: FunctionSnapshot,
 ): readonly unknown[] | null => {
   const edges = [
-    ...snapshot.collections.incoming_references.items.map((edge) => ({
+    ...snapshot.dossier.incoming_references.map((edge) => ({
       direction: "in",
       edge,
     })),
-    ...snapshot.collections.outgoing_references.items.map((edge) => ({
+    ...snapshot.dossier.outgoing_references.map((edge) => ({
       direction: "out",
       edge,
     })),
@@ -136,38 +132,57 @@ export const referenceKindProjection = (
 export const commentProjection = (
   snapshot: FunctionSnapshot,
 ): readonly unknown[] | null => {
-  const values = snapshot.collections.comments.items.map(
-    ({ address, kind, text }) => ({
-      offset: relativeAddress(address, snapshot.procedure.address),
-      kind,
-      text,
-    }),
-  );
+  const values = snapshot.dossier.comments.map(({ address, kind, text }) => ({
+    offset: relativeAddress(address, snapshot.dossier.procedure.address),
+    kind,
+    text,
+  }));
   return values.some(({ offset }) => offset === null) ? null : sorted(values);
 };
 
 export const stringAndNameProjection = (
   snapshot: FunctionSnapshot,
+  includeSwiftLiterals = true,
 ): readonly unknown[] | null => {
   const values = [
-    ...snapshot.collections.referenced_strings.items.map(
+    ...snapshot.dossier.referenced_strings.map(
       ({ source_address: sourceAddress, value }) => ({
         kind: "string",
         source_offset: relativeAddress(
           sourceAddress,
-          snapshot.procedure.address,
+          snapshot.dossier.procedure.address,
         ),
         value,
       }),
     ),
-    ...snapshot.collections.referenced_names.items.map(
+    ...snapshot.dossier.referenced_names.map(
       ({ source_address: sourceAddress, value }) => ({
         kind: "name",
         source_offset: relativeAddress(
           sourceAddress,
-          snapshot.procedure.address,
+          snapshot.dossier.procedure.address,
         ),
         value,
+      }),
+    ),
+    ...(includeSwiftLiterals
+      ? (snapshot.dossier.swift_string_literals ?? [])
+      : []
+    ).map(
+      ({
+        source_address: sourceAddress,
+        value,
+        representation,
+        registers,
+      }) => ({
+        kind: "swift_string",
+        source_offset: relativeAddress(
+          sourceAddress,
+          snapshot.dossier.procedure.address,
+        ),
+        value,
+        representation,
+        registers,
       }),
     ),
   ];
@@ -176,40 +191,76 @@ export const stringAndNameProjection = (
     : sorted(values);
 };
 
+/**
+ * A retained literal proves presence, not that every path through its site was examined.
+ * A differing retained fact proves a change only when the opposite dossier is complete
+ * and therefore establishes its absence.
+ */
+export const swiftLiteralSitesConflict = (
+  left: FunctionSnapshot,
+  right: FunctionSnapshot,
+): boolean => {
+  const leftSites = swiftLiteralSites(left);
+  const rightSites = swiftLiteralSites(right);
+  for (const site of new Set([
+    ...leftSites.values.keys(),
+    ...rightSites.values.keys(),
+  ])) {
+    const leftValues =
+      leftSites.values.get(site) ?? (leftSites.complete ? [] : undefined);
+    const rightValues =
+      rightSites.values.get(site) ?? (rightSites.complete ? [] : undefined);
+    if (leftValues === undefined || rightValues === undefined) continue;
+    const leftFacts = new Set(leftValues);
+    const rightFacts = new Set(rightValues);
+    if (
+      (rightSites.complete &&
+        leftValues.some((value) => !rightFacts.has(value))) ||
+      (leftSites.complete && rightValues.some((value) => !leftFacts.has(value)))
+    )
+      return true;
+  }
+  return false;
+};
+
+const swiftLiteralSites = (snapshot: FunctionSnapshot) => {
+  const base = snapshot.dossier.procedure.address;
+  const omissions = snapshot.dossier.swift_string_literal_omissions ?? [];
+  const site = (sourceAddress: string, registers: readonly string[]) => {
+    const offset = relativeAddress(sourceAddress, base);
+    return offset === null ? null : canonicalJson([offset, registers]);
+  };
+  // Keep the same literal facts the full strings_names projection compares.
+  const values = new Map<string, string[]>();
+  for (const literal of snapshot.dossier.swift_string_literals ?? []) {
+    const key = site(literal.source_address, literal.registers);
+    if (key === null) continue;
+    values.set(
+      key,
+      [
+        ...(values.get(key) ?? []),
+        canonicalJson([literal.value, literal.representation]),
+      ].sort(compareUnicodeCodePoints),
+    );
+  }
+  const complete =
+    snapshot.dossier.swift_string_literals !== undefined &&
+    omissions.length === 0;
+  return { values, complete };
+};
+
 export const sorted = (values: readonly unknown[]): readonly unknown[] =>
   values
     .map((value) => ({
       value,
       json: canonicalJson(value, "Function normalization"),
     }))
-    .sort((left, right) => {
-      // Preserve existing collation while ordering distinct values within a tie.
-      return (
-        left.json.localeCompare(right.json) ||
-        compareCodePoints(left.json, right.json)
-      );
-    })
+    .sort((left, right) => compareUnicodeCodePoints(left.json, right.json))
     .map(({ value }) => value);
 
-export const combineCoverage = <Item>(
-  left: FunctionCollection<Item>,
-  right: FunctionCollection<Item>,
-): FunctionCollection<Item> => {
-  return {
-    items: [...left.items, ...right.items],
-    total: left.total + right.total,
-    complete: true,
-    truncated: false,
-  };
-};
-
-export const project = <Input, Output>(
-  collection: FunctionCollection<Input>,
-  mapper: (item: Input) => Output,
-): Output[] => collection.items.map(mapper);
-
+/** Recognize address-derived procedure names without excluding named FUN_ symbols. */
 export const isAutoName = (name: string): boolean =>
-  /^(?:sub_[0-9a-f]+|fcn\.[0-9a-f]+)$/iu.test(name);
+  /^(?:sub_[0-9a-f]+|fcn\.[0-9a-f]+|FUN_[0-9a-f]+)$/iu.test(name);
 
 const parseAddress = (value: string): bigint | null =>
   /^0x[0-9a-f]+$/iu.test(value) ? BigInt(value) : null;

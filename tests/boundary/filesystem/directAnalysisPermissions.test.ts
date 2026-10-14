@@ -3,10 +3,11 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { withArtifactResourceScope } from "../../fixtures/artifactInventory.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 import { writeAnalysisSnapshot } from "../../../src/application/binary/AnalysisSnapshotFiles.js";
-import { runDirectAnalysis } from "../../../src/composition/directAnalysis.js";
+import { createDirectAnalysis } from "../../../src/composition/directAnalysis.js";
 import type { AnalysisSnapshot } from "../../../src/domain/analysisSnapshot.js";
 import {
   snapshotBinding,
@@ -19,7 +20,7 @@ import {
   REA_WORKFLOW_PROVIDER,
   workflowAnalysisProfile,
 } from "../../../src/application/InvestigationProviders.js";
-import { HOPPER_PROVIDER_IDENTITY } from "../../../src/hopper/HopperProvider.js";
+import { HOPPER_PROVIDER_IDENTITY } from "../../../src/hopper/HopperProviderCapabilities.js";
 import { resolveHopperAnalysisProfile } from "../../../src/hopper/HopperAnalysisProfile.js";
 
 afterEach(async () => {
@@ -35,7 +36,7 @@ describe("direct analysis snapshot files", () => {
     vi.stubEnv("REA_ANALYSIS_PROVIDER", "environment-provider");
 
     await expect(
-      runDirectAnalysis(
+      createDirectAnalysis(process.env).runDirectAnalysis(
         targetPath,
         "binary_overview",
         {},
@@ -54,7 +55,7 @@ describe("direct analysis snapshot files", () => {
     });
   });
 
-  it("replays a cache hit from the supplied path without root configuration", async () => {
+  it("does not replay unbound historical Evidence from a supplied snapshot", async () => {
     const directory = await createTestTempDirectory("rea-direct-snapshot-");
     const snapshotPath = join(directory, "analysis.json");
     const launcherPath = join(directory, "hopper-launcher");
@@ -81,15 +82,17 @@ describe("direct analysis snapshot files", () => {
       target: snapshotTarget(target.value),
       binding: snapshotBinding(profile),
       entries: [],
+      workflow_entries: [],
       evidence_bundle: createEvidenceBundle([evidence]),
     };
-    expect(
-      (await writeAnalysisSnapshot(snapshot, snapshotPath, false)).ok,
-    ).toBe(true);
+    const written = await withArtifactResourceScope((resources) =>
+      writeAnalysisSnapshot(snapshot, snapshotPath, false, resources),
+    );
+    if (!written.ok) throw written.error;
     vi.stubEnv("HOPPER_LAUNCHER_PATH", launcherPath);
 
     await expect(
-      runDirectAnalysis(
+      createDirectAnalysis(process.env).runDirectAnalysis(
         process.execPath,
         "binary_overview",
         {},
@@ -97,6 +100,6 @@ describe("direct analysis snapshot files", () => {
           snapshotPath,
         },
       ),
-    ).resolves.toEqual(evidence);
+    ).resolves.not.toEqual(evidence);
   });
 });

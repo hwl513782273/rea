@@ -9,7 +9,6 @@ import {
   type AnalysisOperationPort,
 } from "./AnalysisProvider.js";
 import {
-  AnalysisCapabilityUnavailableError,
   AnalysisCancelledError,
   AnalysisOutputError,
   AnalysisProtocolError,
@@ -19,6 +18,35 @@ import { err, ok } from "../domain/result.js";
 const provider = { id: "fixture", name: "Fixture", version: "1" };
 
 describe("analysis context queries: navigation", () => {
+  it.each([
+    [null, "0x401000", "current_document"],
+    ["fixture", null, "current_address"],
+  ] as const)(
+    "rejects malformed %s / %s provider selection before returning success",
+    async (document, address, operation) => {
+      const analysis: AnalysisOperationPort = {
+        execute: async (name) =>
+          ok(
+            createAnalysisExecution(
+              name === "current_document" ? document : address,
+              provider,
+            ),
+          ),
+      };
+      const result = await getNavigationContext(analysis, {});
+      expect(result).toEqual(
+        err(
+          new AnalysisOutputError(
+            operation,
+            operation === "current_document"
+              ? "expected a document identity string"
+              : "expected an address string",
+          ),
+        ),
+      );
+    },
+  );
+
   it("aggregates volatile navigation and treats a missing procedure as null", async () => {
     const calls: {
       operation: string;
@@ -72,6 +100,23 @@ describe("analysis context queries: navigation", () => {
     });
   });
 
+  it("preserves empty string selections accepted by the output contract", async () => {
+    const analysis: AnalysisOperationPort = {
+      execute: async (operation) =>
+        ok(
+          createAnalysisExecution(
+            operation === "resolve_containing_procedure"
+              ? { found: false, procedure: null, reason: "not_in_procedure" }
+              : "",
+            provider,
+          ),
+        ),
+    };
+    await expect(getNavigationContext(analysis, {})).resolves.toEqual(
+      ok({ document: "", address: "", procedure: null }),
+    );
+  });
+
   it("uses an explicit document without passing it to current_document and preserves procedure failures", async () => {
     const calls: string[] = [];
     const failure = new AnalysisProtocolError("provider response malformed");
@@ -91,111 +136,6 @@ describe("analysis context queries: navigation", () => {
     ).resolves.toEqual(err(failure));
     expect(calls).not.toContain("current_document");
     expect(calls).toContain("resolve_containing_procedure");
-  });
-});
-
-describe("analysis context queries: headless document resolution", () => {
-  it("resolves a sole headless document when current-document selection is unavailable", async () => {
-    const calls: string[] = [];
-    const analysis: AnalysisOperationPort = {
-      execute: (operation) => {
-        calls.push(operation);
-        if (operation === "current_document")
-          return Promise.resolve(
-            err(
-              new AnalysisCapabilityUnavailableError(
-                "ghidra",
-                operation,
-                "headless sessions have no cursor-selected document",
-              ),
-            ),
-          );
-        if (operation === "list_documents")
-          return Promise.resolve(
-            ok(createAnalysisExecution(["fixture"], provider)),
-          );
-        if (operation === "resolve_containing_procedure")
-          return Promise.resolve(
-            ok(
-              createAnalysisExecution(
-                {
-                  query_address: "0x401000",
-                  found: false,
-                  procedure: null,
-                  reason: "not_in_procedure",
-                },
-                provider,
-              ),
-            ),
-          );
-        return Promise.resolve(
-          err(
-            new AnalysisCapabilityUnavailableError(
-              "ghidra",
-              operation,
-              "unsupported",
-            ),
-          ),
-        );
-      },
-    };
-
-    await expect(
-      inspectAddressContext(analysis, { address: "0x401000" }),
-    ).resolves.toMatchObject({
-      ok: true,
-      value: {
-        document: "fixture",
-        name: { state: "unavailable" },
-        procedure: { state: "available" },
-        comment: { state: "unavailable" },
-        inline_comment: { state: "unavailable" },
-        bookmarks: { state: "unavailable" },
-      },
-    });
-    expect(calls.slice(0, 2)).toEqual(["current_document", "list_documents"]);
-  });
-
-  it("does not use list-documents fallback for non-capability document errors", async () => {
-    const failure = new AnalysisProtocolError(
-      "current-document response malformed",
-    );
-    const calls: string[] = [];
-    const analysis: AnalysisOperationPort = {
-      execute: (operation) => {
-        calls.push(operation);
-        return Promise.resolve(err(failure));
-      },
-    };
-
-    await expect(
-      inspectAddressContext(analysis, { address: "0x401000" }),
-    ).resolves.toEqual(err(failure));
-    expect(calls).toEqual(["current_document"]);
-  });
-
-  it("requires exactly one listed document for a headless fallback", async () => {
-    const analysis: AnalysisOperationPort = {
-      execute: (operation) =>
-        Promise.resolve(
-          operation === "current_document"
-            ? err(
-                new AnalysisCapabilityUnavailableError(
-                  "ghidra",
-                  operation,
-                  "no selected document",
-                ),
-              )
-            : ok(createAnalysisExecution(["one", "two"], provider)),
-        ),
-    };
-
-    await expect(
-      inspectAddressContext(analysis, { address: "0x401000" }),
-    ).resolves.toMatchObject({
-      ok: false,
-      error: expect.any(AnalysisOutputError),
-    });
   });
 });
 

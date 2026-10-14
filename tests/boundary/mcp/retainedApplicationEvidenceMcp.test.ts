@@ -1,3 +1,4 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, expect, it } from "vitest";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -6,9 +7,9 @@ import { createServer } from "../../../src/server/createServer.js";
 import {
   JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
   JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE,
-  JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE,
   SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
 } from "../../../src/contracts/javascript/javascriptApplicationWorkflowExamples.js";
+import { JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE } from "../../../src/contracts/javascript/javascriptExportShapeComparisonExample.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 
 const resources: Array<{ close(): Promise<unknown> }> = [];
@@ -21,12 +22,13 @@ const retained = (evidence_id: string) => ({
 });
 const application = JAVASCRIPT_FEATURE_TRACE_EXAMPLE.application;
 const pair = JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE;
+const exportPair = JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE;
 
 async function connect() {
   const session = createTestBinarySession(() => {
     throw new Error("references must not launch a provider");
   });
-  const server = createServer(session, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "retained-evidence-test", version: "1" });
   resources.push(client, server, session);
   const [a, b] = InMemoryTransport.createLinkedPair();
@@ -35,10 +37,40 @@ async function connect() {
   return { client, session };
 }
 
+it("advertises the primitive literal seeds accepted by semantic tracing", async () => {
+  const { client } = await connect();
+  const { tools } = await client.listTools();
+  const tool = tools.find(({ name }) => name === "trace_javascript_semantics");
+  if (tool === undefined) throw new Error("Semantic trace tool is missing");
+  const validate = new Ajv2020({
+    strict: false,
+    validateFormats: false,
+  }).compile(tool.inputSchema);
+  for (const value of ["literal", 42, true, null, {}, []]) {
+    const primitive = value === null || typeof value !== "object";
+    const arguments_ = {
+      application,
+      query: {
+        seed: { kind: "literal", value },
+        direction: "backward-provenance",
+      },
+    };
+    expect(validate(arguments_), JSON.stringify(value)).toBe(primitive);
+    const result = await client.callTool({
+      name: tool.name,
+      arguments: arguments_,
+    });
+    if (primitive) expect(result.isError).not.toBe(true);
+    else expect(result.isError).toBe(true);
+  }
+});
+
 it("runs the same trace/compare workflows with inline and retained application Evidence", async () => {
   const { client, session } = await connect();
   expect(session.recordEvidence(pair.left).ok).toBe(true);
   expect(session.recordEvidence(pair.right).ok).toBe(true);
+  expect(session.recordEvidence(exportPair.left).ok).toBe(true);
+  expect(session.recordEvidence(exportPair.right).ok).toBe(true);
   const scenarios = [
     {
       name: "trace_application_feature",
@@ -61,8 +93,8 @@ it("runs the same trace/compare workflows with inline and retained application E
       inline: JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE,
       refs: {
         ...JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE,
-        left: retained(pair.left.evidence_id),
-        right: retained(pair.right.evidence_id),
+        left: retained(exportPair.left.evidence_id),
+        right: retained(exportPair.right.evidence_id),
       },
     },
     {
@@ -133,15 +165,12 @@ it("keeps references session-scoped and expires them when close_binary clears th
     },
   };
   const foreign = await second.client.callTool(request);
-  expect(foreign).toMatchObject({
-    isError: true,
-    structuredContent: {
-      error: {
-        details: {
-          evidence_id: application.evidence_id,
-          reason: "missing",
-          actual: null,
-        },
+  expect(parseMcpToolError(foreign)).toMatchObject({
+    error: {
+      details: {
+        evidence_id: application.evidence_id,
+        reason: "missing",
+        actual: null,
       },
     },
   });
@@ -153,10 +182,9 @@ it("keeps references session-scoped and expires them when close_binary clears th
     arguments: {},
   });
   expect(closed.isError).not.toBe(true);
-  expect(await first.client.callTool(request)).toMatchObject({
-    isError: true,
-    structuredContent: { error: { details: { reason: "missing" } } },
-  });
+  expect(parseMcpToolError(await first.client.callTool(request))).toMatchObject(
+    { error: { details: { reason: "missing" } } },
+  );
   for (const harness of [first, second]) {
     const portable = await harness.client.callTool({
       name: "trace_application_feature",
@@ -196,12 +224,25 @@ it("preserves validation for the referenced record's operation, predicate, and s
         application: retained(record.evidence_id),
       },
     });
-    expect(response).toMatchObject({
-      isError: true,
-      structuredContent: {
-        error: { code: "invalid_request", category: "invalid_input" },
+    expect(parseMcpToolError(response)).toMatchObject({
+      error: { code: "invalid_request", category: "invalid_input" },
+    });
+  }
+  for (const reference of [
+    { evidence_id: application.evidence_id },
+    { ...retained(application.evidence_id), kind: "another-session" },
+    retained("ev_short"),
+    { ...retained(application.evidence_id), session_id: "foreign" },
+    { ...retained(application.evidence_id), normalized_result: {} },
+  ]) {
+    const rejected = await client.callTool({
+      name: "trace_application_feature",
+      arguments: {
+        ...JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
+        application: reference,
       },
     });
+    expect(rejected.isError).toBe(true);
   }
   const tampered = {
     ...application,
@@ -214,4 +255,28 @@ it("preserves validation for the referenced record's operation, predicate, and s
     arguments: { ...JAVASCRIPT_FEATURE_TRACE_EXAMPLE, application: tampered },
   });
   expect(response.isError).toBe(true);
+});
+
+it("projects a retained JavaScript summary without graph or semantic_graph", async () => {
+  const { client, session } = await connect();
+  expect(session.recordEvidence(application).ok).toBe(true);
+  const inline = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: {
+      source: { kind: "inline", evidence: application },
+      view: { kind: "summary" },
+    },
+  });
+  const referenced = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: {
+      source: retained(application.evidence_id),
+      view: { kind: "summary" },
+    },
+  });
+  expect(inline.isError).not.toBe(true);
+  expect(referenced.structuredContent).toEqual(inline.structuredContent);
+  expect(inline.structuredContent).not.toHaveProperty(
+    "normalized_result.summary.semantic_graph",
+  );
 });

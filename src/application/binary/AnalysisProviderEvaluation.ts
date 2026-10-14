@@ -2,20 +2,24 @@ import {
   analysisProfileSchema,
   type AnalysisProfileCommitment,
 } from "../../domain/analysisProfile.js";
-import type { BinaryTarget } from "../../domain/binaryTarget.js";
-import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
+import {
+  AnalysisCancelledError,
+  AnalysisUnsupportedTargetError,
+} from "../../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { jsonObjectSchema, type JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { AnalysisProviderCandidate } from "../AnalysisProvider.js";
 import type { AnalysisProviderCandidateStatus } from "./AnalysisProviderRegistry.js";
-import { ABORTED, waitForAbortable } from "./AbortablePromise.js";
+import { ABORTED, waitForAbortable } from "../../process/AbortablePromise.js";
 
 /** Profile-resolution truth for one discovered provider candidate. */
 export interface AnalysisProviderCandidateEvaluation {
   readonly candidate: AnalysisProviderCandidate;
   readonly status: AnalysisProviderCandidateStatus;
   readonly profile?: AnalysisProfileCommitment;
-  readonly compatibility?: Readonly<Record<string, JsonValue>>;
+  readonly profileError?: AnalysisError;
 }
 
 /** Resolve and validate one provider profile without starting its client. */
@@ -51,12 +55,27 @@ export const evaluateAnalysisProviderCandidate = async (
     return err(new AnalysisCancelledError("open_binary"));
   if (!resolved.ok && resolved.error instanceof AnalysisCancelledError)
     return err(resolved.error);
-  if (!resolved.ok)
-    return ok(
-      rejectedProfile(candidate, status, resolved.error.message, {
-        error_tag: resolved.error._tag,
-      }),
-    );
+  if (!resolved.ok) {
+    const error = resolved.error;
+    const rejection =
+      error instanceof AnalysisUnsupportedTargetError
+        ? {
+            candidate,
+            status: {
+              ...status,
+              targetSupport: {
+                status: "unsupported" as const,
+                code: "target_format_unsupported" as const,
+                reason: error.reason,
+                diagnostics: { path: error.path, error_tag: error._tag },
+              },
+            },
+          }
+        : rejectedProfile(candidate, status, error.message, {
+            error_tag: error._tag,
+          });
+    return ok({ ...rejection, profileError: error });
+  }
   try {
     if (resolved.value.profile === null)
       return ok(
@@ -67,7 +86,6 @@ export const evaluateAnalysisProviderCandidate = async (
         ),
       );
     const profile = analysisProfileSchema.parse(resolved.value.profile);
-    const compatibility = jsonObjectSchema.parse(resolved.value.compatibility);
     const identity = candidate.identity();
     if (
       profile.provider.id !== identity.id ||
@@ -82,7 +100,7 @@ export const evaluateAnalysisProviderCandidate = async (
           "Resolved analysis profile has mismatched provider identity",
         ),
       );
-    return ok({ candidate, status, profile, compatibility });
+    return ok({ candidate, status, profile });
   } catch (cause: unknown) {
     void cause;
     return ok(

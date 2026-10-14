@@ -6,7 +6,6 @@ import { exec, json, run } from "./lib/verify-package-core.mjs";
 
 /** Install the packed CLI globally with and without optional dependencies and verify PTY degradation. */
 export async function verifyPackageInstall({
-  root,
   tarball,
   prefix,
   workspace,
@@ -18,9 +17,11 @@ export async function verifyPackageInstall({
       "install",
       "--global",
       "--ignore-scripts",
+      "--omit=dev",
+      "--install-strategy=nested",
       "--prefix",
       prefix,
-      join(root, tarball),
+      tarball,
     ],
     { env: environment },
   );
@@ -31,7 +32,7 @@ export async function verifyPackageInstall({
   const processCaptureCapabilityUrl = pathToFileURL(
     join(
       prefix,
-      "lib/node_modules/rea-agents/dist/application/ProcessCaptureCapability.js",
+      "lib/node_modules/rea-agents/dist/process/capture/ProcessCaptureCapability.js",
     ),
   ).href;
   const processCaptureCapability = json(
@@ -61,7 +62,7 @@ export async function verifyPackageInstall({
       "--omit=optional",
       "--prefix",
       noOptionalPrefix,
-      join(root, tarball),
+      tarball,
     ],
     { env: environment },
   );
@@ -77,7 +78,7 @@ export async function verifyPackageInstall({
   const noOptionalCapabilityUrl = pathToFileURL(
     join(
       noOptionalPrefix,
-      "lib/node_modules/rea-agents/dist/application/ProcessCaptureCapability.js",
+      "lib/node_modules/rea-agents/dist/process/capture/ProcessCaptureCapability.js",
     ),
   ).href;
   const noOptionalCapability = json(

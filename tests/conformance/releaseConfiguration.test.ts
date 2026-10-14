@@ -7,14 +7,7 @@ import { SUPPORTED_NODE_VERSION_RANGE } from "../../src/domain/runtimeVersion.js
 const readJson = async (path: string): Promise<unknown> =>
   JSON.parse(await readFile(path, "utf8")) as unknown;
 
-const versionedDocumentation = [
-  "README.md",
-  "README_zh.md",
-  "README_ja.md",
-  "README_ko.md",
-  "README_ar.md",
-  "docs/installation.md",
-] as const;
+const versionedDocumentation = ["docs/installation.md"] as const;
 
 describe("release configuration", () => {
   it("keeps doctor and setup runtime support aligned with package engines", async () => {
@@ -27,6 +20,7 @@ describe("release configuration", () => {
     const configuration = await readJson("release-please-config.json");
 
     expect(configuration).toMatchObject({
+      versioning: "always-bump-minor",
       packages: {
         ".": {
           "extra-files": [
@@ -48,11 +42,6 @@ describe("release configuration", () => {
               path: "server.json",
               jsonpath: "$.packages[0].version",
             },
-            {
-              type: "json",
-              path: "docs/product-catalog.json",
-              jsonpath: "$.package.version",
-            },
           ],
         },
       },
@@ -63,14 +52,32 @@ describe("release configuration", () => {
     "marks the versioned package example in %s",
     async (path) => {
       const content = await readFile(path, "utf8");
+      const packageJson = (await readJson("package.json")) as {
+        version: string;
+      };
       const versionBlock =
         /<!-- x-release-please-start-version -->[\s\S]*?<!-- x-release-please-end -->/u.exec(
           content,
         )?.[0];
 
-      expect(versionBlock).toMatch(/rea-agents@\d+\.\d+\.\d+/u);
+      expect(versionBlock).toContain(`rea-agents@${packageJson.version}`);
     },
   );
+
+  it("keeps the release baseline, lockfile, and changelog aligned with the package version", async () => {
+    const packageJson = (await readJson("package.json")) as {
+      version: string;
+    };
+    expect(await readJson(".release-please-manifest.json")).toEqual({
+      ".": packageJson.version,
+    });
+    expect(await readJson("package-lock.json")).toMatchObject({
+      version: packageJson.version,
+      packages: { "": { version: packageJson.version } },
+    });
+    const changelog = await readFile("CHANGELOG.md", "utf8");
+    expect(/^## \[([^\]]+)\]/mu.exec(changelog)?.[1]).toBe(packageJson.version);
+  });
 
   it("keeps the npm package and MCP Registry metadata aligned", async () => {
     const packageJson = (await readJson("package.json")) as {
@@ -111,15 +118,5 @@ describe("release configuration", () => {
         },
       ],
     });
-  });
-
-  it("keeps generated API HTML out of the tracked tree", async () => {
-    await expect(readFile("typedoc.json", "utf8")).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    const packageJson = (await readJson("package.json")) as {
-      scripts?: Record<string, string>;
-    };
-    expect(packageJson.scripts?.["docs:api"]).toBeUndefined();
   });
 });

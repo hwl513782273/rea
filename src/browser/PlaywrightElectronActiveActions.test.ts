@@ -9,6 +9,41 @@ import {
 import { createElectronActiveObservationFixtureResult } from "../domain/javascript/electronActiveObservation.fixture.js";
 import { runElectronActions } from "./PlaywrightElectronActiveActions.js";
 
+it("requires observed Electron retention and coverage instead of repairing old results", () => {
+  const result = createElectronActiveObservationFixtureResult("/opt/app");
+  for (const field of ["retention", "timeline", "coverage"] as const) {
+    expect(
+      electronActiveObservationResultSchema.safeParse({
+        ...result,
+        [field]: undefined,
+      }).success,
+    ).toBe(false);
+  }
+  for (const section of ["ipc", "timeline"] as const) {
+    expect(
+      electronActiveObservationResultSchema.safeParse({
+        ...result,
+        [section]: { ...result[section], dropped: undefined },
+      }).success,
+    ).toBe(false);
+  }
+  expect(
+    electronActiveObservationResultSchema.safeParse({
+      ...result,
+      retention: null,
+    }).success,
+  ).toBe(false);
+  expect(
+    electronActiveObservationResultSchema.safeParse({
+      ...result,
+      ipc: {
+        ...result.ipc,
+        events: [{ ...result.ipc.events[0], source: undefined }],
+      },
+    }).success,
+  ).toBe(false);
+});
+
 it("parses window, renderer, and deep-link actions for agents", () => {
   const input = electronActiveObservationInputSchema.parse({
     executable_path: "/opt/electron",
@@ -233,7 +268,7 @@ it("accepts complete Electron input and observation strings", () => {
         title: longText,
       },
     ],
-    ipc: { events: [event], observed: 1 },
+    ipc: { events: [event], observed: 1, dropped: 0 },
     timeline: {
       events: [
         {
@@ -245,6 +280,7 @@ it("accepts complete Electron input and observation strings", () => {
         },
       ],
       observed: 1,
+      dropped: 0,
     },
     limitations: [longText],
   });

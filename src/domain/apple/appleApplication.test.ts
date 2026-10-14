@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { projectAppleApplication } from "./appleApplication.js";
-import { canonicalDigest } from "../comparisonSemantics.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import { digestCanonicalValue } from "../canonicalDigest.js";
 import { createEvidence, type Evidence } from "../evidence.js";
 import { jsonValueSchema } from "../jsonValue.js";
 
@@ -19,7 +20,7 @@ interface FixtureEntry {
 const sha = (text: string): string =>
   createHash("sha256").update(text).digest("hex");
 const artifactId = (sha256: string): string =>
-  `art_${canonicalDigest({ sha256 }, "Artifact inventory")}`;
+  `art_${digestCanonicalValue({ sha256 }, "Artifact inventory")}`;
 
 /** Build one complete, content-addressed inventory page for pure projection tests. */
 const inventoryEvidence = (
@@ -31,21 +32,33 @@ const inventoryEvidence = (
   const rootId = artifactId(rootSha);
   const node = (sha256: string, format: string) => ({
     artifact_id: artifactId(sha256),
-    kind: "resource",
-    format,
+    format: [
+      "directory",
+      "mach-o",
+      "mach-o-universal",
+      "elf",
+      "pe",
+      "plist",
+    ].includes(format)
+      ? format
+      : "file",
     sha256,
     size: 1,
     media_type: null,
     architecture: null,
-    executable: false,
     content_state: "materialized",
     limitations: [],
   });
-  const occurrence = (path: string, kind: EntryKind, id: string | null) => ({
+  const occurrence = (
+    path: string,
+    kind: EntryKind,
+    id: string | null,
+    format = "file",
+  ) => ({
     occurrence_id:
       path === "."
-        ? `occ_${canonicalDigest({ root: rootId }, "Artifact inventory")}`
-        : `occ_${canonicalDigest(
+        ? `occ_${digestCanonicalValue({ root: rootId }, "Artifact inventory")}`
+        : `occ_${digestCanonicalValue(
             { root_artifact_id: rootId, logical_path: path, entry_kind: kind },
             "Artifact inventory",
           )}`,
@@ -53,6 +66,8 @@ const inventoryEvidence = (
     parent_occurrence_id: null,
     logical_path: path,
     entry_kind: kind,
+    artifact_kind: "resource",
+    artifact_format: format,
     declared_size: null,
     compressed_size: null,
     executable: false,
@@ -62,7 +77,7 @@ const inventoryEvidence = (
     limitations: [],
   });
   const nodes = new Map([[rootId, node(rootSha, rootFormat)]]);
-  const occurrences = [occurrence(".", "file", rootId)];
+  const occurrences = [occurrence(".", "file", rootId, rootFormat)];
   for (const { path, kind = "file", format = "file" } of entries) {
     if (kind === "symlink") {
       occurrences.push(occurrence(path, kind, null));
@@ -74,15 +89,17 @@ const inventoryEvidence = (
       id,
       node(contentSha, kind === "directory" ? "directory" : format),
     );
-    occurrences.push(occurrence(path, kind, id));
+    occurrences.push(
+      occurrence(path, kind, id, kind === "directory" ? "directory" : format),
+    );
   }
   const sortedNodes = [...nodes.values()].sort((left, right) =>
     left.artifact_id.localeCompare(right.artifact_id),
   );
   const sortedOccurrences = occurrences.sort((left, right) =>
-    left.logical_path.localeCompare(right.logical_path, "en"),
+    compareUnicodeCodePoints(left.logical_path, right.logical_path),
   );
-  const graphSha256 = canonicalDigest(
+  const graphSha256 = digestCanonicalValue(
     {
       nodes: sortedNodes,
       occurrences: sortedOccurrences,
@@ -105,7 +122,7 @@ const inventoryEvidence = (
       authority: "shipped-artifact",
       result: jsonValueSchema.parse({
         manifest: {
-          manifest_id: `agm_${canonicalDigest(
+          manifest_id: `agm_${digestCanonicalValue(
             { root_artifact_id: rootId, graph_sha256: graphSha256 },
             "Artifact inventory",
           )}`,
@@ -121,6 +138,7 @@ const inventoryEvidence = (
         occurrences: sortedOccurrences,
         edges: [],
         provenance: [],
+        coverage_status: "complete",
         limitations: [],
       }),
     },
@@ -399,6 +417,34 @@ describe("Apple bundle layouts and containers", () => {
   });
 });
 
+describe("Apple IPA components", () => {
+  it("excludes AppleDouble sidecars from IPA components", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        { path: "Payload/Fixture.app/Contents/Resources/._libfoo.dylib" },
+        { path: "Payload/Fixture.app/Frameworks/Foo.framework/._Foo" },
+        { path: "__MACOSX/Payload/Fixture.app/libghost.dylib" },
+        macho("Payload/Fixture.app/Contents/Resources/libreal.dylib"),
+        macho("SwiftSupport/iphoneos/libswiftCore.dylib"),
+      ]),
+    );
+    expect(result.components.native_libraries.map(({ path }) => path)).toEqual([
+      "Payload/Fixture.app/Contents/Resources/libreal.dylib",
+      "SwiftSupport/iphoneos/libswiftCore.dylib",
+    ]);
+    expect(result.components.frameworks).toEqual([]);
+    expect(result.components.executables.map(({ path }) => path)).toEqual([
+      "Payload/Fixture.app/Contents/Resources/libreal.dylib",
+      "Payload/Fixture.app/Fixture",
+    ]);
+    expect(result.limitations).toContainEqual(
+      expect.stringContaining("AppleDouble sidecar entries"),
+    );
+  });
+});
+
 describe("macOS application scope", () => {
   it("attributes only components inside the application roots", () => {
     const result = project(
@@ -494,4 +540,196 @@ describe("Apple application bridge candidates", () => {
       ],
     ]);
   });
+
+  it("reports candidate omission when one root expands beyond the bridge safety budget", () => {
+    const escapedDirectory = `${"é".repeat(100)}${'"'.repeat(120)}`;
+    const scripts = Array.from({ length: 129 }, (_, index) => ({
+      path: `Payload/Fixture.app/${escapedDirectory}/script-${String(index).padStart(3, "0")}.js`,
+      format: "javascript-bundle",
+    }));
+    const native = Array.from({ length: 128 }, (_, index) =>
+      macho(
+        `Payload/Fixture.app/${escapedDirectory}/lib${String(index).padStart(3, "0")}.dylib`,
+      ),
+    );
+    const result = project(
+      inventoryEvidence("zip", "Fixture.zip", [...scripts, ...native]),
+    );
+
+    expect(result.components.javascript).toHaveLength(129);
+    expect(result.components.native_libraries).toHaveLength(128);
+    expect(result.bridge_candidate_coverage).toMatchObject({
+      status: "partial",
+      total_candidates: 129 * 128,
+      emitted_candidates: result.bridge_candidates.length,
+      omitted_candidates: 129 * 128 - result.bridge_candidates.length,
+    });
+    expect(result.bridge_candidates.length).toBeGreaterThan(0);
+    expect(result.bridge_candidates.length).toBeLessThan(129 * 128);
+    expect(
+      Buffer.byteLength(JSON.stringify(result.bridge_candidates)),
+    ).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(result.coverage).toMatchObject({
+      status: "partial",
+      inventory_complete: true,
+    });
+    expect(result.limitations).toContain(
+      `Bridge candidate pairs exceeded the projection safety budget; ${result.bridge_candidate_coverage.omitted_candidates} hypotheses are omitted. Component arrays still include every component from the supplied inventory pages.`,
+    );
+  });
+
+  it("preserves candidate pairing for components without an application root", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        {
+          path: "Payload/Fixture.app/Resources/app.js",
+          format: "javascript-bundle",
+        },
+        { path: "SwiftSupport/outside.js", format: "javascript-bundle" },
+        { path: "SwiftSupport/liboutside.dylib", format: "mach-o" },
+      ]),
+    );
+
+    expect(result.bridge_candidates).toContainEqual({
+      source_path: "SwiftSupport/outside.js",
+      native_path: "SwiftSupport/liboutside.dylib",
+      basis: "javascript-and-native-content",
+    });
+    expect(result.bridge_candidate_coverage).toMatchObject({
+      status: "complete",
+    });
+  });
+
+  it("keeps an extensionless Mach-O without an application root as a native component", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        { path: "SwiftSupport/outside.js", format: "javascript-bundle" },
+        macho("SwiftSupport/HelperTool"),
+        macho("SwiftSupport/iphoneos/libswiftCore.dylib"),
+      ]),
+    );
+
+    expect(result.components.executables.map(({ path }) => path)).toEqual([
+      "Payload/Fixture.app/Fixture",
+      "SwiftSupport/HelperTool",
+    ]);
+    expect(result.bridge_candidates).toEqual([
+      {
+        source_path: "SwiftSupport/outside.js",
+        native_path: "SwiftSupport/HelperTool",
+        basis: "javascript-and-native-content",
+      },
+      {
+        source_path: "SwiftSupport/outside.js",
+        native_path: "SwiftSupport/iphoneos/libswiftCore.dylib",
+        basis: "javascript-and-native-content",
+      },
+    ]);
+  });
+});
+
+describe("Apple path conventions", () => {
+  it("recognizes anatomy names by English case and reports the archive spelling", () => {
+    const result = project(
+      inventoryEvidence("directory", "Fixture.app", [
+        { path: "contents/info.plist" },
+        macho("contents/macos/Fixture"),
+        { path: "contents/_codesignature/coderesources" },
+      ]),
+    );
+    expect(result.bundles[0]).toMatchObject({
+      layout: "macos-deep",
+      info_plist_path: "contents/info.plist",
+      executable_candidates: ["contents/macos/Fixture"],
+      signing_paths: ["contents/_codesignature/coderesources"],
+    });
+    expect(result.components.bundle_metadata.map(({ path }) => path)).toEqual([
+      "contents/info.plist",
+    ]);
+    expect(result.components.signing.map(({ path }) => path)).toEqual([
+      "contents/_codesignature/coderesources",
+    ]);
+  });
+
+  it("limits runtime families and bridge bases to path segments", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        macho("Payload/Fixture.app/Frameworks/libfoo.dylib"),
+        macho("SwiftSupport/libswiftCore.dylib"),
+        macho("Payload/Fixture.app/Frameworks/MyApp.framework/MyApp"),
+        macho("Payload/Fixture.app/community/libcommunity.so"),
+        {
+          path: "Payload/Fixture.app/main.js",
+          format: "javascript-bundle",
+        },
+      ]),
+    );
+    expect(result.runtime_families).toEqual(
+      expect.arrayContaining(["javascript", "native", "swift-objective-c"]),
+    );
+    expect(result.runtime_families).not.toContain("flutter");
+    expect(result.runtime_families).not.toContain("unity");
+    expect(result.runtime_families).not.toContain("react-native");
+    expect(
+      result.bridge_candidates.every(
+        ({ basis }) => basis === "javascript-and-native-content",
+      ),
+    ).toBe(true);
+    expect(result.limitations).toEqual(
+      expect.arrayContaining([
+        "Runtime families are inferred from inventory formats and bounded framework path conventions, not observed runtime loading.",
+        "A bridge basis is inferred from the native path and is repeated for every managed component.",
+      ]),
+    );
+  });
+
+  it("recognizes framework segments and does not treat a bare dylib as Swift", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        macho("Payload/Fixture.app/Frameworks/Flutter.framework/Flutter"),
+        macho(
+          "Payload/Fixture.app/Frameworks/UnityFramework.framework/UnityFramework",
+        ),
+        macho("Payload/Fixture.app/Frameworks/hermes.framework/hermes"),
+        macho("Payload/Fixture.app/Frameworks/libfoo.dylib"),
+      ]),
+    );
+    expect(result.runtime_families).toEqual(
+      expect.arrayContaining(["flutter", "unity", "react-native", "native"]),
+    );
+    expect(result.runtime_families).not.toContain("swift-objective-c");
+  });
+
+  it.each([
+    // U+10000 sorts before U+FFFD by UTF-16 code unit, after it by code point.
+    ["an astral and a BMP name", "\uFFFD", "\u{10000}"],
+    ["two BMP names", "\uE000", "\uFFFD"],
+  ])(
+    "orders roots, bundles and symlinks by code point for %s",
+    (_label, low, high) => {
+      const result = project(
+        inventoryEvidence(
+          "zip",
+          "Fixture.zip",
+          [high, low].flatMap((name) => [
+            { path: `A${name}.app/Contents/Info.plist` },
+            { path: `A${name}.app/Contents/Resources/link`, kind: "symlink" },
+          ]),
+        ),
+      );
+      const roots = [`A${low}.app`, `A${high}.app`];
+      expect(result.application_roots).toEqual(roots);
+      expect(result.bundles.map(({ path }) => path)).toEqual(roots);
+      expect(result.symlinks).toEqual(
+        roots.map((root) => `${root}/Contents/Resources/link`),
+      );
+    },
+  );
 });

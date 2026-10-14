@@ -12,6 +12,7 @@ import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
+  AnalysisOutputError,
 } from "../../domain/analysisErrorCore.js";
 import { EnhancedTools } from "../EnhancedTools.js";
 import {
@@ -23,6 +24,20 @@ import type { Result } from "../../domain/result.js";
 
 const target = "a".repeat(64);
 const provider = { id: "fixture", name: "Fixture", version: "1" };
+const methodName = "-[BuildViewController buildTapped:]";
+const methodSymbol = {
+  primary: true,
+  dynamic: false,
+  external: false,
+  type: "function",
+  source: "user_defined",
+};
+const methodInventoryEntry = {
+  address: "0x1000",
+  value: methodName,
+  symbol: methodSymbol,
+};
+
 const evidence = [
   {
     kind: "interface_builder_resource" as const,
@@ -199,6 +214,49 @@ const testAnalysis = (
 });
 
 describe("native UI action trace", () => {
+  it("retains Hopper targetless call evidence alongside fallback callee routes", async () => {
+    const result = await new EnhancedTools(
+      testAnalysis({
+        procedure_address: () => execution("procedure_address", "0x1000"),
+        procedure_references: (parameters) =>
+          ok(
+            createAnalysisExecution(
+              {
+                reference_kinds_available: false,
+                references: [],
+                unresolved_calls:
+                  parameters.procedure === "0x1000"
+                    ? [{ address: "0x1008", reason: "No static target" }]
+                    : [],
+              },
+              { id: "hopper", name: "Hopper", version: "fixture" },
+            ),
+          ),
+      }),
+    ).execute("trace_native_ui_action", { action: "0x1000" });
+    if (!result.ok) throw result.error;
+    const trace = nativeInvestigationTraceSchema.parse(result.value);
+    expect(trace.edges).toContainEqual(
+      expect.objectContaining({
+        relation: "provider_call",
+        to: "native:function:0x2000",
+      }),
+    );
+    expect(trace.unresolved).toContainEqual(
+      expect.objectContaining({
+        from: "native:function:0x1000",
+        to: null,
+        reason: "No static target",
+        evidence: [
+          expect.objectContaining({
+            description: "Hopper reported an unresolved call: No static target",
+            location: { address: "0x1008", file_offset: null },
+            artifact_sha256: target,
+          }),
+        ],
+      }),
+    );
+  });
   it("accepts an explicit native seed without an authored UI connection", async () => {
     const result = await new EnhancedTools(
       testAnalysis({
@@ -215,13 +273,16 @@ describe("native UI action trace", () => {
       },
     });
   });
-  it("builds the evidence path from the active app and native provider", async () => {
-    const tools = new EnhancedTools(testAnalysis());
+  it("builds the evidence path from provider names with declared symbol facts", async () => {
+    const tools = new EnhancedTools(
+      testAnalysis({
+        list_names: () => execution("list_names", [methodInventoryEntry]),
+      }),
+    );
     const result = await tools.execute("trace_native_ui_action", {
       action: "buildTapped:",
     });
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     const trace = nativeInvestigationTraceSchema.parse(result.value);
     expect(trace.start).toBe("action");
     expect(trace.nodes.map(({ id }) => id)).toContain("native:function:0x1000");
@@ -244,6 +305,40 @@ describe("native UI action trace", () => {
         status: "unsupported",
       }),
     );
+  });
+});
+
+describe("native UI action selector origin", () => {
+  it("marks provider-reported function addresses as derived and the action seed as caller-supplied", async () => {
+    const inner = testAnalysis({
+      procedure_address: () => execution("procedure_address", "0x1000"),
+    });
+    const recorded: { operation: string; origin: unknown }[] = [];
+
+    const result = await new EnhancedTools({
+      execute: async (operation, parameters, options) => {
+        recorded.push({ operation, origin: options?.selectorOrigin });
+        return inner.execute(operation, parameters);
+      },
+    }).execute("trace_native_ui_action", { action: "0x1000" });
+
+    expect(result.ok, "the trace completes").toBe(true);
+    expect(
+      recorded
+        .filter(({ operation }) => operation === "procedure_address")
+        .map(({ origin }) => origin),
+      "the caller's action seed carries no provider origin",
+    ).toEqual([undefined]);
+    const probes = recorded.filter(
+      ({ operation }) =>
+        operation === "procedure_references" ||
+        operation === "procedure_callees",
+    );
+    expect(probes.length, "relationships were probed").toBeGreaterThan(0);
+    expect(
+      probes.every(({ origin }) => origin === "provider"),
+      "every relationship probe uses a provider-reported address",
+    ).toBe(true);
   });
 });
 
@@ -297,8 +392,7 @@ describe("bounded native UI tracing", () => {
       { action: "buildTapped:", max_depth: 3 },
     );
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(
       nativeInvestigationTraceSchema
         .parse(result.value)
@@ -317,18 +411,117 @@ describe("bounded native UI tracing", () => {
       error: { _tag: "AnalysisInputError" },
     });
   });
+});
 
-  it("binds dispatch metadata to the active target digest", async () => {
-    const result = await new EnhancedTools(testAnalysis()).execute(
-      "inspect_native_dispatch_metadata",
-      { max_records: 10 },
-    );
+describe("native dispatch inventory", () => {
+  it.each([
+    { label: "plain value", entry: { address: "0x1000", value: methodName } },
+    { label: "value with symbol facts", entry: methodInventoryEntry },
+    {
+      label: "legacy name with symbol facts",
+      entry: { address: "0x1000", name: methodName, symbol: methodSymbol },
+    },
+  ])(
+    "binds $label inventory to the target without overstating dispatch coverage",
+    async ({ entry }) => {
+      const result = await new EnhancedTools(
+        testAnalysis({
+          list_names: () => execution("list_names", [entry]),
+        }),
+      ).execute("inspect_native_dispatch_metadata", { max_records: 10 });
 
-    expect(result).toMatchObject({
-      ok: true,
-      value: { target_sha256: target },
-    });
-  });
+      expect(result).toMatchObject({
+        ok: true,
+        value: {
+          target_sha256: target,
+          provider,
+          result: {
+            objc_dispatch_implementations: [
+              {
+                class_name: "BuildViewController",
+                selector: "buildTapped:",
+                implementation_address: "0x1000",
+                decode: { status: "partial", reason: "symbol_name_only" },
+              },
+            ],
+            coverage: expect.arrayContaining([
+              expect.objectContaining({
+                facet: "objc_dispatch_implementations",
+                status: "partial",
+              }),
+              expect.objectContaining({
+                facet: "swift_dispatch_tables",
+                status: "unsupported",
+              }),
+              expect.objectContaining({
+                facet: "relative_pointers",
+                status: "unsupported",
+              }),
+            ]),
+          },
+        },
+      });
+    },
+  );
+
+  it.each([
+    {
+      label: "malformed symbol flag",
+      entry: {
+        ...methodInventoryEntry,
+        symbol: { ...methodSymbol, primary: "true" },
+      },
+    },
+    {
+      label: "unknown symbol source",
+      entry: {
+        ...methodInventoryEntry,
+        symbol: { ...methodSymbol, source: "unknown" },
+      },
+    },
+    {
+      label: "incomplete symbol",
+      entry: { ...methodInventoryEntry, symbol: { primary: true } },
+    },
+    {
+      label: "malformed legacy symbol",
+      entry: { address: "0x1000", name: methodName, symbol: null },
+    },
+    {
+      label: "malformed address",
+      entry: { ...methodInventoryEntry, address: 4096 },
+    },
+    {
+      label: "malformed value with a legacy name",
+      entry: { ...methodInventoryEntry, value: 42, name: methodName },
+    },
+    {
+      label: "undeclared field",
+      entry: { address: "0x1000", value: methodName, unexpected: true },
+    },
+  ])(
+    "rejects $label inventory in both dispatch consumers",
+    async ({ entry }) => {
+      const tools = new EnhancedTools(
+        testAnalysis({
+          list_names: () => execution("list_names", [entry]),
+        }),
+      );
+      for (const [operation, parameters] of [
+        ["inspect_native_dispatch_metadata", { max_records: 10 }],
+        ["trace_native_ui_action", { action: "buildTapped:" }],
+      ] as const) {
+        expect(await tools.execute(operation, parameters)).toMatchObject({
+          ok: false,
+          error: {
+            _tag: "AnalysisOutputError",
+            operation: "list_names",
+            reason: "provider returned an invalid inventory",
+          },
+        });
+      }
+    },
+  );
 });
 
 describe("native UI query outcomes", () => {
@@ -337,8 +530,7 @@ describe("native UI query outcomes", () => {
     const result = await tools.execute("trace_native_ui_action", {
       action: "button",
     });
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value).toMatchObject({ start: "action" });
   });
 
@@ -385,8 +577,7 @@ describe("native UI query outcomes", () => {
     const result = await tools.execute("trace_native_ui_action", {
       action: "buildTapped:",
     });
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value).toMatchObject({
       reason: "action_selector_matches_multiple_ui_connections",
       nodes: [{ id: "action" }, { id: "second-action" }],
@@ -422,6 +613,25 @@ describe("native UI query outcomes", () => {
           reason: "object_limit_reached",
         }),
       ]),
+    });
+  });
+
+  it("returns native seed resolution failures instead of reporting not found", async () => {
+    const result = await new EnhancedTools(
+      testAnalysis({
+        procedure_address: () =>
+          err(
+            new AnalysisOutputError(
+              "procedure_address",
+              "invalid address response",
+            ),
+          ),
+      }),
+    ).execute("trace_native_ui_action", { action: "missing-selector" });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisOutputError", operation: "procedure_address" },
     });
   });
 

@@ -1,24 +1,25 @@
-import { canonicalDigest } from "../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 
-const inventory = (format: "apk" | "ipa" | "directory", digit: string) => {
+const inventory = (
+  format: "apk" | "ipa" | "directory" | "hap",
+  digit: string,
+) => {
   const sha = digit.repeat(64);
-  const artifactId = `art_${canonicalDigest({ sha256: sha }, "Artifact inventory")}`;
-  const occurrenceId = `occ_${canonicalDigest(
+  const artifactId = `art_${digestCanonicalValue({ sha256: sha }, "Artifact inventory")}`;
+  const occurrenceId = `occ_${digestCanonicalValue(
     { root: artifactId },
     "Artifact inventory",
   )}`;
   const nodes = [
     {
       artifact_id: artifactId,
-      kind: "resource",
-      format,
+      format: format === "directory" ? "directory" : "zip",
       sha256: sha,
       size: 1,
       media_type: null,
       architecture: null,
-      executable: false,
       content_state: "materialized",
       limitations: [],
     },
@@ -30,6 +31,8 @@ const inventory = (format: "apk" | "ipa" | "directory", digit: string) => {
       parent_occurrence_id: null,
       logical_path: ".",
       entry_kind: "file",
+      artifact_kind: "resource",
+      artifact_format: format,
       declared_size: 1,
       compressed_size: null,
       executable: false,
@@ -39,7 +42,7 @@ const inventory = (format: "apk" | "ipa" | "directory", digit: string) => {
       limitations: [],
     },
   ];
-  const graphSha256 = canonicalDigest(
+  const graphSha256 = digestCanonicalValue(
     {
       nodes,
       occurrences,
@@ -50,7 +53,7 @@ const inventory = (format: "apk" | "ipa" | "directory", digit: string) => {
   );
   return jsonValueSchema.parse({
     manifest: {
-      manifest_id: `agm_${canonicalDigest(
+      manifest_id: `agm_${digestCanonicalValue(
         {
           root_artifact_id: artifactId,
           graph_sha256: graphSha256,
@@ -123,6 +126,23 @@ export const MACOS_APPLICATION_GRAPH_EXAMPLE = {
         operation: "inventory_artifact",
         parameters: {},
         result: inventory("directory", "c"),
+        confidence: "observed",
+        authority: "shipped-artifact",
+      },
+    ),
+  ],
+};
+
+/** Catalog example for HarmonyOS application inventory projection. */
+export const HARMONY_APPLICATION_GRAPH_EXAMPLE = {
+  inventory_evidence: [
+    createEvidence(
+      { path: "Fixture.hap", sha256: "d".repeat(64), format: "hap" },
+      provider,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: inventory("hap", "d"),
         confidence: "observed",
         authority: "shipped-artifact",
       },

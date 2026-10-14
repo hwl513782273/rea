@@ -20,6 +20,9 @@ const PYTHON_PATH = "/usr/bin/python3";
 const UNSHARE_PATH = "/usr/bin/unshare";
 const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
 
+const isAborted = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted === true;
+
 export type LinuxPrivateDisplayRunnableStrategy = Exclude<
   HopperPrivateDisplayStrategy,
   "unavailable"
@@ -37,6 +40,7 @@ export type LinuxPrivateDisplayProbeRunner = (
   strategy: LinuxPrivateDisplayRunnableStrategy,
   options: {
     readonly helperPath: string;
+    readonly environment?: Readonly<NodeJS.ProcessEnv>;
     readonly timeoutMs: number;
     readonly signal?: AbortSignal;
   },
@@ -58,6 +62,7 @@ export type LinuxPrivateDisplaySelection =
 /** Probe the exact Xvfb boundary and select the least-privileged viable strategy. */
 export const selectLinuxPrivateDisplayStrategy = async (options: {
   readonly helperPath: string;
+  readonly environment?: Readonly<NodeJS.ProcessEnv>;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
   readonly runProbe?: LinuxPrivateDisplayProbeRunner;
@@ -101,8 +106,7 @@ export const selectLinuxPrivateDisplayStrategy = async (options: {
 /** Run one helper probe in an owned process group and retain its full diagnostics. */
 export const runLinuxPrivateDisplayProbe: LinuxPrivateDisplayProbeRunner =
   async (strategy, options) => {
-    if (options.signal?.aborted === true)
-      return emptyProcessResult("cancelled");
+    if (isAborted(options.signal)) return emptyProcessResult("cancelled");
     const command = privateDisplayProbeCommand(options.helperPath, strategy);
     let started: Awaited<ReturnType<typeof spawnOwnedProviderProcess>>;
     try {
@@ -111,11 +115,17 @@ export const runLinuxPrivateDisplayProbe: LinuxPrivateDisplayProbeRunner =
         arguments: command.arguments,
         runId: randomUUID(),
         expectedCommand: null,
+        ...(options.environment === undefined
+          ? {}
+          : { hostEnvironment: options.environment }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (cause: unknown) {
       // best-effort cleanup: probe spawn failure is reported as launch-failed.
       void cause;
-      return emptyProcessResult("launch-failed");
+      return emptyProcessResult(
+        isAborted(options.signal) ? "cancelled" : "launch-failed",
+      );
     }
     const launch: ProviderProcessLaunch = {
       process: started.process,
@@ -178,6 +188,7 @@ const evaluatedProbe = async (
   strategy: LinuxPrivateDisplayRunnableStrategy,
   options: {
     readonly helperPath: string;
+    readonly environment?: Readonly<NodeJS.ProcessEnv>;
     readonly signal?: AbortSignal;
   },
   timeoutMs: number,
@@ -197,6 +208,9 @@ const evaluatedProbe = async (
   try {
     processResult = await runner(strategy, {
       helperPath: options.helperPath,
+      ...(options.environment === undefined
+        ? {}
+        : { environment: options.environment }),
       timeoutMs,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });

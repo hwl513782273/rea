@@ -1,21 +1,19 @@
-import { canonicalDigest } from "../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 
 const inventory = (digit: string) => {
   const sha = digit.repeat(64);
-  const artifactId = `art_${canonicalDigest({ sha256: sha }, "Artifact example")}`;
-  const occurrenceId = `occ_${canonicalDigest({ root: artifactId }, "Artifact example")}`;
+  const artifactId = `art_${digestCanonicalValue({ sha256: sha }, "Artifact example")}`;
+  const occurrenceId = `occ_${digestCanonicalValue({ root: artifactId }, "Artifact example")}`;
   const nodes = [
     {
       artifact_id: artifactId,
-      kind: "resource",
       format: "file",
       sha256: sha,
       size: 1,
       media_type: null,
       architecture: null,
-      executable: false,
       content_state: "materialized",
       limitations: [],
     },
@@ -27,6 +25,8 @@ const inventory = (digit: string) => {
       parent_occurrence_id: null,
       logical_path: ".",
       entry_kind: "file",
+      artifact_kind: "resource",
+      artifact_format: "file",
       declared_size: 1,
       compressed_size: null,
       executable: false,
@@ -36,7 +36,7 @@ const inventory = (digit: string) => {
       limitations: [],
     },
   ];
-  const graphSha256 = canonicalDigest(
+  const graphSha256 = digestCanonicalValue(
     {
       nodes,
       occurrences,
@@ -47,7 +47,7 @@ const inventory = (digit: string) => {
   );
   return jsonValueSchema.parse({
     manifest: {
-      manifest_id: `agm_${canonicalDigest(
+      manifest_id: `agm_${digestCanonicalValue(
         {
           root_artifact_id: artifactId,
           graph_sha256: graphSha256,

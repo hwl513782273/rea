@@ -2,10 +2,14 @@ import { HopperProtocolError } from "../domain/hopperErrors.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
 
+/** Bound cleanup handshakes and the bridge's idle reconnection wait. */
+export const HOPPER_SHUTDOWN_TIMEOUT_MS = 30_000;
+
 /** Authenticated identity returned by the Hopper bridge health handshake. */
 export interface HopperServerInfo {
   readonly name: string;
   readonly version: string;
+  readonly processId: number;
 }
 
 /** Validate the bridge identity and exact per-launch run identifier. */
@@ -19,9 +23,16 @@ export const parseHopperServerInfo = (
     !Array.isArray(value) &&
     value.name === "REA Hopper bridge" &&
     typeof value.version === "string" &&
+    typeof value.process_id === "number" &&
+    Number.isSafeInteger(value.process_id) &&
+    value.process_id > 0 &&
     value.run_id === expectedRunId
   )
-    return ok({ name: value.name, version: value.version });
+    return ok({
+      name: value.name,
+      version: value.version,
+      processId: value.process_id,
+    });
   return err(new HopperProtocolError("Hopper bridge health result is invalid"));
 };
 

@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,12 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parseBinaryTarget } from "../../../dist/application/BinaryTargetResolver.js";
 import { inspectAppleDispatchMetadata } from "../../../dist/native/AppleDispatchMetadata.js";
+import {
+  artifactCliEvidence,
+  artifactMcpResult,
+  withArtifactMcp,
+} from "../../lib/artifact-e2e.mjs";
+import { nativeDispatchMetadataResultSchema } from "../../../dist/domain/native/objcSwiftMetadata.js";
 
 if (process.platform !== "darwin")
   throw new Error(
@@ -22,7 +29,7 @@ const LINK_MODES = [
   {
     mode: "dyld-info",
     flags: ["-Wl,-no_fixup_chains"],
-    fixups: "LC_DYLD_INFO bind opcodes",
+    fixups: "LC_DYLD_INFO rebase opcodes were not decoded",
     swift: true,
   },
   { mode: "chained", flags: [], fixups: "chained fixups:", swift: true },
@@ -61,6 +68,30 @@ const checkObjc = (metadata, mode) => {
   const objcCoverage = metadata.coverage.find(
     ({ facet }) => facet === "objc_class_method_ivar_metadata",
   );
+  assert.equal(fixture?.is_meta_class, false);
+  assert.equal(fixture?.is_root_class, false);
+  assert.equal(
+    fixture?.properties.find(({ name }) => name === "fixtureName")?.atomicity,
+    "nonatomic",
+  );
+  assert.equal(
+    fixture?.properties.find(({ name }) => name === "atomicValue")?.atomicity,
+    "atomic",
+  );
+  for (const method of fixture.methods) {
+    assert.equal(method.is_required, null);
+    assert.equal(method.is_optional, null);
+  }
+  for (const property of fixture.properties)
+    for (const attribute of property.attributes)
+      assert.deepEqual(Object.keys(attribute).sort(), ["name", "value"]);
+  const protocol = metadata.objc_protocols.find(
+    ({ name }) => name === "ReaDispatchProtocol",
+  );
+  assert.equal(protocol?.methods[0]?.is_required, true);
+  assert.equal(protocol?.methods[0]?.is_optional, false);
+  assert.equal(protocol?.optional_methods[0]?.is_required, false);
+  assert.equal(protocol?.optional_methods[0]?.is_optional, true);
   if (
     !metadata.objc_dispatch_implementations.some(
       (item) =>
@@ -104,7 +135,12 @@ const checkObjc = (metadata, mode) => {
         item.selector === "reaFixtureLength",
     ) ||
     objcCoverage?.status !== "complete" ||
-    fixupCoverage(metadata)?.reason?.startsWith(mode.fixups) !== true
+    fixupCoverage(metadata)?.reason?.startsWith(mode.fixups) !== true ||
+    (mode.mode === "dyld-info") !==
+      (fixupCoverage(metadata)?.reason?.includes(
+        "LC_DYLD_INFO bind opcodes",
+      ) ===
+        true)
   )
     throw new Error(
       `Apple metadata fixture drifted (${mode.mode}): ${JSON.stringify(metadata)}`,
@@ -134,7 +170,12 @@ const checkSwift = (metadata, mode) => {
         item.owner === "ReaWitnessFixture: ReaWitnessFixtureProtocol" &&
         item.implementation_address !== null,
     ) ||
-    fixupCoverage(metadata)?.reason?.startsWith(mode.fixups) !== true
+    fixupCoverage(metadata)?.reason?.startsWith(mode.fixups) !== true ||
+    (mode.mode === "dyld-info") !==
+      (fixupCoverage(metadata)?.reason?.includes(
+        "LC_DYLD_INFO bind opcodes",
+      ) ===
+        true)
   )
     throw new Error(
       `Swift metadata fixture drifted (${mode.mode}): ${JSON.stringify(metadata)}`,
@@ -142,6 +183,7 @@ const checkSwift = (metadata, mode) => {
 };
 
 const root = await mkdtemp(join(tmpdir(), "rea-dispatch-"));
+let report;
 try {
   const results = [];
   for (const mode of LINK_MODES) {
@@ -161,6 +203,25 @@ try {
         await exec("/usr/bin/strip", ["-x", objcPath]);
       const { target, metadata } = await inspect(objcPath);
       checkObjc(metadata, mode);
+      if (mode.mode === "chained" && variant === "stripped") {
+        const cli = await artifactCliEvidence(
+          "inspect-native-dispatch-metadata",
+          objcPath,
+        );
+        const cliResult = nativeDispatchMetadataResultSchema.parse(
+          cli.normalized_result,
+        );
+        assert.equal(cliResult.target_sha256, target.sha256);
+        checkObjc(cliResult.result, mode);
+        await withArtifactMcp(objcPath, async (client) => {
+          const mcpResult = nativeDispatchMetadataResultSchema.parse(
+            await artifactMcpResult(client, "inspect_native_dispatch_metadata"),
+          );
+          assert.equal(mcpResult.target_sha256, target.sha256);
+          checkObjc(mcpResult.result, mode);
+          assert.deepEqual(mcpResult.result, cliResult.result);
+        });
+      }
       results.push({
         variant: `objc-${mode.mode}-${variant}`,
         target_sha256: target.sha256,
@@ -175,6 +236,8 @@ try {
     await exec("/usr/bin/xcrun", [
       "swiftc",
       "-emit-library",
+      "-module-name",
+      "ReaWitnessFixture",
       "-O",
       ...mode.flags
         .map((flag) => flag.replace(/^-Wl,/u, "-Xlinker\0"))
@@ -197,9 +260,8 @@ try {
       });
     }
   }
-  process.stdout.write(
-    `${JSON.stringify({ ok: true, target_executed: false, fixtures: results })}\n`,
-  );
+  report = { ok: true, target_executed: false, fixtures: results };
 } finally {
   await rm(root, { recursive: true, force: true });
 }
+process.stdout.write(`${JSON.stringify(report)}\n`);

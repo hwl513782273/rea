@@ -45,7 +45,6 @@ export const HOPPER_OPERATIONS = Object.freeze([
   "set_addresses_names",
   "set_bookmark",
   "set_comment",
-  "set_current_document",
   "set_inline_comment",
   "unset_bookmark",
   "xrefs",
@@ -63,12 +62,16 @@ const MUTATING_OPERATIONS = new Set<string>([
 
 /** Source-owned capabilities without acquiring or probing a Hopper session. */
 export const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
-  HOPPER_OPERATIONS.map((operation) =>
+  [...HOPPER_OPERATIONS, "search_bytes" as const].map((operation) =>
     Object.freeze({
       provider: HOPPER_PROVIDER_IDENTITY,
       operation,
-      available: true,
-      reason: null,
+      ...(operation === "search_bytes"
+        ? {
+            available: false as const,
+            reason: "Masked byte search has not been verified for Hopper.",
+          }
+        : { available: true as const, reason: null }),
       effects: Object.freeze({
         mutatesArtifact: MUTATING_OPERATIONS.has(operation),
         launchesProcess: true,
@@ -80,6 +83,25 @@ export const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
       }),
       limitations: Object.freeze([
         "Results depend on Hopper's completed static analysis.",
+        ...(operation === "address_to_file_offset"
+          ? [
+              "Original-file coordinates require source bytes matching the selected executable digest. A changed, unavailable, or database-only source retains native mapping facts in partial error evidence.",
+            ]
+          : []),
+        ...(operation === "search_strings" || operation === "search_procedures"
+          ? [
+              "Regex mode uses ECMAScript Unicode semantics in a supervised worker with a five-second matching deadline. Cancellation or deadline failure stops matching without blocking Hopper; literal mode retains native casefold semantics.",
+            ]
+          : []),
+        ...(operation === "list_strings" ||
+        operation === "search_strings" ||
+        operation === "analyze_function"
+          ? [
+              "String values cover native typed objects. Hopper may split long literals into adjacent unterminated fragments; string searches match each object independently.",
+              "Undecodable typed objects retain native display text with an explicit decoding unknown; these values do not establish decoded source literals.",
+              "Reported string encodings are inferred from typed bytes and native display; the original source's intended encoding is unknown.",
+            ]
+          : []),
       ]),
     }),
   ),

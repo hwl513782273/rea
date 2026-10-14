@@ -1,12 +1,14 @@
-import type { ApplicationNode } from "../../domain/javascript/javascriptApplicationGraph.js";
+import type { ApplicationNode } from "../../domain/javascript/javascriptApplicationGraphSchemas.js";
 import type { JavaScriptBundlerRegistration } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
+import { compositeKey } from "../../domain/unicodeCodePointOrder.js";
 import {
   addAstContainsEdge,
   artifactLocalIdentity,
   chunkLookupKey,
   javascriptAnalysisCoverage,
   moduleLookupKey,
+  selfReferenceOmissions,
   type JavaScriptArtifactGraphContext,
   type JavaScriptArtifactGraphCoverage,
 } from "./JavaScriptArtifactGraphContext.js";
@@ -15,10 +17,11 @@ import {
   staticInferenceEvidence,
 } from "./JavaScriptArtifactGraphEvidence.js";
 
-/** Project Webpack/Rspack chunk and factory literals recovered from AST. */
+/** Project Webpack/Rspack AST literals and disclose unrepresentable relationships. */
 export const addJavaScriptBundlerNodes = (
   context: JavaScriptArtifactGraphContext,
-): void => {
+): readonly string[] => {
+  let selfAsyncChunks = 0;
   for (const analyzed of context.analysis.files) {
     const { file, javascript } = analyzed;
     const asset = context.assetNodes.get(file.path);
@@ -49,8 +52,14 @@ export const addJavaScriptBundlerNodes = (
       records.push({ file, registration, chunk, coverage });
       addBundlerModuleNodes(context, { ...input, chunk });
     }
-    for (const record of records) addBundlerRuntimeEdges(context, record);
+    for (const record of records)
+      selfAsyncChunks += addBundlerRuntimeEdges(context, record);
   }
+  return selfReferenceOmissions(
+    selfAsyncChunks,
+    ["bundler async-chunk reference", "bundler async-chunk references"],
+    "the requesting chunk",
+  );
 };
 
 interface BundlerProjectionInput {
@@ -72,7 +81,11 @@ const createBundlerChunkNode = (
   const chunkKey = `${registration.runtime}:${registration.chunk_keys.join(",")}`;
   return context.accumulator.addNode({
     kind: "javascript-chunk",
-    identity: artifactLocalIdentity(file.sha256, "bundler-chunk", chunkKey),
+    identity: artifactLocalIdentity(
+      file.sha256,
+      "bundler-chunk",
+      compositeKey([registration.runtime, registration.chunk_keys]),
+    ),
     observations: [
       {
         label: chunkKey,
@@ -148,7 +161,7 @@ const addBundlerModuleNodes = (
       ],
     });
     context.moduleNodes.set(
-      moduleLookupKey(file.path, moduleValue.module_key),
+      moduleLookupKey(file.path, registration.runtime, moduleValue.module_key),
       module,
     );
     addAstContainsEdge(context, {
@@ -177,11 +190,12 @@ interface BundlerGraphRecord {
 const addBundlerRuntimeEdges = (
   context: JavaScriptArtifactGraphContext,
   record: BundlerGraphRecord,
-): void => {
+): number => {
+  let selfAsyncChunks = 0;
   const { file, registration, chunk, coverage } = record;
   for (const moduleKey of registration.entry_module_keys) {
     const resolved = context.moduleNodes.get(
-      moduleLookupKey(file.path, moduleKey),
+      moduleLookupKey(file.path, registration.runtime, moduleKey),
     );
     const target =
       resolved ?? unresolvedBundlerModuleNode(context, record, moduleKey);
@@ -209,6 +223,10 @@ const addBundlerRuntimeEdges = (
   for (const chunkKey of registration.async_chunk_keys) {
     const lookup = chunkLookupKey(file.path, registration.runtime, chunkKey);
     const resolved = context.chunkNodes.get(lookup);
+    if (resolved?.node_id === chunk.node_id) {
+      selfAsyncChunks++;
+      continue;
+    }
     const target =
       resolved ?? unresolvedBundlerChunkNode(context, record, chunkKey);
     context.accumulator.addEdge({
@@ -232,6 +250,7 @@ const addBundlerRuntimeEdges = (
       }),
     });
   }
+  return selfAsyncChunks;
 };
 
 const unresolvedBundlerModuleNode = (

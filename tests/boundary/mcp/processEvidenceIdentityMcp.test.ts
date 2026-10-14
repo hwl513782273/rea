@@ -1,18 +1,18 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { expect, it, onTestFinished } from "vitest";
-import { z } from "zod";
 
-import { compareProcessEvidenceFiles } from "../../../src/application/ProcessCli.js";
-import { PROCESS_PROVIDER } from "../../../src/application/ProcessEvidence.js";
+import { compareProcessEvidenceFiles } from "../../../src/application/process/ProcessCli.js";
+import { PROCESS_PROVIDER } from "../../../src/domain/process/processEvidenceProvider.js";
 import { FUNCTION_COMPARISON_EXAMPLE } from "../../../src/contracts/functionComparisonExample.js";
 import {
   FUNCTION_COMPARISON_EVIDENCE,
   INVESTIGATION_EXAMPLES,
 } from "../../../src/contracts/investigationExamples.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../../src/contracts/processCaptureExample.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../../src/domain/process/processCaptureExample.js";
 import { findChangedBehavior } from "../../../src/domain/changedBehavior.js";
 import {
   createEvidence,
@@ -20,23 +20,26 @@ import {
   type Evidence,
 } from "../../../src/domain/evidence.js";
 import { createEvidenceBundle } from "../../../src/domain/evidenceBundle.js";
-import { verifyReconstruction } from "../../../src/domain/reconstructionVerification.js";
 import { correlateStaticAndRuntime } from "../../../src/domain/staticRuntimeCorrelation.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
+import { verifyReconstruction } from "../../../src/domain/reconstructionVerification.js";
 const providerNames = [
   "REA process capture",
   "REA deterministic process harness",
 ];
 
-const captureEvidence = (side: "left" | "right") =>
+const captureEvidence = (
+  side: "left" | "right",
+  result: Evidence["normalized_result"] = EMPTY_PROCESS_CAPTURE_EXAMPLE,
+) =>
   createEvidence(undefined, PROCESS_PROVIDER, {
     predicateType: "rea.process-capture",
     operation: "capture_process_scenario",
     parameters: { side },
-    result: EMPTY_PROCESS_CAPTURE_EXAMPLE,
+    result,
     confidence: "observed",
     authority: "controlled-replay",
     environment: {
@@ -48,16 +51,13 @@ const captureEvidence = (side: "left" | "right") =>
   });
 
 const inlineEvidence = (response: { structuredContent?: unknown }) =>
-  parseEvidence(
-    z.object({ evidence: z.unknown() }).parse(response.structuredContent)
-      .evidence,
-  );
+  parseEvidence(response.structuredContent);
 
 const connectedComparison = async () => {
   const session = createTestBinarySession(() => {
     throw new Error("Process comparison must not launch a provider");
   });
-  const server = createServer(session, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({
     name: "process-evidence-identity",
     version: "1",
@@ -291,7 +291,7 @@ for (const name of providerNames)
       for (const { expected: _expected, ...call } of consumerCalls(invalid)) {
         const response = await client.callTool(call);
         expect(response.isError, call.name).toBe(true);
-        expect(response.structuredContent, call.name).toMatchObject({
+        expect(parseMcpToolError(response), call.name).toMatchObject({
           error: { code: "invalid_request" },
         });
       }
@@ -309,7 +309,9 @@ it("separately rejects a tampered digest before admission to any consumer or ses
   };
   const digestMismatch = /semantic identifier does not match/u;
   expect(() => parseEvidence(tampered)).toThrow(digestMismatch);
-  expect(() => findChangedBehavior([tampered])).toThrow(digestMismatch);
+  expect(() => findChangedBehavior({ comparisons: [tampered] })).toThrow(
+    digestMismatch,
+  );
   expect(() => correlateStaticAndRuntime(correlationInput(tampered))).toThrow(
     digestMismatch,
   );
@@ -330,8 +332,52 @@ it("separately rejects a tampered digest before admission to any consumer or ses
   )) {
     const response = await client.callTool(call);
     expect(response.isError, call.name).toBe(true);
-    expect(response.structuredContent).toMatchObject({
+    expect(parseMcpToolError(response)).toMatchObject({
       error: { code: "invalid_request" },
     });
   }
+});
+
+it("maps malformed changed-behavior Evidence to an invalid request before closure lookup", async () => {
+  const { client, comparison } = await connectedComparison();
+  const malformed = { ...comparison, evidence_links: undefined } as unknown;
+  const response = await client.callTool({
+    name: "find_changed_behavior",
+    arguments: { comparisons: [malformed] },
+  });
+  expect(response.isError).toBe(true);
+  expect(parseMcpToolError(response)).toMatchObject({
+    error: { code: "invalid_request" },
+  });
+});
+
+it("keeps withheld ownership unknown through CLI and MCP comparison", async () => {
+  const { client, right } = await connectedComparison();
+  const left = captureEvidence("left", {
+    ...EMPTY_PROCESS_CAPTURE_EXAMPLE,
+    cleanup: {
+      ...EMPTY_PROCESS_CAPTURE_EXAMPLE.cleanup,
+      unverified_processes: [
+        { pid: 900, reason: "platform_binary_environment_withheld" },
+      ],
+    },
+    residual_unknowns: [
+      { scope: "process", reason: "Ownership of process 900 was withheld" },
+    ],
+  });
+  const response = await client.callTool({
+    name: "compare_process_captures",
+    arguments: { left, right },
+  });
+  expect(response.isError, JSON.stringify(response)).not.toBe(true);
+  const comparison = inlineEvidence(response);
+  expect(comparison.normalized_result).toMatchObject({ status: "unknown" });
+  const root = await createTestTempDirectory("rea-withheld-ownership-");
+  const leftPath = join(root, "left.json");
+  const rightPath = join(root, "right.json");
+  await writeFile(leftPath, JSON.stringify(left));
+  await writeFile(rightPath, JSON.stringify(right));
+  expect(
+    parseEvidence(await compareProcessEvidenceFiles(leftPath, rightPath)),
+  ).toEqual(comparison);
 });

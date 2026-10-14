@@ -1,6 +1,12 @@
 /** Primitive values admitted into the constant lattice. */
 export type JavaScriptSemanticPrimitive = string | number | boolean | null;
 
+/** Resource bound that prevented an exact semantic value. */
+export type JavaScriptSemanticResourceLimit =
+  | "primitive-candidates"
+  | "primitive-bytes"
+  | "expression-depth";
+
 type JavaScriptSemanticObjectValue = {
   readonly status: "object";
   readonly properties: readonly JavaScriptSemanticProperty[];
@@ -17,7 +23,7 @@ type JavaScriptSemanticObjectValue = {
 
 type JavaScriptSemanticArrayValue = {
   readonly status: "array";
-  readonly items: readonly JavaScriptSemanticValue[];
+  readonly items: readonly JavaScriptSemanticProperty[];
 } & (
   | {
       readonly unknownItems: false;
@@ -44,10 +50,18 @@ export type JavaScriptSemanticValue =
   | {
       readonly status: "unknown" | "ambiguous" | "cycle";
       readonly reason: string;
+      readonly resourceLimit?: JavaScriptSemanticResourceLimit;
     };
 
-/** One statically named object-literal property. */
+/** One statically named own slot in an object or array. */
 export interface JavaScriptSemanticProperty {
   readonly name: string;
   readonly value: JavaScriptSemanticValue;
+  readonly presence: JavaScriptSemanticSlotPresence;
 }
+
+/** Own-slot presence, independent of its value and sibling coverage. */
+export type JavaScriptSemanticSlotPresence =
+  | "present"
+  | "absent"
+  | "unknown-coverage";

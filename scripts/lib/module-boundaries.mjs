@@ -5,6 +5,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PURE_LAYERS = new Set(["domain", "contracts"]);
 const MIGRATED_PROVIDER_ROOTS = new Set([
+  "sqlite",
+  "evm",
+  "go",
+  "rust",
+  "wasm",
+  "captures",
+  "signals",
   "android",
   "firmware",
   "ghidra",
@@ -13,14 +20,6 @@ const MIGRATED_PROVIDER_ROOTS = new Set([
   "inspector",
   "javascript",
 ]);
-const PROVIDER_ROOTS = new Set([
-  ...MIGRATED_PROVIDER_ROOTS,
-  "artifacts",
-  "browser",
-  "dotnet",
-  "native",
-]);
-
 const repositoryPath = (root, path) =>
   relative(root, path).replaceAll("\\", "/");
 
@@ -61,6 +60,14 @@ const failedBoundary = (file, target) => {
   const layer = file.split("/")[1];
   const targetLayer = target.split("/")[1];
   if (
+    file.startsWith("src/process/capture/") &&
+    (["application", "composition", "server", "cli", "main"].includes(
+      targetLayer,
+    ) ||
+      /^src\/(?:cli|main)\./u.test(target))
+  )
+    return "process-capture";
+  if (
     file.startsWith("src/application/javascript/") &&
     /^src\/artifacts\/(?:Asar|Directory)ArtifactReader\.(?:js|ts)$/u.test(
       target,
@@ -70,6 +77,8 @@ const failedBoundary = (file, target) => {
   if (
     (file.startsWith("src/artifacts/javascript/") ||
       file.startsWith("src/artifacts/apple/") ||
+      file.startsWith("src/artifacts/inventory/") ||
+      file.startsWith("src/artifacts/extraction/") ||
       /^src\/artifacts\/ArtifactHash\.(?:js|ts)$/u.test(file)) &&
     (["application", "composition", "server", "cli", "main"].includes(
       targetLayer,
@@ -77,11 +86,6 @@ const failedBoundary = (file, target) => {
       /^src\/(?:cli|main)\./u.test(target))
   )
     return "artifact-acquisition";
-  if (
-    PROVIDER_ROOTS.has(layer) &&
-    /^src\/generatedMcpToolCatalog\.(?:js|ts)$/u.test(target)
-  )
-    return "provider-generated-catalog";
   if (PURE_LAYERS.has(layer)) {
     if (
       (/^src\/[^/]+\//u.test(target) && !PURE_LAYERS.has(targetLayer)) ||

@@ -38,10 +38,6 @@ export const nativeInvestigationNodeKindSchema = z.enum([
   "unknown",
 ]);
 
-type NativeInvestigationNodeKind = z.infer<
-  typeof nativeInvestigationNodeKindSchema
->;
-
 /** One UI, dispatch, or value entity with optional decoded source location. */
 export const nativeInvestigationNodeSchema = z.strictObject({
   id: z.string().min(1),
@@ -51,7 +47,6 @@ export const nativeInvestigationNodeSchema = z.strictObject({
   attributes: z.record(z.string(), jsonValueSchema),
   evidence: z.array(nativeMetadataEvidenceSchema),
 });
-type NativeInvestigationNode = z.infer<typeof nativeInvestigationNodeSchema>;
 
 /** Relationship types preserve UI wiring, native dispatch, and value flow. */
 export const nativeInvestigationRelationSchema = z.enum([
@@ -71,10 +66,6 @@ export const nativeInvestigationRelationSchema = z.enum([
   "flows_to",
   "controls",
 ]);
-
-type NativeInvestigationRelation = z.infer<
-  typeof nativeInvestigationRelationSchema
->;
 
 /** An observed, inferred, or unresolved relationship between entities. */
 export const nativeInvestigationEdgeSchema = z.discriminatedUnion(
@@ -216,7 +207,6 @@ export const traceNativeInvestigationGraph = (
   while (queue.length > 0) {
     const current = queue.shift();
     if (current === undefined) break;
-    reachedDepth = Math.max(reachedDepth, current.depth);
     const adjacent = adjacency.get(current.id) ?? [];
 
     for (const edge of adjacent) {
@@ -236,19 +226,24 @@ export const traceNativeInvestigationGraph = (
         reason ??= "max_depth_reached";
         continue;
       }
-      selectedEdges.set(edge.id, edge);
-      if (alreadyVisited) continue;
-      if (visited.size >= limits.max_nodes) {
+      // Check destination capacity before retaining its edge. Otherwise the node
+      // bound leaves a resolved edge pointing outside the returned trace.
+      if (!alreadyVisited && visited.size >= limits.max_nodes) {
         truncated = true;
         reason = "max_nodes_reached";
         break;
       }
+      selectedEdges.set(edge.id, edge);
+      if (alreadyVisited) continue;
       if (!nodeById.has(nextId)) {
         truncated = true;
         reason ??= "edge_target_missing_from_graph";
         continue;
       }
       visited.add(nextId);
+      // A retained node has already been reached even if a later sibling
+      // exhausts a budget before this node is dequeued for expansion.
+      reachedDepth = Math.max(reachedDepth, current.depth + 1);
       queue.push({ id: nextId, depth: current.depth + 1 });
     }
     if (reason === "max_edges_reached" || reason === "max_nodes_reached") break;

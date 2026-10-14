@@ -8,10 +8,14 @@ import { HopperProcessError } from "../domain/hopperErrors.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok, type Result } from "../domain/result.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
-import type { ProcessCleanupResult } from "../process/ProcessOwnership.js";
+import type {
+  ProcessCleanupResult,
+  ProcessIdentityObservation,
+} from "../process/ProcessOwnership.js";
 import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
+import { observeProcessStartIdentityExit } from "../process/ProcessOwnershipObservation.js";
 import type { BridgeLaunch } from "./BridgeLauncher.js";
 import {
   createOwnedHopperShutdownDiagnostic,
@@ -33,14 +37,26 @@ interface CleanupState {
   readonly issues: CleanupIssue[];
   readonly resources: Set<string>;
   cleanupResult: ProcessCleanupResult | undefined;
+  processStopped: boolean;
+}
+
+/** Owned capabilities survive failed cleanup until their release is verified. */
+export interface HopperOwnedResources {
+  launch: BridgeLaunch | undefined;
+  processSupervisor: ProviderProcessSupervisor | undefined;
+  runtimeRoot: PrivateRuntimeRoot | undefined;
   shutdownConfirmed: boolean;
+  externalApplication:
+    | {
+        readonly pid: number;
+        readonly identity: ProcessIdentityObservation;
+      }
+    | undefined;
 }
 
 export interface HopperCleanupInput {
   readonly socket: Socket | undefined;
-  readonly launch: BridgeLaunch | undefined;
-  readonly processSupervisor: ProviderProcessSupervisor | undefined;
-  readonly runtimeRoot: PrivateRuntimeRoot | undefined;
+  readonly resources: HopperOwnedResources;
   readonly activeRequest: HopperRequestActivity | null;
   readonly retainDocument: boolean;
   readonly progress: ProgressReporter | undefined;
@@ -60,23 +76,84 @@ export const cleanupHopperSession = async (
     issues: [],
     resources: new Set(),
     cleanupResult: undefined,
-    shutdownConfirmed: false,
+    processStopped: input.resources.processSupervisor === undefined,
   };
+  await confirmExternalApplicationExit(
+    input.resources,
+    input.socket,
+    input.releaseTransport,
+  );
   await report(
     input.progress,
     0,
-    input.retainDocument
+    input.retainDocument &&
+      input.resources.launch?.preparedImagePath === undefined
       ? "detaching REA from the Hopper document"
       : "requesting Hopper document shutdown",
   );
   await requestShutdown(input, state);
   await report(input.progress, 0.35, "releasing Hopper bridge transport");
-  input.releaseTransport(input.socket);
+  if (
+    input.resources.shutdownConfirmed ||
+    input.resources.launch?.providerLifetime !== "external-application"
+  )
+    input.releaseTransport(input.socket);
   await stopProcess(input, state);
   recordUnconfirmedDocument(input, state);
   await report(input.progress, 0.75, "removing Hopper private runtime files");
-  await closeRuntimeRoot(input.runtimeRoot, state);
+  if (
+    input.resources.runtimeRoot !== undefined &&
+    (!state.processStopped ||
+      (!input.resources.shutdownConfirmed &&
+        (input.resources.launch?.preparedImagePath !== undefined ||
+          input.resources.launch?.providerLifetime === "external-application")))
+  ) {
+    const resource = input.resources.runtimeRoot.path;
+    state.resources.add(resource);
+    state.issues.push({
+      resource,
+      reason:
+        "Private runtime retained because process or native document closure was not confirmed",
+    });
+  } else {
+    await closeRuntimeRoot(input, state);
+  }
+  if (state.processStopped && input.resources.shutdownConfirmed) {
+    const launch = input.resources.launch;
+    try {
+      await launch?.releaseLease?.();
+      input.resources.launch = undefined;
+    } catch (cause: unknown) {
+      state.resources.add("hopper-lease");
+      state.issues.push({
+        resource: "hopper-lease",
+        reason: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
+  }
   return cleanupOutcome(input, state);
+};
+
+export const confirmExternalApplicationExit = async (
+  resources: HopperOwnedResources,
+  socket: Socket | undefined,
+  releaseTransport: (socket: Socket | undefined) => void,
+  observeExit: typeof observeProcessStartIdentityExit = observeProcessStartIdentityExit,
+): Promise<void> => {
+  const application = resources.externalApplication;
+  if (
+    resources.shutdownConfirmed ||
+    resources.launch?.providerLifetime !== "external-application" ||
+    application?.identity.state !== "readable"
+  )
+    return;
+  if (
+    (await observeExit(application.pid, application.identity.identity)) ===
+    "exited"
+  ) {
+    resources.shutdownConfirmed = true;
+    releaseTransport(socket);
+  }
 };
 
 const requestShutdown = async (
@@ -84,6 +161,7 @@ const requestShutdown = async (
   state: CleanupState,
 ): Promise<void> => {
   if (
+    input.resources.shutdownConfirmed ||
     input.socket === undefined ||
     input.socket.destroyed ||
     input.activeRequest !== null
@@ -99,7 +177,9 @@ const requestShutdown = async (
     return;
   }
   const method =
-    input.retainDocument || input.launch?.shutdownMode === "process-cleanup"
+    (input.retainDocument &&
+      input.resources.launch?.preparedImagePath === undefined) ||
+    input.resources.launch?.shutdownMode === "process-cleanup"
       ? "shutdown"
       : "shutdown_document";
   const shutdown = await input
@@ -108,23 +188,22 @@ const requestShutdown = async (
   if (
     shutdown.ok &&
     isHopperCleanupRequired(shutdown.value) &&
-    input.launch?.shutdownMode === "process-cleanup"
+    input.resources.launch?.shutdownMode === "process-cleanup"
   ) {
-    state.cleanupResult = await input.launch
+    state.cleanupResult = await input.resources.launch
       .cleanup()
       .catch(providerCleanupFailure);
     if (!state.cleanupResult.cleaned) {
-      state.shutdownConfirmed = await fallbackDocumentShutdown(input);
-      state.cleanupResult = await input.launch
-        .cleanup()
-        .catch(providerCleanupFailure);
+      input.resources.shutdownConfirmed = await fallbackDocumentShutdown(input);
     }
   } else if (shutdown.ok) {
-    state.shutdownConfirmed = isHopperShutdownAcknowledgement(shutdown.value);
+    input.resources.shutdownConfirmed = isHopperShutdownAcknowledgement(
+      shutdown.value,
+    );
   }
   if (
     !shutdown.ok ||
-    (!state.shutdownConfirmed && state.cleanupResult === undefined)
+    (!input.resources.shutdownConfirmed && state.cleanupResult === undefined)
   )
     input.logger.warn(
       {
@@ -160,9 +239,7 @@ const shutdownRequestFailure = (
   operation: "shutdown" | "shutdown_document",
   cause: unknown,
 ): HopperProcessError => {
-  const failure = new HopperProcessError(null, undefined, operation);
-  failure.cause = cause;
-  return failure;
+  return new HopperProcessError(null, { operation, cause });
 };
 
 const shutdownFailureDetails = (
@@ -206,7 +283,7 @@ const stopProcess = async (
   input: HopperCleanupInput,
   state: CleanupState,
 ): Promise<void> => {
-  const supervisor = input.processSupervisor;
+  const supervisor = input.resources.processSupervisor;
   if (supervisor === undefined) return;
   const stopped = await supervisor.stop(
     state.cleanupResult === undefined
@@ -227,10 +304,12 @@ const stopProcess = async (
   input.logger.info(diagnostic, "Owned Hopper launcher shutdown completed");
   if (stopped.status !== "incomplete") {
     if (
-      input.launch?.shutdownMode === "process-cleanup" &&
+      input.resources.launch?.providerLifetime === "launcher-process" &&
       stopped.status !== "not-owned"
     )
-      state.shutdownConfirmed = true;
+      input.resources.shutdownConfirmed = true;
+    state.processStopped = true;
+    input.resources.processSupervisor = undefined;
     return;
   }
   const processGroupId = supervisor.launch.ownership?.processGroupId;
@@ -251,8 +330,16 @@ const recordUnconfirmedDocument = (
   state: CleanupState,
 ): void => {
   if (
-    (input.socket === undefined && input.launch === undefined) ||
-    state.shutdownConfirmed
+    input.socket === undefined &&
+    state.processStopped &&
+    input.resources.launch?.providerLifetime === "launcher-process"
+  ) {
+    // Startup never connected a document; the verified provider lifetime ended.
+    input.resources.shutdownConfirmed = true;
+  }
+  if (
+    (input.socket === undefined && input.resources.launch === undefined) ||
+    input.resources.shutdownConfirmed
   )
     return;
   state.resources.add("hopper-document");
@@ -266,11 +353,13 @@ const recordUnconfirmedDocument = (
 };
 
 const closeRuntimeRoot = async (
-  runtimeRoot: PrivateRuntimeRoot | undefined,
+  input: HopperCleanupInput,
   state: CleanupState,
 ): Promise<void> => {
+  const runtimeRoot = input.resources.runtimeRoot;
   try {
     await runtimeRoot?.close();
+    input.resources.runtimeRoot = undefined;
   } catch (cause: unknown) {
     const resource = runtimeRoot?.path ?? "hopper-runtime-root";
     state.resources.add(resource);
@@ -292,9 +381,9 @@ const cleanupOutcome = (
   return err(
     new ProviderCleanupError("hopper", [...state.resources], {
       issues: cleanupIssueDetails(state.issues),
-      ...(input.runtimeRoot === undefined
+      ...(input.resources.runtimeRoot === undefined
         ? {}
-        : { runtime_root: input.runtimeRoot.path }),
+        : { runtime_root: input.resources.runtimeRoot.path }),
       ...(input.activeRequest === null
         ? {}
         : { active_request: activityDetails(input.activeRequest) }),

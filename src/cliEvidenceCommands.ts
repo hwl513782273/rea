@@ -6,11 +6,11 @@ import {
   importEvidenceBundleCommand,
 } from "./application/EvidenceBundleCommands.js";
 import { logCliCommand } from "./cliLogging.js";
-import type { Logger } from "./logger.js";
+import type { Logger } from "pino";
 import { CLI_COMMANDS } from "./cliCommandNames.js";
 import type { JsonValue } from "./domain/jsonValue.js";
 import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
-import { type AnalysisError } from "./domain/analysisErrorBase.js";
+import type { AnalysisError } from "./domain/analysisErrorBase.js";
 
 /** Register caller-path Evidence commands. */
 export const registerEvidenceCommands = (

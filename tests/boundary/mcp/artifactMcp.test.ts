@@ -1,3 +1,8 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
+import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
+import { jsonValueSchema } from "../../../src/domain/jsonValue.js";
+import { artifactInventoryResultSchema } from "../../../src/domain/artifactGraph.js";
+import { ok as resultOk } from "../../../src/domain/result.js";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -14,6 +19,13 @@ import { ArtifactProvider } from "../../../src/artifacts/ArtifactProvider.js";
 import { ARTIFACT_COMPARISON_EXAMPLE } from "../../../src/contracts/artifactComparisonExample.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed } from "../../fixtures/analysisExecution.js";
+
+const integrityMessage = (unpacked: boolean): string =>
+  `${
+    unpacked
+      ? "Declared ASAR integrity for unpacked entry main.js contradicts its companion file; packaging tools commonly sign or strip unpacked native binaries after writing the archive."
+      : "Artifact bytes contradict declared integrity."
+  } If expected, rerun inspect_artifact with integrity_policy=record-and-continue (CLI: --integrity-policy record-and-continue) to retain observed bytes as untrusted; otherwise get a fresh copy.`;
 
 it.each([
   { unpacked: false, label: "embedded" },
@@ -43,8 +55,8 @@ it.each([
       await writeFile(archive, bytes);
     }
 
-    const session = createTestBinarySession(new ArtifactProvider());
-    const server = createServer(session, session);
+    const session = createTestBinarySession(new ArtifactProvider(process.env));
+    const server = createServer({ kind: "session", session });
     const client = new Client({ name: "asar-integrity-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -62,12 +74,11 @@ it.each([
         arguments: {},
       });
       expect(result.isError).toBe(true);
-      expect(result.structuredContent).toEqual({
+      expect(parseMcpToolError(result)).toEqual({
         error: {
           code: "artifact_integrity_mismatch",
           category: "integrity_mismatch",
-          message:
-            "Artifact is invalid or has changed. Get a fresh copy and try again.",
+          message: integrityMessage(unpacked),
           details: {
             logical_path: "main.js",
             declared_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
@@ -75,10 +86,7 @@ it.each([
             unpacked,
           },
           retryable: false,
-          remediation: {
-            action:
-              "Artifact is invalid or has changed. Get a fresh copy and try again.",
-          },
+          remediation: { action: integrityMessage(unpacked) },
         },
       });
     } finally {
@@ -92,20 +100,6 @@ it.each([
   20_000,
 );
 
-const artifactInventoryResultSchema = z.object({
-  occurrences: z.array(
-    z.object({ logical_path: z.string(), hash_status: z.string() }),
-  ),
-  integrity_contradictions: z.array(
-    z.object({
-      logical_path: z.string(),
-      declared_sha256: z.string(),
-      observed_sha256: z.string(),
-      trust: z.literal("observed-untrusted"),
-    }),
-  ),
-});
-
 it("extracts an active archive through MCP when requested", async () => {
   const root = await createTestTempDirectory("rea-artifact-extract-mcp-");
   const archive = join(root, "fixture.zip");
@@ -113,8 +107,8 @@ it("extracts an active archive through MCP when requested", async () => {
   await zip.add("main.js", new TextReader("console.log('extract');\n"));
   await writeFile(archive, await zip.close());
 
-  const session = createTestBinarySession(new ArtifactProvider());
-  const server = createServer(session, session);
+  const session = createTestBinarySession(new ArtifactProvider(process.env));
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "artifact-extract-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -135,7 +129,7 @@ it("extracts an active archive through MCP when requested", async () => {
     expect(result.isError).not.toBe(true);
     const normalized = z
       .object({ output_root: z.string(), artifacts: z.array(z.unknown()) })
-      .parse(compactResult(result.structuredContent).result);
+      .parse(toolEvidence(result.structuredContent).normalized_result);
     outputRoot = normalized.output_root;
     expect(await readFile(join(outputRoot, "main.js"), "utf8")).toBe(
       "console.log('extract');\n",
@@ -162,8 +156,8 @@ it("extracts a macOS app bundle through MCP", async () => {
   header.writeUInt32LE(2, 12);
   await writeFile(join(contents, "MacOS", "Fixture"), header);
 
-  const session = createTestBinarySession(new ArtifactProvider());
-  const server = createServer(session, session);
+  const session = createTestBinarySession(new ArtifactProvider(process.env));
+  const server = createServer({ kind: "session", session });
   const client = new Client({
     name: "artifact-extract-app-test",
     version: "1",
@@ -187,7 +181,7 @@ it("extracts a macOS app bundle through MCP", async () => {
     expect(result.isError).not.toBe(true);
     const normalized = z
       .object({ output_root: z.string() })
-      .parse(compactResult(result.structuredContent).result);
+      .parse(toolEvidence(result.structuredContent).normalized_result);
     outputRoot = normalized.output_root;
     expect(
       await readFile(join(outputRoot, "Contents", "Info.plist"), "utf8"),
@@ -221,8 +215,8 @@ it("records an explicitly continued mismatch, preserves verified siblings, and n
   bytes.write(secondChanged, secondOffset, "utf8");
   await writeFile(archive, bytes);
 
-  const session = createTestBinarySession(new ArtifactProvider());
-  const server = createServer(session, session);
+  const session = createTestBinarySession(new ArtifactProvider(process.env));
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "asar-continue-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -242,7 +236,7 @@ it("records an explicitly continued mismatch, preserves verified siblings, and n
     expect(result.isError, JSON.stringify(result.structuredContent)).not.toBe(
       true,
     );
-    const compact = compactResult(result.structuredContent);
+    const compact = toolEvidence(result.structuredContent);
     const evidence = session.evidenceById(compact.evidence_id);
     if (evidence === undefined) throw new Error("missing inventory Evidence");
     const inspection = z
@@ -254,7 +248,7 @@ it("records an explicitly continued mismatch, preserves verified siblings, and n
           }),
         ),
       })
-      .parse(compact.result);
+      .parse(compact.normalized_result);
     const inventory = artifactInventoryResultSchema.parse(
       inspection.substeps[0]?.evidence.normalized_result,
     );
@@ -295,7 +289,9 @@ it("records an explicitly continued mismatch, preserves verified siblings, and n
       },
     });
     expect(compared.isError).not.toBe(true);
-    expect(compactResult(compared.structuredContent).result).toMatchObject({
+    expect(
+      toolEvidence(compared.structuredContent).normalized_result,
+    ).toMatchObject({
       status: "contradiction",
       summary: { contradiction: 2 },
       changes: expect.arrayContaining([
@@ -310,6 +306,30 @@ it("records an explicitly continued mismatch, preserves verified siblings, and n
         }),
       ]),
     });
+    const { coverage: _coverage, ...legacyInventory } = inventory;
+    const historical = createEvidence(
+      { path: archive, sha256: inventory.manifest.root_sha256, format: "asar" },
+      compact.provider,
+      {
+        operation: "inventory_artifact",
+        parameters: {},
+        result: jsonValueSchema.parse(legacyInventory),
+      },
+    );
+    const retainedComparison = await client.callTool({
+      name: "compare_artifacts",
+      arguments: { left: evidence, right: historical },
+    });
+    expect(
+      retainedComparison.isError,
+      JSON.stringify(retainedComparison),
+    ).not.toBe(true);
+    expect(
+      toolEvidence(retainedComparison.structuredContent).normalized_result,
+    ).toMatchObject({
+      status: "contradiction",
+      summary: { unchanged: 2, contradiction: 2, unknown: 0 },
+    });
   } finally {
     await Promise.allSettled([client.close(), server.close(), session.close()]);
   }
@@ -319,9 +339,9 @@ it("rejects inline artifact Evidence whose content does not match its ID", async
   const session = createTestBinarySession(() => ({
     health: () => Promise.resolve(),
     execute: () => Promise.resolve(observed(null)),
-    close: () => Promise.resolve(),
+    close: () => Promise.resolve(resultOk(null)),
   }));
-  const server = createServer(session, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({
     name: "artifact-authority-test",
     version: "1",
@@ -357,9 +377,9 @@ it("compares inline inventory Evidence without prior session calls", async () =>
   const session = createTestBinarySession(() => ({
     health: () => Promise.resolve(),
     execute: () => Promise.resolve(observed(null)),
-    close: () => Promise.resolve(),
+    close: () => Promise.resolve(resultOk(null)),
   }));
-  const server = createServer(session, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({
     name: "artifact-ownership-test",
     version: "1",
@@ -376,7 +396,9 @@ it("compares inline inventory Evidence without prior session calls", async () =>
     expect(result.isError, JSON.stringify(result.structuredContent)).not.toBe(
       true,
     );
-    expect(compactResult(result.structuredContent).result).toMatchObject({
+    expect(
+      toolEvidence(result.structuredContent).normalized_result,
+    ).toMatchObject({
       status: "changed",
     });
     expect(
@@ -403,8 +425,8 @@ it("returns full artifact graphs inline and compares changed inventories", async
     new TextReader("changed();"),
   );
   await writeFile(changedArchive, await changedWriter.close());
-  const session = createTestBinarySession(new ArtifactProvider());
-  const server = createServer(session, session);
+  const session = createTestBinarySession(new ArtifactProvider(process.env));
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "artifact-mcp-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -421,7 +443,7 @@ it("returns full artifact graphs inline and compares changed inventories", async
       arguments: {},
     });
     expect(inspected.isError).not.toBe(true);
-    const inspectionResult = compactResult(inspected.structuredContent);
+    const inspectionResult = toolEvidence(inspected.structuredContent);
     const inspectionEvidence = session.evidenceById(
       inspectionResult.evidence_id,
     );
@@ -440,7 +462,7 @@ it("returns full artifact graphs inline and compares changed inventories", async
           substeps_completed: z.literal(1),
         }),
       })
-      .parse(inspectionResult.result);
+      .parse(inspectionResult.normalized_result);
     expect(inspection.substeps).toHaveLength(1);
     expect(
       session.evidenceById(inspection.substeps[0]?.evidence_id ?? ""),
@@ -453,7 +475,7 @@ it("returns full artifact graphs inline and compares changed inventories", async
       arguments: {},
     });
     expect(inventory.isError).not.toBe(true);
-    const inventoryResult = compactResult(inventory.structuredContent);
+    const inventoryResult = toolEvidence(inventory.structuredContent);
     const evidence = session.evidenceById(inventoryResult.evidence_id);
     if (evidence === undefined) throw new Error("missing inventory Evidence");
     expect(evidence).toMatchObject({
@@ -464,7 +486,7 @@ it("returns full artifact graphs inline and compares changed inventories", async
       .object({
         substeps: z.array(z.object({ evidence: z.unknown() })),
       })
-      .parse(inventoryResult.result);
+      .parse(inventoryResult.normalized_result);
     const inventoryEvidence = z
       .object({
         normalized_result: z.object({
@@ -489,12 +511,12 @@ it("returns full artifact graphs inline and compares changed inventories", async
       name: "inspect_artifact",
       arguments: {},
     });
-    const changedResult = compactResult(changedInventory.structuredContent);
+    const changedResult = toolEvidence(changedInventory.structuredContent);
     const changedInspection = z
       .object({
         substeps: z.array(z.object({ evidence: z.unknown() })),
       })
-      .parse(changedResult.result);
+      .parse(changedResult.normalized_result);
     const compared = await client.callTool({
       name: "compare_artifacts",
       arguments: {
@@ -503,8 +525,8 @@ it("returns full artifact graphs inline and compares changed inventories", async
       },
     });
     expect(compared.isError).not.toBe(true);
-    expect(compactResult(compared.structuredContent)).toMatchObject({
-      result: { status: "changed" },
+    expect(toolEvidence(compared.structuredContent)).toMatchObject({
+      normalized_result: { status: "changed" },
       evidence_id: expect.stringMatching(/^ev_/u),
     });
     const unknowns = await client.callTool({
@@ -525,10 +547,4 @@ it("returns full artifact graphs inline and compares changed inventories", async
   }
 });
 
-const compactResult = (value: unknown) =>
-  z
-    .object({
-      result: z.unknown(),
-      evidence_id: z.string(),
-    })
-    .parse(value);
+const toolEvidence = (value: unknown) => parseEvidence(value);

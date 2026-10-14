@@ -1,11 +1,13 @@
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { err, ok } from "../domain/result.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { traverseDirectory } from "./ReferenceSourceReaderEntries.js";
-import {
-  type ReferenceSourceReaderOptions,
-  type ReferenceSourceRead,
-  type ReferenceSourceResult,
-  type TraversalState,
+import type {
+  ReferenceSourceReaderOptions,
+  ReferenceSourceRead,
+  ReferenceSourceResult,
+  TraversalState,
 } from "./ReferenceSourceReaderTypes.js";
 import {
   isAborted,
@@ -13,19 +15,33 @@ import {
   prepareRoot,
 } from "./ReferenceSourceReaderValidate.js";
 
-export type {
-  ReferenceSourceEntry,
-  ReferenceSourceRead,
-  ReferenceSourceReaderOptions,
-} from "./ReferenceSourceReaderTypes.js";
-
 const PATH_RACE_LIMITATION =
   "Path identity is revalidated around operations; Node lacks portable descriptor-relative openat traversal, so a syscall-boundary pathname race remains.";
 
 /** Read a source tree without intentionally following symbolic links. */
 export const readReferenceSource = async (
   root: string,
+  resources: ArtifactResourceScope,
   options: ReferenceSourceReaderOptions = {},
+): Promise<ReferenceSourceResult<ReferenceSourceRead>> => {
+  try {
+    return await resources.run(() => readSource(root, resources, options));
+  } catch (cause: unknown) {
+    if (!(cause instanceof ArtifactReaderFailure)) throw cause;
+    return err({
+      tag: "reference-source-reader",
+      code: cause.reason === "cancelled" ? "cancelled" : "io",
+      message: cause.message,
+      ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
+      cause,
+    });
+  }
+};
+
+const readSource = async (
+  root: string,
+  resources: ArtifactResourceScope,
+  options: ReferenceSourceReaderOptions,
 ): Promise<ReferenceSourceResult<ReferenceSourceRead>> => {
   if (!noFollowOpenSupported())
     return err({
@@ -37,6 +53,7 @@ export const readReferenceSource = async (
   if (!prepared.ok) return prepared;
   const { canonicalRoot, rootIdentity } = prepared.value;
   const state: TraversalState = {
+    resources,
     root: canonicalRoot,
     rootIdentity,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -48,16 +65,16 @@ export const readReferenceSource = async (
     bytesRead: 0,
   };
   const traversal = await traverse(state);
-  if (!traversal.ok) return traversal;
   state.entries.sort((left, right) =>
     compareUnicodeCodePoints(left.path, right.path),
   );
-  return ok({
+  const read: ReferenceSourceRead = {
     root: canonicalRoot,
     entries: state.entries,
     bytesRead: state.bytesRead,
     limitations: [PATH_RACE_LIMITATION],
-  });
+  };
+  return traversal.ok ? ok(read) : err({ ...traversal.error, partial: read });
 };
 
 const traverse = async (

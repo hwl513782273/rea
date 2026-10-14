@@ -1,4 +1,17 @@
-import { requireFunctionDossierOracle } from "../../dist/application/RealHopperAssertions.js";
+import assert from "node:assert/strict";
+
+/**
+ * `requireFunctionDossierOracle` is only used inside `verifyRealHopperFixture`,
+ * which runs against the real Hopper bridge after `build:cached`. Loading it
+ * lazily keeps this module importable from `test:fast` (which docs promise to
+ * run "without build" — see docs/testing.md § test scripts) so that mock-only
+ * callers such as `requireCurrentDocument` and `resolveFixtureProcedure` do
+ * not require `dist/`.
+ */
+const loadFunctionDossierOracle = () =>
+  import("../../dist/application/RealHopperAssertions.js").then(
+    (module) => module.requireFunctionDossierOracle,
+  );
 
 /** Require truthful tri-state permissions from real Hopper memory regions. */
 export const requireTruthfulMemoryRegions = (segments) => {
@@ -10,15 +23,28 @@ export const requireTruthfulMemoryRegions = (segments) => {
     ...(Array.isArray(segment.sections) ? segment.sections : []),
   ]);
   for (const region of regions) {
+    if (
+      typeof region?.name !== "string" ||
+      region.name.length === 0 ||
+      typeof region.start !== "string" ||
+      typeof region.end !== "string"
+    ) {
+      throw new Error(
+        "list_segments omitted observed region identity or bounds",
+      );
+    }
     for (const permission of ["readable", "writable", "executable"]) {
-      if (![true, false, null].includes(region?.[permission])) {
-        throw new Error(`list_segments omitted tri-state ${permission}`);
+      if (region[permission] !== null) {
+        throw new Error(
+          `list_segments invented or omitted unknown ${permission}`,
+        );
       }
     }
     if (
       region.provenance !== "hopper-public-python-api" ||
       region.permissions?.available !== false ||
-      typeof region.permissions.reason !== "string"
+      typeof region.permissions.reason !== "string" ||
+      region.permissions.reason.length === 0
     ) {
       throw new Error("list_segments omitted permission provenance");
     }
@@ -57,7 +83,9 @@ export function requireBridgeDiagnostic(chunks) {
       (diagnostic) =>
         diagnostic.type === "bridge-diagnostic" &&
         diagnostic.category === "invalid_request" &&
-        diagnostic.message === "Invalid Hopper bridge request",
+        diagnostic.message.includes(
+          "Unknown Hopper address or name: __rea_missing_procedure__",
+        ),
     )
   )
     throw new Error("The MCP runtime omitted the correlated Hopper diagnostic");
@@ -71,6 +99,7 @@ export async function verifyRealHopperFixture({
   oracle,
   normalizedResult,
 }) {
+  const requireFunctionDossierOracle = await loadFunctionDossierOracle();
   const main = await resolveFixtureProcedure(
     client,
     options,
@@ -104,7 +133,7 @@ export async function verifyRealHopperFixture({
       },
       options,
     ),
-    "set_comment fixture marker",
+    "set_comment",
   );
   if (commentSet !== true)
     throw new Error("Hopper did not read back the fixture comment marker");
@@ -120,6 +149,53 @@ export async function verifyRealHopperFixture({
       require_assembly: true,
     },
   );
+  const calls = entryDossier.outgoing_references.filter(
+    (edge) => edge.call?.classification === "direct",
+  );
+  assert.ok(
+    calls.some((edge) => edge.target_address === branch.address),
+    "Hopper native direct-call classification was discarded",
+  );
+  const observed = normalizedResult(
+    await client.callTool(
+      {
+        name: "procedure_references",
+        arguments: { procedure: entry.address, direction: "outgoing" },
+      },
+      options,
+    ),
+    "procedure_references",
+  );
+  assert.deepEqual(entryDossier.unresolved_calls, observed.unresolved_calls);
+  assert.equal(
+    observed.reference_kinds_available,
+    false,
+    "Hopper's partial CallReference observations do not expose detailed reference kinds",
+  );
+  assert.ok(
+    Array.isArray(observed.unresolved_calls),
+    "procedure_references omitted its observed unresolved CallReference results",
+  );
+  for (const call of calls) {
+    assert.equal(call.call.provider_type, 2);
+    assert.equal(
+      call.call.provenance,
+      "hopper-public-python-api:CallReference",
+    );
+    assert.equal(
+      call.kind.available,
+      false,
+      "partial call metadata invented detailed reference flags",
+    );
+    assert.deepEqual(
+      observed.references.find(
+        (edge) =>
+          edge.source_address === call.source_address &&
+          edge.target_address === call.target_address,
+      )?.call,
+      call.call,
+    );
+  }
   const branchDossier = requireFunctionDossierOracle(
     await analyzeFixtureProcedure(client, options, branch, normalizedResult),
     {
@@ -153,7 +229,13 @@ export async function verifyRealHopperFixture({
 }
 
 /** Reject malformed, unsafe, or unexpected failure diagnostics from MCP. */
-export function requireSafeDiagnostics(chunks) {
+export function requireSafeDiagnostics(
+  chunks,
+  expectedErrorTools = ["procedure_info"],
+  expectedErrorTags = ["HopperRemoteError"],
+) {
+  const expected = new Set(expectedErrorTools);
+  const tags = new Set(expectedErrorTags);
   const lines = chunks
     .join("")
     .split("\n")
@@ -173,10 +255,8 @@ export function requireSafeDiagnostics(chunks) {
       typeof diagnostic.level !== "number" ||
       diagnostic.level >= 50 ||
       (diagnostic.level >= 40 &&
-        diagnostic.errorTag !== "HopperRemoteError" &&
-        !(
-          diagnostic.tool === "procedure_info" && diagnostic.status === "error"
-        ))
+        !tags.has(diagnostic.errorTag) &&
+        !(expected.has(diagnostic.tool) && diagnostic.status === "error"))
     )
       throw new Error(`The MCP runtime emitted unsafe stderr: ${line}`);
   }
@@ -221,7 +301,7 @@ export async function resolveFixtureProcedure(
       },
       options,
     ),
-    `search_procedures ${expectedName}`,
+    "search_procedures",
   );
   const exactMatches = Array.isArray(matches)
     ? matches.filter(
@@ -247,14 +327,57 @@ export const analyzeFixtureProcedure = async (
   options,
   procedure,
   normalizedResult,
-) =>
-  normalizedResult(
+) => {
+  const reply = await client.callTool(
+    {
+      name: "analyze_function",
+      arguments: { procedure: procedure.address },
+    },
+    options,
+  );
+  const dossier = normalizedResult(reply, "analyze_function");
+  assert.deepEqual(reply.structuredContent.relationship_coverage, {
+    status: "complete",
+  });
+  for (const facet of [
+    "pseudocode",
+    "assembly",
+    "comments",
+    "callers",
+    "callees",
+    "references",
+    "strings_names",
+    "cfg",
+  ])
+    assert.deepEqual(dossier.facet_availability[facet], { available: true });
+  const comparison = normalizedResult(
     await client.callTool(
       {
-        name: "analyze_function",
-        arguments: { procedure: procedure.address },
+        name: "compare_functions",
+        arguments: {
+          left: reply.structuredContent,
+          right: reply.structuredContent,
+        },
       },
       options,
     ),
-    `analyze_function ${procedure.name}`,
+    "compare_functions",
   );
+  assert.deepEqual(
+    Object.fromEntries(
+      comparison.dimensions.map(({ dimension, status }) => [dimension, status]),
+    ),
+    {
+      identity: "unchanged",
+      pseudocode: "unchanged",
+      assembly: "unchanged",
+      comments: "unchanged",
+      calls: "unchanged",
+      references: "unknown",
+      strings_names: "unchanged",
+      cfg: "unchanged",
+    },
+    JSON.stringify(comparison.dimensions),
+  );
+  return dossier;
+};

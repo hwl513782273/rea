@@ -32,7 +32,9 @@ const findingSchema = z.object({
 });
 
 const originalSourceSchema = z.object({
-  source: z.string(),
+  source_index: z.number().int().min(0).optional(),
+  declaration_index: z.number().int().min(0).optional(),
+  source: z.string().nullable(),
   artifact: webTextArtifactSchema.nullable(),
 });
 const originalModuleEdgeSchema = z.object({
@@ -42,9 +44,11 @@ const originalModuleEdgeSchema = z.object({
   resolved_source: z.string().nullable(),
 });
 const sourceMapMappingSchema = z.object({
+  source_index: z.number().int().min(0).optional(),
+  declaration_index: z.number().int().min(0).optional(),
   generated_line: z.number().int().min(1),
   generated_column: z.number().int().min(0),
-  source: z.string(),
+  source: z.string().nullable(),
   original_line: z.number().int().min(1),
   original_column: z.number().int().min(0),
   name: z.string().nullable(),
@@ -52,6 +56,8 @@ const sourceMapMappingSchema = z.object({
 const sourceMapContextShape = {
   script_key: z.string(),
   declared_url: z.string(),
+  // Older saved observations omit this field; current fetches emit string/null.
+  effective_url: z.string().nullable().optional(),
 };
 const parsedSourceMapShape = {
   artifact: webTextArtifactSchema,
@@ -99,29 +105,44 @@ export const webSourceMapsSchema = z
     requested: z.number().int().min(0),
     processed: z.number().int().min(0),
     items: z.array(sourceMapSchema),
+    limitation: z.string().min(1).optional(),
   })
   .superRefine((sourceMaps, context) => {
     if (
-      sourceMaps.requested !== sourceMaps.processed ||
+      sourceMaps.processed > sourceMaps.requested ||
       sourceMaps.processed !== sourceMaps.items.length
     )
       context.addIssue({
         code: "custom",
         message: "Source-map coverage counts are inconsistent",
       });
+    if (
+      sourceMaps.processed < sourceMaps.requested &&
+      sourceMaps.limitation === undefined
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Unprocessed source maps require an explicit coverage limitation",
+        path: ["limitation"],
+      });
     const statuses = sourceMaps.items.map(({ status }) => status);
     const retained = statuses.filter(
       (status) => status === "included" || status === "partial",
     ).length;
     const allowedStatuses =
-      sourceMaps.items.length === 0
-        ? ["not_requested", "unavailable"]
-        : retained === 0
+      sourceMaps.processed < sourceMaps.requested
+        ? retained === 0
           ? ["unavailable"]
-          : retained === sourceMaps.items.length &&
-              !statuses.includes("partial")
-            ? ["included"]
-            : ["partial"];
+          : ["partial"]
+        : sourceMaps.items.length === 0
+          ? ["not_requested", "unavailable"]
+          : retained === 0
+            ? ["unavailable"]
+            : retained === sourceMaps.items.length &&
+                !statuses.includes("partial")
+              ? ["included"]
+              : ["partial"];
     if (!allowedStatuses.includes(sourceMaps.status))
       context.addIssue({
         code: "custom",
@@ -181,7 +202,12 @@ export const webBundleAnalysisSchema = z.object({
   }),
   inferences: z.array(
     z.object({
-      kind: z.enum(["vendor_fingerprint", "route_framework", "bundle_runtime"]),
+      kind: z.enum([
+        "vendor_fingerprint",
+        "route_framework",
+        "bundle_runtime",
+        "endpoint_candidate",
+      ]),
       value: z.string(),
       confidence: z.enum(["low", "medium", "high"]),
       basis: z.array(basisSchema).min(1),

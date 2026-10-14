@@ -1,20 +1,22 @@
 import { z } from "incur";
 
-import { runProviderAnalysis } from "../composition/directAnalysis.js";
-import { createArtifactExtractionDestination } from "../application/ArtifactExtractionDestination.js";
+import type { DirectAnalysis } from "../composition/directAnalysis.js";
+import { createArtifactExtractionDestination } from "../application/artifacts/ArtifactExtractionDestination.js";
 import { logCliCommand } from "../cliLogging.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 
 export const registerArtifactCommands = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
-  registerInspectionCommand(cli, logger);
-  registerExtractionCommand(cli, logger);
-  registerInterfaceBuilderCommand(cli, logger);
-  registerAssetCatalogCommand(cli, logger);
+  registerInspectionCommand(cli, logger, runProviderAnalysis);
+  registerExtractionCommand(cli, logger, runProviderAnalysis);
+  registerInterfaceBuilderCommand(cli, logger, runProviderAnalysis);
+  registerAssetCatalogCommand(cli, logger, runProviderAnalysis);
+  registerDylibResolutionCommand(cli, logger, runProviderAnalysis);
   cli.command(CLI_COMMANDS.inspectKeyedArchive, {
     description:
       "Inspect a Foundation keyed archive as an object-reference graph",
@@ -58,9 +60,50 @@ export const registerArtifactCommands = (
   });
 };
 
+const registerDylibResolutionCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.traceDylibResolution, {
+    description:
+      "Trace dyld load-path resolution for a Mach-O or every executable in an app bundle",
+    args: z.object({
+      path: z.string().describe("Mach-O file or Apple .app bundle path"),
+    }),
+    options: z.object({
+      root: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Process root relative to the bundle or the Mach-O's directory (repeatable)",
+        ),
+      architecture: z
+        .enum(["arm64", "arm64e", "x86_64"])
+        .optional()
+        .describe("Trace only this slice of each root"),
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, CLI_COMMANDS.traceDylibResolution, () =>
+        runProviderAnalysis(
+          args.path,
+          "trace_dylib_resolution",
+          {
+            ...(options.root === undefined ? {} : { roots: options.root }),
+            ...(options.architecture === undefined
+              ? {}
+              : { architecture: options.architecture }),
+          },
+          logger,
+        ),
+      ),
+  });
+};
+
 const registerAssetCatalogCommand = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.inspectAssetCatalog, {
     description: "Inspect compiled Apple asset catalog metadata",
@@ -80,7 +123,6 @@ const registerAssetCatalogCommand = (
         .default(1_000)
         .describe("Maximum records to return"),
     }),
-    alias: {},
     run: ({ args, options }) =>
       logCliCommand(logger, CLI_COMMANDS.inspectAssetCatalog, () =>
         runProviderAnalysis(
@@ -96,6 +138,7 @@ const registerAssetCatalogCommand = (
 const registerInterfaceBuilderCommand = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.decodeInterfaceBuilder, {
     description:
@@ -126,11 +169,6 @@ const registerInterfaceBuilderCommand = (
         .default(40_000)
         .describe("Maximum decoded connections"),
     }),
-    alias: {
-      maxDocuments: "max-documents",
-      maxObjects: "max-objects",
-      maxConnections: "max-connections",
-    },
     run: ({ args, options }) =>
       logCliCommand(logger, "decode-interface-builder", () =>
         runProviderAnalysis(
@@ -147,31 +185,13 @@ const registerInterfaceBuilderCommand = (
   });
 };
 
-const registerExtractionCommand = (cli: CliInstance, logger: Logger): void => {
+const registerExtractionCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
   cli.command(CLI_COMMANDS.extractArtifact, {
     description: "Extract all regular artifact contents safely",
-    args: z.object({
-      path: z.string().describe("Application or package path"),
-    }),
-    options: z.object({}),
-    run: ({ args }) =>
-      logCliCommand(logger, "extract-artifact", () =>
-        runProviderAnalysis(
-          args.path,
-          "extract_artifact",
-          {
-            output_root: createArtifactExtractionDestination(),
-          },
-          logger,
-        ),
-      ),
-  });
-};
-
-const registerInspectionCommand = (cli: CliInstance, logger: Logger): void => {
-  cli.command(CLI_COMMANDS.inspectArtifact, {
-    description:
-      "Inspect one artifact and return all available observations and next probes",
     args: z.object({
       path: z.string().describe("Application or package path"),
     }),
@@ -181,9 +201,38 @@ const registerInspectionCommand = (cli: CliInstance, logger: Logger): void => {
         .default("fail")
         .describe("Behavior when declared artifact integrity does not match"),
     }),
-    alias: {
-      integrityPolicy: "integrity-policy",
-    },
+    run: ({ args, options }) =>
+      logCliCommand(logger, "extract-artifact", () =>
+        runProviderAnalysis(
+          args.path,
+          "extract_artifact",
+          {
+            integrity_policy: options.integrityPolicy,
+            output_root: createArtifactExtractionDestination(),
+          },
+          logger,
+        ),
+      ),
+  });
+};
+
+const registerInspectionCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.inspectArtifact, {
+    description:
+      "Inspect one artifact and return all available observations and next probes",
+    args: z.object({
+      path: z.string().min(1).describe("Application or package path"),
+    }),
+    options: z.object({
+      integrityPolicy: z
+        .enum(["fail", "record-and-continue"])
+        .default("fail")
+        .describe("Behavior when declared artifact integrity does not match"),
+    }),
     run: ({ args, options }) =>
       logCliCommand(logger, "inspect-artifact", () =>
         runProviderAnalysis(

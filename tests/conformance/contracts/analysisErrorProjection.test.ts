@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { ProcessCaptureError } from "../../../src/application/ProcessCaptureError.js";
+import { ProcessCaptureError } from "../../../src/process/capture/ProcessCaptureError.js";
 import { analysisErrorProjectionSchema } from "../../../src/contracts/errorSchemas.js";
 import { ArtifactOperationError } from "../../../src/domain/artifactOperationError.js";
 import { EvidenceFileError } from "../../../src/domain/evidenceErrors.js";
 import { HopperRemoteError } from "../../../src/domain/hopperErrors.js";
 import { UnknownRegistryError } from "../../../src/domain/unknownRegistryError.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
-import { type AnalysisError } from "../../../src/domain/analysisErrorBase.js";
+import type { AnalysisError } from "../../../src/domain/analysisErrorBase.js";
 
 describe("analysis error projection contract", () => {
-  it("accepts every closed error-reason variant without exposing diagnostics", () => {
+  it("accepts every closed error-reason variant", () => {
     const variants: AnalysisError[] = [
       ...(
         [
@@ -25,7 +25,7 @@ describe("analysis error projection contract", () => {
       ).map(
         (reason) => new ArtifactOperationError("inventory_artifact", reason),
       ),
-      ...(["not-file", "exists", "invalid-json", "io"] as const).map(
+      ...(["not-file", "exists", "invalid-json", "missing", "io"] as const).map(
         (reason) => new EvidenceFileError("read", reason),
       ),
       ...(
@@ -40,7 +40,9 @@ describe("analysis error projection contract", () => {
       ).map((reason) => new UnknownRegistryError(reason)),
       ...(["capture_failed", "cleanup_incomplete", "cancelled"] as const).map(
         (reason) =>
-          new ProcessCaptureError("SECRET capture diagnostic", { reason }),
+          new ProcessCaptureError("API_TOKEN=selected capture diagnostic", {
+            reason,
+          }),
       ),
       ...(
         [
@@ -62,7 +64,11 @@ describe("analysis error projection contract", () => {
         JSON.stringify({ variant, projected }),
       ).toMatchObject({ success: true });
       expect(projected.code).toMatch(/^[a-z][a-z0-9_]*$/u);
-      expect(JSON.stringify(projected)).not.toContain("SECRET");
+      if (variant instanceof ProcessCaptureError)
+        expect(projected).toMatchObject({
+          message: variant.message,
+          details: { execution_failure: variant.message },
+        });
     }
   });
 });

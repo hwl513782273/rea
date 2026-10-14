@@ -5,23 +5,23 @@ import {
   JAVASCRIPT_SEMANTIC_RELATIONS,
   javaScriptSemanticNodeSchema,
   javaScriptSemanticRelationSchema,
+  javaScriptSemanticEvidenceContextSchema,
   javaScriptSemanticUnknownSchema,
 } from "./javascriptSemanticGraphSchemas.js";
-import { jsonValueSchema } from "../jsonValue.js";
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
 
 const semanticNodeIdSchema = prefixedDigestSchema("jsrg_node");
+const literalValueSchema = z.union([
+  z.string(),
+  z.number(),
+  z.boolean(),
+  z.null(),
+]);
+
 const literalSeedSchema = z.strictObject({
   kind: z.literal("literal"),
-  value: jsonValueSchema.refine(
-    (value) =>
-      value === null ||
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean",
-    "Literal seeds accept only JSON primitive values",
-  ),
+  value: literalValueSchema,
 });
 
 /** Authenticated starting points accepted by semantic tracing. */
@@ -88,6 +88,7 @@ export const javaScriptSemanticQueryResultSchema = z.strictObject({
   direction: javaScriptSemanticQueryInputSchema.shape.direction,
   status: z.enum(["found", "no-match", "ambiguous", "partial", "unsupported"]),
   seed_node_ids: z.array(semanticNodeIdSchema),
+  evidence_contexts: z.array(javaScriptSemanticEvidenceContextSchema),
   nodes: z.array(javaScriptSemanticNodeSchema),
   relations: z.array(javaScriptSemanticRelationSchema),
   unknowns: z.array(javaScriptSemanticUnknownSchema),

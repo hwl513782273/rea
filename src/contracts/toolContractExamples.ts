@@ -26,6 +26,7 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   resolve_native_call_targets: { address: "0x1000" },
   read_function_instructions: { procedure: "main" },
   read_bytes: { address: "0x1000", length: 16 },
+  search_bytes: { pattern: "48 8B ?? ?? 89" },
   address_to_file_offset: { address: "0x1000" },
   procedure_references: { procedure: "main" },
   procedure_pseudo_code: { procedure: "main" },
@@ -36,7 +37,6 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   set_addresses_names: { names: { "0x1000": "entry" } },
   set_bookmark: { address: "0x1000" },
   set_comment: { address: "0x1000", comment: "validated entry point" },
-  set_current_document: { document: "fixture" },
   set_inline_comment: { address: "0x1000", comment: "calls parser" },
   unset_bookmark: { address: "0x1000" },
   get_call_graph: { address: "0x1000" },
@@ -54,11 +54,17 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   trace_native_ui_action: { action: "buildTapped:" },
   open_binary: { path: "/tmp/fixture" },
   export_evidence_bundle: { path: "/tmp/evidence.json" },
+  get_evidence_bundle: {
+    detail: "summary",
+    filters: { operation: "analyze_function", procedure_address: "0x1000" },
+  },
   inspect_address_context: { address: "0x1000" },
-  import_evidence_bundle: { path: "evidence.json" },
+  import_evidence_bundle: { path: "/tmp/evidence.json" },
   capture_process_scenario: {
     executable: "/usr/bin/true",
     working_directory: "/tmp",
+    timeout_ms: 30_000,
+    finalization_ms: 1_500,
   },
   compare_process_captures: {
     left: PROCESS_CAPTURE_REFERENCE,
@@ -75,5 +81,33 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   compare_bundles: {
     left_bundle_path: "/tmp/left-evidence.json",
     right_bundle_path: "/tmp/right-evidence.json",
+  },
+  inspect_with_objdump: {
+    path: "/tmp/program",
+    operation: "disassemble",
+  },
+  execute_rizin_command: { path: "/tmp/program", command: "iI" },
+  list_frida_devices: {},
+  list_frida_processes: { device_id: "local" },
+  start_frida_session: { mode: "attach", device_id: "local", pid: 1234 },
+  load_frida_script: {
+    session_id: "00000000-0000-4000-8000-000000000001",
+    source_kind: "inline",
+    source: "send(Process.id);",
+  },
+  resume_frida_session: { session_id: "00000000-0000-4000-8000-000000000001" },
+  unload_frida_script: {
+    session_id: "00000000-0000-4000-8000-000000000001",
+    script_id: "00000000-0000-4000-8000-000000000002",
+  },
+  frida_session_status: { session_id: "00000000-0000-4000-8000-000000000001" },
+  close_frida_session: { session_id: "00000000-0000-4000-8000-000000000001" },
+  instrument_with_frida: {
+    mode: "attach",
+    device_id: "local",
+    pid: 1234,
+    source_kind: "inline",
+    source: "send(Process.id);",
+    duration_ms: 1_000,
   },
 };

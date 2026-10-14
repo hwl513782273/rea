@@ -37,6 +37,13 @@ export const legacyMetadataSchema = z
     base: idaAddressSchema,
   })
   .passthrough();
+/** A worker that is still busy right after opening reports this transient shape instead of its identity. */
+export const busyHealthSchema = z
+  .object({
+    status: z.literal("busy"),
+    busy_tool: z.string().optional(),
+  })
+  .passthrough();
 export const modernHealthSchema = z
   .object({
     status: z.literal("ok"),
@@ -78,15 +85,13 @@ export const modernPageSchema = z
   )
   .length(1);
 
-export const modernLookupSchema = z
-  .array(
-    z.object({
-      query: z.string(),
-      fn: idaFunctionSchema.nullable(),
-      error: z.string().nullable(),
-    }),
-  )
-  .length(1);
+const modernLookupRowSchema = z.object({
+  query: z.string(),
+  fn: idaFunctionSchema.nullable(),
+  error: z.string().nullable(),
+});
+export const modernLookupBatchSchema = z.array(modernLookupRowSchema);
+export const modernLookupSchema = modernLookupBatchSchema.length(1);
 
 const instructionSchema = z.union([
   z.object({
@@ -175,6 +180,31 @@ export const modernCalleesSchema = z
     }),
   )
   .length(1);
+/** Depth-one `callgraph` reply: one row per root, with function-only call edges. */
+export const modernCallGraphSchema = z
+  .array(
+    z
+      .object({
+        root: z.string(),
+        error: z.string().optional(),
+        nodes: z.array(
+          z.object({ addr: idaAddressSchema, name: z.string().nullable() }),
+        ),
+        edges: z.array(
+          z.object({
+            from: idaAddressSchema,
+            to: idaAddressSchema,
+            type: z.string(),
+          }),
+        ),
+        truncated: z.boolean().optional(),
+        limit_reason: z.string().nullable().optional(),
+        max_edges_per_func: z.number().int().positive().optional(),
+        per_func_capped: z.boolean().optional(),
+      })
+      .passthrough(),
+  )
+  .length(1);
 export const legacyCalleesSchema = z.array(
   z.object({ address: idaAddressSchema, name: z.string() }).passthrough(),
 );
@@ -188,6 +218,14 @@ export const openDatabaseSchema = z
       .passthrough(),
   })
   .passthrough();
+/** Only an explicit completed rejection preserves legacy no-worker cleanup. */
+export const rejectedOpenDatabaseSchema = z
+  .object({
+    error: z.string().min(1),
+    success: z.never().optional(),
+  })
+  .passthrough();
+
 export const databaseListSchema = z
   .object({
     sessions: z.array(
@@ -212,3 +250,58 @@ export const closeDatabaseSchema = z
     backend: z.enum(["worker", "gui"]),
   })
   .passthrough();
+/** Supervisor response when the requested worker was already reaped. */
+export const absentDatabaseCloseSchema = (sessionId: string) =>
+  z
+    .object({ error: z.literal(`Session not found: ${sessionId}`) })
+    .passthrough();
+
+// Piped, so a malformed coordinate is a schema issue and never reaches BigInt.
+const hexCoordinate = z
+  .string()
+  .regex(/^0x[0-9a-f]+$/iu)
+  .pipe(z.transform((value) => BigInt(value)));
+
+/**
+ * The minimal `survey_binary` reply, reduced to validated segment intervals
+ * (exclusive ends). Any malformed, reversed or inconsistent fact rejects the
+ * whole reply, because a membership answer needs every segment.
+ */
+export const surveySegmentsSchema = z
+  .object({
+    statistics: z
+      .object({ total_segments: z.number().int().nonnegative().optional() })
+      .passthrough()
+      .optional(),
+    segments: z
+      .array(
+        z
+          .object({
+            start: hexCoordinate,
+            end: hexCoordinate,
+            size: hexCoordinate.optional(),
+          })
+          .passthrough(),
+      )
+      .min(1),
+  })
+  .passthrough()
+  .superRefine(({ statistics, segments }, context) => {
+    if (
+      statistics?.total_segments !== undefined &&
+      statistics.total_segments !== segments.length
+    )
+      context.addIssue({
+        code: "custom",
+        message: "survey segment count disagrees with its statistics",
+      });
+    for (const { start, end, size } of segments) {
+      // A malformed row has already reported its own issue; refinements still run.
+      if (typeof start !== "bigint" || typeof end !== "bigint") continue;
+      if (start >= end || (size !== undefined && size !== end - start))
+        context.addIssue({
+          code: "custom",
+          message: "survey segment bounds are reversed or inconsistent",
+        });
+    }
+  });

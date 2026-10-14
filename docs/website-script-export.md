@@ -10,8 +10,11 @@ verified manifest into one caller-selected, absent directory.
 For passive inspection, select `include_script_sources: true` (CLI:
 `--include-script-sources`). For scenarios, select
 `capture.network.response_body: true`. Save either the complete Evidence record
-or its normalized result as UTF-8 JSON. The compact MCP wrapper's `evidence`
-field contains the complete Evidence record.
+or its normalized result as UTF-8 JSON. MCP `structuredContent` contains the complete Evidence record.
+
+The capture must be a regular file. A symlink to a regular file is accepted;
+directories, named pipes and device files are rejected before reading capture
+bytes or creating output.
 
 ```sh
 rea export-web-scripts /analysis/capture.json /analysis/exported-scripts --json
@@ -45,9 +48,14 @@ its own descriptor. It does not duplicate script bytes.
 - Passive sources are the Debugger-exposed text encoded as UTF-8, with the
   verified source digest and source-map declaration retained. Unavailable or
   explicitly non-JavaScript sources remain unavailable.
-- Scenario sources use observed requests classified as `script`, matched to
-  completed response bytes by transaction and event identity. URLs never select
-  the response. Binary and empty retained bytes are written exactly.
+- Scenario sources use observed requests classified as `script`, associated
+  with one response event and the bytes returned by Playwright's
+  `Response.body()` API for its response object. URLs never select the response.
+  Playwright may load the request URL again with credentials when CDP has no
+  response body, so transaction and event references do not verify that
+  exported bytes came from the original network transaction. The capture and
+  export manifest retain this limitation. Binary and empty retained bytes are
+  written exactly.
 - Ordinary query-free `.js`, `.mjs`, and `.cjs` URL paths are arranged under a
   directory for each origin, preserving their relative module layout when it
   is unambiguous.
@@ -59,8 +67,9 @@ its own descriptor. It does not duplicate script bytes.
 ## Interpretation and limits
 
 Export does not fetch URLs or execute JavaScript. Retained Debugger sources and
-response bytes do not establish execution or a complete website. Response bytes
-are browser-decoded bytes; they do not represent transfer encoding. Declared
+response bytes do not establish execution or a complete website. Scenario
+response bytes preserve Playwright's body API result; see the source-body
+identity limitation above. Declared
 redaction is preserved and can change JavaScript syntax; passive captures do
 not report a byte-redaction flag, so that value remains unknown.
 

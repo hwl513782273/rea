@@ -1,25 +1,26 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import { afterEach, expect, it } from "vitest";
 
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
+import { toolContract } from "../../../src/contracts/toolContracts.js";
 import type {
   AnalysisClient,
-  AnalysisOperationPort,
   AnalysisProvider,
   CapabilityDescriptor,
 } from "../../../src/application/AnalysisProvider.js";
 import { AnalysisCapabilityUnavailableError } from "../../../src/domain/analysisErrorCore.js";
-import { err } from "../../../src/domain/result.js";
+import { err, ok as resultOk } from "../../../src/domain/result.js";
 import { observed as ok } from "../../fixtures/analysisExecution.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { parseEvidenceBundle } from "../../../src/domain/evidenceBundle.js";
-import { processCaptureSchema } from "../../../src/domain/processCapture.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../../src/contracts/processCaptureExample.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../../../src/domain/process/processCaptureExample.js";
 import { jsonValueSchema } from "../../../src/domain/jsonValue.js";
-import { PROCESS_PROVIDER } from "../../../src/server/sessionToolPolicies.js";
+import { PROCESS_PROVIDER } from "../../../src/domain/process/processEvidenceProvider.js";
 
+import { processCaptureSchema } from "../../../src/domain/process/processCapture.js";
 const resources: Array<{ close(): Promise<void> }> = [];
 
 afterEach(async () => {
@@ -61,13 +62,24 @@ const providerWithCapabilities = (
     identity: () => identity,
     capabilities: () => capabilities,
     createClient: () => ({
-      execute: () => Promise.resolve(ok(null)),
-      close: () => Promise.resolve(),
+      execute: (operation) => {
+        return Promise.resolve(
+          err(
+            new AnalysisCapabilityUnavailableError(
+              "fixture",
+              operation,
+              "Decompiler is not installed.",
+            ),
+          ),
+        );
+      },
+      close: () => Promise.resolve(resultOk(null)),
     }),
   };
 };
 
 const structured = (result: CallToolResult): Record<string, unknown> => {
+  if (result.isError === true) return parseMcpToolError(result);
   if (
     typeof result.structuredContent !== "object" ||
     result.structuredContent === null
@@ -77,25 +89,10 @@ const structured = (result: CallToolResult): Record<string, unknown> => {
 };
 
 it("does not record capability unavailability without supporting Evidence", async () => {
-  const received: Array<Readonly<Record<string, unknown>>> = [];
-  const analysis: AnalysisOperationPort = {
-    execute: (name, arguments_) => {
-      received.push(arguments_);
-      return Promise.resolve(
-        err(
-          new AnalysisCapabilityUnavailableError(
-            "partial",
-            name,
-            "Decompiler is not installed.",
-          ),
-        ),
-      );
-    },
-  };
   const session = createTestBinarySession(
     providerWithCapabilities(["procedure_pseudo_code"]),
   );
-  const server = createServer(analysis, session);
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "unavailable-unknown", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -116,10 +113,9 @@ it("does not record capability unavailability without supporting Evidence", asyn
   expect(unavailable.isError).toBe(true);
   expect(structured(unavailable)).toMatchObject({
     error: {
-      category: "unsupported_provider",
+      category: "unavailable",
     },
   });
-  expect(received[0]).toMatchObject({ procedure: "main" });
   expect(
     structured(await client.callTool({ name: "list_unknowns", arguments: {} })),
   ).toMatchObject({
@@ -134,7 +130,7 @@ it("records capture disagreement as a contradicted unknown", async () => {
     () =>
       ({
         execute: () => Promise.resolve(ok(null)),
-        close: () => Promise.resolve(),
+        close: () => Promise.resolve(resultOk(null)),
       }) satisfies AnalysisClient,
   );
   const left = processCaptureSchema.parse(EMPTY_PROCESS_CAPTURE_EXAMPLE);
@@ -164,10 +160,7 @@ it("records capture disagreement as a contradicted unknown", async () => {
   const rightEvidence = captureEvidence(right);
   expect(session.recordEvidence(leftEvidence).ok).toBe(true);
   expect(session.recordEvidence(rightEvidence).ok).toBe(true);
-  const server = createServer(
-    { execute: () => Promise.resolve(ok(null)) },
-    session,
-  );
+  const server = createServer({ kind: "session", session });
   const client = new Client({ name: "comparison-unknown", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -195,7 +188,7 @@ it("records capture disagreement as a contradicted unknown", async () => {
     },
   });
   expect(compared.isError).not.toBe(true);
-  const firstEvidence = parseEvidence(structured(compared).evidence);
+  const firstEvidence = parseEvidence(structured(compared));
   expect(
     structured(await client.callTool({ name: "list_unknowns", arguments: {} })),
   ).toMatchObject({
@@ -227,7 +220,7 @@ it("records capture disagreement as a contradicted unknown", async () => {
   expect(secondComparison.isError, JSON.stringify(secondComparison)).not.toBe(
     true,
   );
-  const secondEvidence = parseEvidence(structured(secondComparison).evidence);
+  const secondEvidence = parseEvidence(structured(secondComparison));
   expect(secondEvidence.normalized_result).toMatchObject({
     status: "changed",
     interaction: "added",
@@ -250,12 +243,164 @@ it("records capture disagreement as a contradicted unknown", async () => {
     arguments: { left: leftEvidence, right: repeatedCapture },
   });
   expect(repeatedComparison.isError).not.toBe(true);
-  expect(parseEvidence(structured(repeatedComparison).evidence)).toEqual(
-    secondEvidence,
-  );
+  expect(parseEvidence(structured(repeatedComparison))).toEqual(secondEvidence);
   expect(
     parseEvidenceBundle(
       structured(await client.callTool({ name: "get_evidence_bundle" })).result,
     ),
   ).toEqual(beforeRepeat);
+});
+
+it("pages filtered unknown heads through the public MCP contract", async () => {
+  const session = createTestBinarySession(providerWithCapabilities([]));
+  const server = createServer({ kind: "session", session });
+  const client = new Client({ name: "unknown-pagination", version: "1" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  resources.push(client, server);
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+
+  const created = [
+    ["matching c", "high", "pagination"],
+    ["matching a", "high", "pagination"],
+    ["matching b", "high", "pagination"],
+    ["filtered severity", "medium", "pagination"],
+    ["filtered domain", "high", "other"],
+  ] as const;
+  for (const [question, severity, domain] of created) {
+    const result = session.recordUnknown({
+      question,
+      severity,
+      domain,
+      required_authority: "analyst-inference",
+      required_confidence: "observed",
+      required_environment: null,
+      recommended_probes: [],
+      relationships: [],
+      supporting_evidence_ids: [],
+      contradicting_evidence_ids: [],
+    });
+    if (!result.ok) throw result.error;
+  }
+
+  const defaultPage = structured(
+    await client.callTool({ name: "list_unknowns", arguments: {} }),
+  ).result as {
+    items: { unknown_id: string }[];
+    total: number;
+    offset: number;
+    next_offset: number | null;
+  };
+  expect(defaultPage.items.map(({ unknown_id }) => unknown_id)).toEqual(
+    defaultPage.items.map(({ unknown_id }) => unknown_id).sort(),
+  );
+  expect(defaultPage).toMatchObject({ total: 5, offset: 0, next_offset: null });
+
+  const detached = session.listUnknownsPage({ limit: 1 });
+  const detachedHead = detached.items[0];
+  if (detachedHead === undefined) throw new Error("Expected one unknown head");
+  const originalQuestion = detachedHead.question;
+  Reflect.set(detachedHead, "question", "changed outside the ledger");
+  expect(
+    session
+      .listUnknowns()
+      .find(({ unknown_id }) => unknown_id === detachedHead.unknown_id)
+      ?.question,
+  ).toBe(originalQuestion);
+
+  const offsetWithoutLimit = structured(
+    await client.callTool({
+      name: "list_unknowns",
+      arguments: { domain: "pagination", offset: 1 },
+    }),
+  ).result as typeof defaultPage;
+  expect(offsetWithoutLimit).toMatchObject({
+    total: 4,
+    offset: 1,
+    next_offset: null,
+  });
+  expect(offsetWithoutLimit.items).toHaveLength(3);
+
+  const noMatches = structured(
+    await client.callTool({
+      name: "list_unknowns",
+      arguments: { domain: "no-such-domain", limit: 2 },
+    }),
+  ).result as typeof defaultPage;
+  expect(noMatches).toMatchObject({
+    items: [],
+    total: 0,
+    offset: 0,
+    next_offset: null,
+  });
+
+  const beyondEnd = structured(
+    await client.callTool({
+      name: "list_unknowns",
+      arguments: { domain: "pagination", offset: 100, limit: 2 },
+    }),
+  ).result as typeof defaultPage;
+  expect(beyondEnd).toMatchObject({
+    total: 4,
+    offset: 100,
+    next_offset: null,
+  });
+  expect(beyondEnd.items).toEqual([]);
+
+  const maximumSafePage = structured(
+    await client.callTool({
+      name: "list_unknowns",
+      arguments: {
+        offset: Number.MAX_SAFE_INTEGER,
+        limit: Number.MAX_SAFE_INTEGER,
+      },
+    }),
+  ).result as typeof defaultPage;
+  expect(maximumSafePage).toMatchObject({
+    total: 5,
+    offset: Number.MAX_SAFE_INTEGER,
+    next_offset: null,
+  });
+  expect(maximumSafePage.items).toEqual([]);
+
+  const request = {
+    name: "list_unknowns",
+    arguments: { domain: "pagination", severity: "high", limit: 2 },
+  } as const;
+  const first = structured(await client.callTool(request))
+    .result as typeof defaultPage;
+  expect(first).toMatchObject({ total: 3, offset: 0, next_offset: 2 });
+  expect(first.items).toHaveLength(2);
+  const secondResponse = await client.callTool({
+    ...request,
+    arguments: { ...request.arguments, offset: first.next_offset ?? 0 },
+  });
+  const second = structured(secondResponse).result as typeof defaultPage;
+  expect(second).toMatchObject({ total: 3, offset: 2, next_offset: null });
+  expect(second.items).toHaveLength(1);
+  expect(
+    [...first.items, ...second.items].map(({ unknown_id }) => unknown_id),
+  ).toEqual(
+    session
+      .listUnknowns({ domain: "pagination", severity: "high" })
+      .map(({ unknown_id }) => unknown_id),
+  );
+  expect(
+    toolContract("list_unknowns").outputSchema.safeParse(
+      secondResponse.structuredContent,
+    ).success,
+  ).toBe(true);
+
+  for (const arguments_ of [
+    { limit: 0 },
+    { offset: -1 },
+    { offset: Number.MAX_SAFE_INTEGER + 1 },
+    { unexpected: true },
+  ]) {
+    expect(
+      (await client.callTool({ name: "list_unknowns", arguments: arguments_ }))
+        .isError,
+    ).toBe(true);
+  }
 });

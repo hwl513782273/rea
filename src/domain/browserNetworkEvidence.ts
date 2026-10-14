@@ -1,20 +1,29 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
-/** Caller-selected network content; omission retains metadata alone. */
+export const PLAYWRIGHT_RESPONSE_BODY_PROVENANCE_LIMITATION =
+  "Captured response-body bytes are the result of Playwright's Response.body() API. Playwright may satisfy that API with a credentialed follow-up load of the request URL when CDP has no body, so transaction and event links do not verify that retained bytes came from the original network transaction.";
+
+/** Resolved network content selection recorded by a capture. */
 export const browserNetworkContentSelectionValuesSchema = z.strictObject({
-  request_body: z.boolean().default(false),
-  response_body: z.boolean().default(false),
-  header_values: z.boolean().default(false),
+  request_body: z.boolean(),
+  response_body: z.boolean(),
+  header_values: z.boolean(),
 });
 
-/** Input omission selects metadata without defaulting legacy capture coverage. */
+/** Caller omission selects metadata alone; individual content facets remain optional. */
 export const browserNetworkContentSelectionSchema =
-  browserNetworkContentSelectionValuesSchema.default({
-    request_body: false,
-    response_body: false,
-    header_values: false,
-  });
+  browserNetworkContentSelectionValuesSchema
+    .extend({
+      request_body: z.boolean().default(false),
+      response_body: z.boolean().default(false),
+      header_values: z.boolean().default(false),
+    })
+    .default({
+      request_body: false,
+      response_body: false,
+      header_values: false,
+    });
 
 /** Self-verifying retained bytes, after any declared-secret redaction. */
 export const browserNetworkBodySchema = z.union([
@@ -37,6 +46,9 @@ export const browserNetworkBodySchema = z.union([
       state: z.literal("captured"),
       representation: z.enum([
         "browser-exposed-request-bytes",
+        "playwright-response-body-bytes",
+        // Retained for captures produced before response-body provenance was
+        // narrowed to the bytes Playwright exposes through Response.body().
         "browser-decoded-response-bytes",
       ]),
       encoding: z.literal("base64"),

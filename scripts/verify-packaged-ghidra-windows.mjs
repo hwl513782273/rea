@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import {
+  expandProviderOutput,
+  requireMcpOperationResult,
+} from "./lib/mcp-verifier-results.mjs";
+import { verifyGhidraCompactReferences } from "./lib/real-ghidra-compact-references.mjs";
+import { verifyWindowsGhidraByteSearch } from "./lib/ghidra-windows-byte-search.mjs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -12,9 +18,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -23,12 +29,54 @@ if (process.platform !== "win32" || process.arch !== "x64")
   throw new Error(
     "Packaged Windows Ghidra acceptance requires a Windows x64 host.",
   );
-const workspace = await mkdtemp(join(tmpdir(), "rea-packaged-ghidra-"));
 const exec = promisify(execFile);
-let packageRoot = resolve(process.argv[2] ?? ".");
+const arguments_ = process.argv.slice(2);
+const internalWorkspace = arguments_[0] === "--internal-workspace";
+const fixtureArguments = internalWorkspace ? arguments_.slice(2) : arguments_;
+const x86Fixture = fixtureArguments.includes("--x86");
+const dllFixture = fixtureArguments.includes("--dll");
+const [packageRootArgument, targetArgument, reportArgument] =
+  fixtureArguments.filter(
+    (argument) => argument !== "--x86" && argument !== "--dll",
+  );
+// Windows locks the loaded package-owned addon until the verifier exits.
+// Keep installation cleanup in a parent that never loads that addon.
+if (!internalWorkspace) {
+  const ownedWorkspace = await mkdtemp(join(tmpdir(), "rea-packaged-ghidra-"));
+  let result;
+  try {
+    result = await exec(
+      process.execPath,
+      [
+        fileURLToPath(import.meta.url),
+        "--internal-workspace",
+        ownedWorkspace,
+        ...arguments_,
+      ],
+      { timeout: 900_000, maxBuffer: 8 * 1024 * 1024 },
+    );
+  } catch (cause) {
+    if (typeof cause.stdout === "string") process.stdout.write(cause.stdout);
+    if (typeof cause.stderr === "string") process.stderr.write(cause.stderr);
+    throw cause;
+  } finally {
+    await rm(ownedWorkspace, { recursive: true, force: true });
+  }
+  const report = JSON.parse(result.stdout);
+  report.workspaceCleanup = true;
+  report.ok = true;
+  if (reportArgument !== undefined)
+    await writeFile(reportArgument, `${JSON.stringify(report)}\n`);
+  process.stdout.write(`${JSON.stringify(report)}\n`);
+  process.stderr.write(result.stderr);
+  process.exit(0);
+}
+assert.ok(arguments_[1] !== undefined, "Missing verifier workspace.");
+const workspace = resolve(arguments_[1]);
+let packageRoot = resolve(packageRootArgument ?? ".");
 // The default lane verifies the npm artifact in an isolated prefix. Explicit
 // package roots support an already-installed artifact without a second install.
-if (process.argv[2] === undefined) {
+if (packageRootArgument === undefined) {
   try {
     const npmEntry =
       process.env.npm_execpath ??
@@ -72,14 +120,17 @@ if (process.argv[2] === undefined) {
     );
     packageRoot = join(prefix, "node_modules", "rea-agents");
   } catch (cause) {
-    await rm(workspace, { recursive: true, force: true });
-    throw cause;
+    throw new Error("Packaged Windows verifier installation failed.", {
+      cause,
+    });
   }
 }
 const target = resolve(
-  process.argv[3] ?? "build/fixtures/rea-ghidra-windows.exe",
+  targetArgument ??
+    `build/fixtures/rea-ghidra-windows${x86Fixture ? "-x86" : ""}.${dllFixture ? "dll" : "exe"}`,
 );
 let TOOL_CONTRACTS, native, token, sha256;
+let parsedTarget;
 try {
   ({ TOOL_CONTRACTS } = await import(
     pathToFileURL(join(packageRoot, "dist/contracts/toolContracts.js"))
@@ -101,15 +152,39 @@ try {
   );
   const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
   sha256 = digest(await readFile(target));
+  const { parseBinaryTarget } = await import(
+    pathToFileURL(join(packageRoot, "dist/application/BinaryTargetResolver.js"))
+  );
+  parsedTarget = await parseBinaryTarget(target);
+  assert.equal(parsedTarget.ok, true);
+  assert.equal(parsedTarget.value.format, "pe");
+  assert.equal(parsedTarget.value.managed, false);
+  if (targetArgument === undefined) {
+    assert.equal(
+      parsedTarget.value.architecture,
+      x86Fixture ? "x86" : "x86_64",
+    );
+    assert.equal(
+      parsedTarget.value.executableRole,
+      dllFixture ? "shared-library" : "application",
+    );
+  }
 } catch (cause) {
-  await rm(workspace, { recursive: true, force: true });
-  throw cause;
+  throw new Error("Packaged Windows verifier prerequisites failed.", { cause });
 }
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const runtimeParent = join(workspace, "runtime with spaces");
 await mkdir(runtimeParent);
 const callerDirectory = join(workspace, "caller cwd with spaces");
-const scriptCollisions = ["ReaGhidraBridge.java", "ReaGhidraPrepareCom.java"];
+// Keep sorted for comparison with the final caller-directory listing.
+const scriptCollisions = [
+  "ReaGhidraAnalysisOptions.java",
+  "ReaGhidraApplySeeds.java",
+  "ReaGhidraBridge.java",
+  "ReaGhidraNoReturnFix.java",
+  "ReaGhidraPrepareCom.java",
+  "ReaGhidraPrepareRaw.java",
+];
 await mkdir(callerDirectory);
 for (const name of scriptCollisions) await mkdir(join(callerDirectory, name));
 const environment = {
@@ -122,7 +197,6 @@ const environment = {
     process.env.ComSpec ??
     join(process.env.SystemRoot ?? "C:\\Windows", "System32", "cmd.exe")
   ).replaceAll("\\", "/"),
-  REA_ANALYSIS_PROVIDER: "ghidra",
   REA_LOG_LEVEL: "error",
   GHIDRA_HEADLESS_MAXMEM: "512m",
   NODE_OPTIONS: "--max-old-space-size=512",
@@ -140,6 +214,8 @@ const report = {
   architecture: "x64",
   nonAdmin: true,
   targetSha256: sha256,
+  targetArchitecture: parsedTarget.value.architecture,
+  targetRole: parsedTarget.value.executableRole,
   cli: {},
   mcpOperations: [],
   nativeControls: "available",
@@ -158,16 +234,25 @@ const assertCleanup = async () => {
   assert.equal(entries.length, 0, "Provider runtime cleanup left files.");
 };
 try {
-  const providers = JSON.parse(
-    (
-      await exec(process.execPath, [entry, "providers", "--json"], {
-        env: environment,
-        cwd: callerDirectory,
-        timeout: 30_000,
-      })
-    ).stdout,
+  const providers = expandProviderOutput(
+    JSON.parse(
+      (
+        await exec(process.execPath, [entry, "providers", "--json"], {
+          env: environment,
+          cwd: callerDirectory,
+          timeout: 30_000,
+        })
+      ).stdout,
+    ),
   );
-  assert.ok(JSON.stringify(providers).includes("ghidra"));
+  assert.equal(providers.analysis_provider_binding, null);
+  assert.ok(Array.isArray(providers.analysis_provider_candidates));
+  const ghidra = providers.analysis_provider_candidates.find(
+    ({ provider }) => provider.id === "ghidra",
+  );
+  assert.ok(ghidra !== undefined);
+  assert.equal(ghidra.selected, false);
+  assert.equal(ghidra.target_support.status, "unknown");
   report.cli.providers = true;
   const inspected = await exec(
     process.execPath,
@@ -196,8 +281,8 @@ try {
   });
   const call = async (name, arguments_) => {
     report.lastOperation = name;
-    if (process.argv[4] !== undefined)
-      await writeFile(process.argv[4], `${JSON.stringify(report)}\n`);
+    if (reportArgument !== undefined)
+      await writeFile(reportArgument, `${JSON.stringify(report)}\n`);
     const contract = TOOL_CONTRACTS.find((value) => value.name === name);
     assert.ok(contract !== undefined, `Missing canonical contract: ${name}`);
     const argumentsParsed = contract.inputSchema.parse(arguments_);
@@ -206,20 +291,54 @@ try {
       { timeout: 360_000 },
     );
     assert.notEqual(result.isError, true, `Packaged operation failed: ${name}`);
-    const structured =
-      result.structuredContent ??
-      JSON.parse(result.content.find((item) => item.type === "text").text);
-    const parsed = contract.outputSchema.parse(structured);
+    const projected = requireMcpOperationResult(result, name, contract);
     report.mcpOperations.push(name);
-    return parsed.result;
+    return projected;
   };
   try {
     await client.connect(transport);
-    await call("open_binary", { path: target, provider_id: "ghidra" });
+    await call("open_binary", { path: target });
+    await call("binary_overview", {});
+    const activators = (
+      await readdir(runtimeParent, { recursive: true })
+    ).filter((path) => basename(path) === "ReaGhidraBundleActivator.class");
+    assert.equal(activators.length, 1);
+    const [activator] = activators;
+    assert.ok(activator !== undefined);
+    const bundleDirectory = dirname(join(runtimeParent, activator));
+    const manifest = await readFile(
+      join(bundleDirectory, "META-INF", "MANIFEST.MF"),
+      "utf8",
+    );
+    assert.match(manifest, /^Bundle-Activator: ReaGhidraBundleActivator\r?$/mu);
+    await assert.rejects(
+      readFile(join(bundleDirectory, "GeneratedActivator.class")),
+      { code: "ENOENT" },
+    );
+    report.bundleActivator = "ReaGhidraBundleActivator";
     assert.equal((await call("list_documents", {})).length, 1);
     await call("list_names", {});
     const procedures = await call("list_procedures", {});
     assert.ok(procedures.length > 0);
+    if (targetArgument === undefined) {
+      const calleeAddress = x86Fixture ? "0x401010" : "0x140001010";
+      const calleeCode = await call("procedure_pseudo_code", {
+        procedure: calleeAddress,
+      });
+      assert.match(calleeCode, /\b(?:42|0x2a)\b/iu);
+      if (dllFixture) {
+        const callerAddress = x86Fixture ? "0x401000" : "0x140001000";
+        assert.ok(
+          (
+            await call("procedure_callees", { procedure: callerAddress })
+          ).includes(calleeAddress),
+        );
+        assert.match(
+          await call("procedure_pseudo_code", { procedure: callerAddress }),
+          /\+\s*1\b/u,
+        );
+      }
+    }
     assert.ok((await call("list_segments", {})).length > 0);
     await call("list_strings", {});
     const procedure =
@@ -240,11 +359,12 @@ try {
     const mapping = await call("address_to_file_offset", {
       address: procedure.address,
     });
+    const sourceBytes = await readFile(target);
     assert.equal(memory.complete, true);
     assert.equal(memory.returned_bytes, 16);
     assert.equal(
       memory.bytes_hex,
-      (await readFile(target))
+      sourceBytes
         .subarray(mapping.file_offset, mapping.file_offset + 16)
         .toString("hex"),
     );
@@ -256,6 +376,35 @@ try {
     await call("resolve_containing_procedure", { address: procedure.address });
     await call("search_procedures", { pattern: procedure.value });
     await call("search_strings", { pattern: "rea" });
+    report.byteSearch = await verifyWindowsGhidraByteSearch({
+      invoke: call,
+      sourceBytes,
+      architecture: parsedTarget.value.architecture,
+      sourceOwnedFixture: targetArgument === undefined,
+      fallbackAddress: procedure.address,
+      fallbackFileOffset: mapping.file_offset,
+      runCliPage: async (query) => {
+        const cliArguments = [entry, "search-bytes", target, query.pattern];
+        for (const [option, value] of [
+          ["--mask", query.mask],
+          ["--start", query.start],
+          ["--end", query.end],
+          ["--limit", String(query.limit)],
+        ]) {
+          if (value !== undefined) cliArguments.push(option, value);
+        }
+        cliArguments.push("--provider", "ghidra", "--json");
+        const result = await exec(process.execPath, cliArguments, {
+          env: environment,
+          cwd: callerDirectory,
+          timeout: 360_000,
+          maxBuffer: 8 * 1024 * 1024,
+        });
+        const evidence = JSON.parse(result.stdout);
+        assert.ok(evidence.error === undefined, "CLI byte search failed");
+        return evidence.normalized_result;
+      },
+    });
     for (const name of [
       "procedure_assembly",
       "procedure_callees",
@@ -271,21 +420,82 @@ try {
     await call("inspect_native_data_type", { type: "/undefined8" });
     await call("inspect_native_instruction", { address: procedure.address });
     await call("resolve_native_call_targets", { address: procedure.address });
-    const expected = (
+    // Explicit caller-selected targets need not contain our fixture instructions.
+    const controlledTargets = [
+      "rea-ghidra-windows.exe",
+      "rea-ghidra-windows-x86.exe",
+    ].map((name) => resolve("build", "fixtures", name));
+    if (controlledTargets.includes(target))
+      report.compactReferences = await verifyGhidraCompactReferences(
+        call,
+        target === controlledTargets[1],
+        async (command, address) => {
+          const result = await exec(
+            process.execPath,
+            [entry, command, target, address, "--provider", "ghidra", "--json"],
+            {
+              env: environment,
+              cwd: callerDirectory,
+              timeout: 360_000,
+              maxBuffer: 8 * 1024 * 1024,
+            },
+          );
+          const evidence = JSON.parse(result.stdout);
+          assert.ok(evidence.error === undefined, `CLI ${command} failed`);
+          const contract = TOOL_CONTRACTS.find(
+            ({ name }) => name === command.replaceAll("-", "_"),
+          );
+          assert.ok(contract, `Missing CLI ${command} contract`);
+          contract.outputSchema.parse(evidence);
+          return evidence.normalized_result;
+        },
+      );
+    const { GHIDRA_MUTATING_OPERATIONS, GHIDRA_SESSION_CAPABILITIES } =
       await import(
         pathToFileURL(join(packageRoot, "dist/ghidra/GhidraSessionValues.js"))
-      )
-    ).GHIDRA_SESSION_CAPABILITIES.filter(
+      );
+    const expected = GHIDRA_SESSION_CAPABILITIES.filter(
       (name) =>
         name !== "ping" &&
         name !== "shutdown" &&
-        name !== "annotate_native_function",
+        !GHIDRA_MUTATING_OPERATIONS.has(name),
     );
-    assert.ok(
-      expected.every((name) => report.mcpOperations.includes(name)),
-      "Packaged verification omitted an admitted operation.",
+    const expectedOperations = new Set([
+      ...expected,
+      "open_binary",
+      "binary_overview",
+      "binary_session",
+      "close_binary",
+    ]);
+    const observedOperations = new Set(report.mcpOperations);
+    const missingOperations = expected.filter(
+      (name) => !observedOperations.has(name),
     );
-    await call("binary_session", {});
+    const unexpectedOperations = [...observedOperations].filter(
+      (name) => !expectedOperations.has(name),
+    );
+    assert.deepEqual(
+      { missing: missingOperations, unexpected: unexpectedOperations },
+      { missing: [], unexpected: [] },
+      "Packaged verification operation coverage drifted.",
+    );
+    const session = await call("binary_session", {});
+    assert.equal(
+      session.analysis_provider_binding?.analysis_profile?.parameters
+        ?.executable_role,
+      parsedTarget.value.executableRole,
+      "MCP profile must preserve the selected PE role.",
+    );
+    assert.equal(
+      session.analysis_provider_binding?.selection_source,
+      "auto-single-candidate",
+      "Packaged MCP verification must exercise automatic provider selection.",
+    );
+    assert.equal(
+      session.analysis_provider_binding?.provider?.id,
+      "ghidra",
+      "The sole available Windows analysis provider must be Ghidra.",
+    );
     await call("close_binary", {});
     await assertCleanup();
   } finally {
@@ -301,14 +511,17 @@ try {
     token,
     "Analysis changed caller token authority.",
   );
-  assert.deepEqual((await readdir(callerDirectory)).sort(), scriptCollisions);
+  assert.deepEqual(
+    (await readdir(callerDirectory)).sort(),
+    [...scriptCollisions].sort(),
+  );
   for (const name of scriptCollisions)
     assert.deepEqual(await readdir(join(callerDirectory, name)), []);
   report.callerScriptCollisionsPreserved = true;
   report.runtimeCleanup = true;
-  report.ok = true;
-  if (process.argv[4] !== undefined)
-    await writeFile(process.argv[4], `${JSON.stringify(report)}\n`);
+  // Only the parent can attest success after removing the installation.
+  if (reportArgument !== undefined)
+    await writeFile(reportArgument, `${JSON.stringify(report)}\n`);
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (cause) {
   report.failure = {
@@ -318,9 +531,7 @@ try {
       .replaceAll(target, "<target>")
       .replaceAll(workspace, "<workspace>"),
   };
-  if (process.argv[4] !== undefined)
-    await writeFile(process.argv[4], `${JSON.stringify(report)}\n`);
+  if (reportArgument !== undefined)
+    await writeFile(reportArgument, `${JSON.stringify(report)}\n`);
   throw cause;
-} finally {
-  await rm(workspace, { recursive: true, force: true });
 }

@@ -1,7 +1,3 @@
-import { safeParseJson } from "./domain/safeJson.js";
-
-const SAFE_VALIDATION_MESSAGE =
-  "REA could not read the command arguments. Run `rea --help`, correct the arguments, then try again.";
 const UNSUPPORTED_OUTPUT_COMBINATION_MESSAGE =
   "Token windows cannot preserve structured output. Remove --token-limit/--token-offset and use --filter-output or command pagination.";
 
@@ -13,35 +9,42 @@ export type CliOutputArgumentValidation =
   | {
       readonly ok: false;
       readonly format: StructuredOutputFormat;
-      readonly code: "UNSUPPORTED_OUTPUT_COMBINATION";
+      readonly code: "UNSUPPORTED_OUTPUT_COMBINATION" | "INVALID_OUTPUT_FILTER";
       readonly message: string;
     };
 
-type JsonRecord = Record<string, unknown>;
-
 interface ParsedCliOutputArguments {
-  readonly filterOutput: boolean;
+  readonly filterOutput: string | undefined;
   readonly format: string;
+  readonly fullOutput: boolean;
   readonly parseError: boolean;
+  readonly tokenCount: boolean;
   readonly tokenWindow: boolean;
+  readonly tokenLimit: number | undefined;
+  readonly tokenOffset: number | undefined;
 }
 
-const isRecord = (value: unknown): value is JsonRecord =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
-const validationError = (value: JsonRecord): JsonRecord | undefined => {
-  if (value.code === "VALIDATION_ERROR") return value;
-  if (value.ok === false && isRecord(value.error))
-    return value.error.code === "VALIDATION_ERROR" ? value.error : undefined;
-  return undefined;
-};
-
-const parseCliOutputArguments = (
+/** Read effective Incur output controls at the executable boundary. */
+export const parseCliOutputArguments = (
   arguments_: readonly string[],
 ): ParsedCliOutputArguments => {
   let format: string = "toon";
-  let filterOutput = false;
-  let tokenWindow = false;
+  let filterOutput: string | undefined;
+  let fullOutput = false;
+  let tokenCount = false;
+  let tokenLimit: number | undefined;
+  let tokenOffset: number | undefined;
+  const parsed = (parseError: boolean): ParsedCliOutputArguments => ({
+    filterOutput,
+    format,
+    fullOutput,
+    parseError,
+    tokenCount,
+    tokenWindow:
+      !parseError && (tokenLimit !== undefined || tokenOffset !== undefined),
+    tokenLimit: parseError ? undefined : tokenLimit,
+    tokenOffset: parseError ? undefined : tokenOffset,
+  });
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     // Incur scans builtins across `--` and accepts only spaced value forms.
@@ -55,8 +58,7 @@ const parseCliOutputArguments = (
       if (value) {
         // Incur stops parsing at an invalid format before applying any later
         // output controls. Let it report that malformed flag itself.
-        if (!INCUR_OUTPUT_FORMATS.has(value))
-          return { filterOutput, format, parseError: true, tokenWindow: false };
+        if (!INCUR_OUTPUT_FORMATS.has(value)) return parsed(true);
         format = value;
         index += 1;
       }
@@ -64,7 +66,7 @@ const parseCliOutputArguments = (
     }
     if (argument === "--filter-output") {
       if (arguments_[index + 1]) {
-        filterOutput = true;
+        filterOutput = arguments_[index + 1];
         index += 1;
       }
       continue;
@@ -74,23 +76,52 @@ const parseCliOutputArguments = (
       if (value) {
         const numericValue = Number(value);
         if (!Number.isFinite(numericValue) || value.trim() === "")
-          return { filterOutput, format, parseError: true, tokenWindow: false };
-        tokenWindow = true;
+          return parsed(true);
+        if (argument === "--token-limit") tokenLimit = numericValue;
+        else tokenOffset = numericValue;
         index += 1;
       }
       continue;
     }
+    if (argument === "--full-output") fullOutput = true;
+    if (argument === "--token-count") tokenCount = true;
   }
-  return { filterOutput, format, parseError: false, tokenWindow };
+  return parsed(false);
 };
 
-/** Reject text-window controls that would corrupt a structured document. */
+/** Reject slices that cannot advance within Incur's comma-delimited paths. */
+const hasUnclosedFilterSlice = (expression: string): boolean => {
+  let depth = 0;
+  let unclosed = false;
+  for (const character of expression) {
+    if (character === "[") {
+      depth += 1;
+      unclosed = true;
+    } else if (character === "]") {
+      depth -= 1;
+      // Incur consumes everything through the next closing bracket, including
+      // nested opening brackets. Do not impose a different filter grammar.
+      unclosed = false;
+    } else if (character === "," && depth === 0 && unclosed) return true;
+  }
+  return unclosed;
+};
+
+/** Reject output controls that cannot safely produce a complete result. */
 export const validateCliOutputArguments = (
   arguments_: readonly string[],
 ): CliOutputArgumentValidation => {
-  const { format, parseError, tokenWindow } =
+  const { filterOutput, format, parseError, tokenWindow } =
     parseCliOutputArguments(arguments_);
   if (parseError) return { ok: true };
+  if (filterOutput !== undefined && hasUnclosedFilterSlice(filterOutput))
+    return {
+      ok: false,
+      format: format === "yaml" || format === "jsonl" ? format : "json",
+      code: "INVALID_OUTPUT_FILTER",
+      message:
+        "The --filter-output expression has a slice without a closing ]. Close the slice or remove --filter-output.",
+    };
   if (
     tokenWindow &&
     (format === "json" || format === "jsonl" || format === "yaml")
@@ -130,33 +161,4 @@ export const renderCliOutputArgumentError = (
   if (error.format === "yaml")
     return `ok: false\nerror:\n  code: ${error.code}\n  message: ${JSON.stringify(error.message)}\n`;
   return `${JSON.stringify(value)}\n`;
-};
-
-/** Remove validator internals from Incur's caller-visible CLI output. */
-export const sanitizeCliOutput = (output: string): string => {
-  const trimmed = output.trimStart();
-  if (trimmed.startsWith("{")) {
-    const decoded = safeParseJson(trimmed);
-    if (!decoded.ok) return output;
-    const parsed: unknown = decoded.value;
-    if (!isRecord(parsed)) return output;
-    const error = validationError(parsed);
-    if (error !== undefined) {
-      const safeError = {
-        code: "VALIDATION_ERROR",
-        message: SAFE_VALIDATION_MESSAGE,
-      };
-      if (error === parsed) return `${JSON.stringify(safeError)}\n`;
-      return `${JSON.stringify({ ...parsed, error: safeError })}\n`;
-    }
-    return output;
-  }
-  if (
-    /^ok: false\r?\nerror:\r?\n  code: VALIDATION_ERROR(?:\r?\n|$)/u.test(
-      trimmed,
-    )
-  )
-    return `ok: false\nerror:\n  code: VALIDATION_ERROR\n  message: "${SAFE_VALIDATION_MESSAGE}"\n`;
-  if (!/^code: VALIDATION_ERROR(?:\r?\n|$)/u.test(trimmed)) return output;
-  return `code: VALIDATION_ERROR\nmessage: "${SAFE_VALIDATION_MESSAGE}"\n`;
 };

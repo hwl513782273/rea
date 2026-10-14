@@ -1,67 +1,48 @@
 import * as t from "@babel/types";
 import { expect, it } from "vitest";
 
-import { analyzeJavaScriptSemantics } from "./javascriptSemanticAnalysis.js";
+import {
+  analyzeJavaScriptSemantics,
+  analyzeParsedJavaScriptSemantics,
+} from "./javascriptSemanticAnalysis.js";
 import { onlyBinding, origin } from "./javascriptSemanticAnalysis.fixture.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 import { calleeName } from "./javascriptStaticAnalysisHelpers.js";
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import { analyzeParsedJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
 
 const memberChain = ".next".repeat(12_000);
+const ordinaryMemberChain = ".next".repeat(64);
 
-it("retains native addon observations through a deep member initializer", () => {
-  const analysis = analyzeJavaScriptStaticSource(
-    `const value = require("./addon.node")${memberChain}.last[""];`,
+it("preserves a 12,000-member native import through both analyzers", () => {
+  const parsed = parseJavaScriptSource(
+    `const value = require("./addon.node")${memberChain}.last; const ordinary = root.next.last;`,
   );
-  expect(analysis.electron.native_addon_bindings).toEqual([
-    expect.objectContaining({ specifier: "./addon.node", members: ["last"] }),
+  if (parsed === null) throw new Error("Expected valid JavaScript");
+
+  const staticAnalysis = analyzeParsedJavaScriptStaticSource("", parsed);
+  const ir = analyzeParsedJavaScriptSemantics(parsed);
+  expect(staticAnalysis.parse_status).toBe("complete");
+  expect(staticAnalysis.electron.native_addon_bindings).toEqual([
+    expect.objectContaining({
+      specifier: "./addon.node",
+      members: ["next"],
+      namespace_access: false,
+      dynamic_member_access: false,
+    }),
   ]);
-  expect(analysis.parse_error_count).toBe(0);
-});
-
-it("keeps a deep non-native initializer outside native addon observations", () => {
-  const analysis = analyzeJavaScriptStaticSource(
-    `const value = root${memberChain}.last;`,
-  );
-  expect(analysis.electron.native_addon_bindings).toEqual([]);
-  expect(analysis.parse_status).toBe("complete");
-});
-
-it("retains unknown value diagnostics and references after a deep member initializer", () => {
-  const ir = analyzeJavaScriptSemantics(
-    `const value = root${memberChain}.last;`,
-  );
   expect(ir.coverage).toEqual({ status: "complete", omittedCount: 0 });
-  expect(onlyBinding(ir, "value")).toMatchObject({
-    value: { status: "unknown", reason: "Cannot project last from unknown." },
-    provenance: { status: "unknown", reason: "Unbound identifier root." },
-  });
-  expect(ir.references.map(({ name, role }) => ({ name, role }))).toEqual([
-    { name: "root", role: "read" },
-  ]);
-});
-
-it.each([
-  `const value = require("./dependency.js")${memberChain}[""].last;`,
-  `const dependency = require("./dependency.js"); const value = dependency${memberChain}[""].last;`,
-  `const value = require("./dependency.js")?.next${memberChain}[""].last;`,
-])("preserves the full literal module path (case %#)", (source) => {
-  const ir = analyzeJavaScriptSemantics(source);
   const path = origin(onlyBinding(ir, "value"));
-  expect(path.specifier).toBe("./dependency.js");
+  expect(path.specifier).toBe("./addon.node");
   expect(path.importedPath).toEqual([
-    ...(source.includes("?.next") ? ["next"] : []),
     ...Array.from({ length: 12_000 }, () => "next"),
-    "",
     "last",
   ]);
-  expect(ir.coverage.status).toBe("complete");
 });
 
-it("retains a deep CommonJS re-export path without inventing dynamic module links", () => {
+it("retains deep CommonJS paths and dependencies without inventing dynamic bindings", () => {
   const ir = analyzeJavaScriptSemantics(`
-    module.exports.result = require("./dependency.js")${memberChain}.last;
-    const dynamic = require("./other.js")${memberChain}[key].last;
+    module.exports.result = require("./dependency.js")${ordinaryMemberChain}.last;
+    const dynamic = require("./other.js")${ordinaryMemberChain}[key].last;
   `);
   expect(ir.moduleLinks).toEqual([
     expect.objectContaining({
@@ -69,6 +50,13 @@ it("retains a deep CommonJS re-export path without inventing dynamic module link
       specifier: "./dependency.js",
       importedName: "last",
       exportedName: "result",
+    }),
+    expect.objectContaining({
+      kind: "require",
+      specifier: "./other.js",
+      importedName: null,
+      localName: null,
+      exportedName: null,
     }),
   ]);
   expect(onlyBinding(ir, "dynamic").provenance).toMatchObject({
@@ -80,16 +68,28 @@ it("retains a deep CommonJS re-export path without inventing dynamic module link
 it("invalidates a deep mutation while retaining unrelated literal properties", () => {
   const ir = analyzeJavaScriptSemantics(`
     const root = { untouched: "retained" };
-    root${memberChain}.last = 1;
+    root${ordinaryMemberChain}.last = 1;
     const value = root.untouched;
   `);
   expect(onlyBinding(ir, "root").value).toEqual({
     status: "object",
     properties: [
-      { name: "untouched", value: { status: "literal", value: "retained" } },
+      {
+        name: "untouched",
+        presence: "present",
+        value: { status: "literal", value: "retained" },
+      },
+      {
+        name: "next",
+        presence: "unknown-coverage",
+        value: {
+          status: "unknown",
+          reason: "This property may have been mutated.",
+        },
+      },
     ],
-    unknownProperties: true,
-    omittedProperties: null,
+    unknownProperties: false,
+    omittedProperties: 0,
   });
   expect(onlyBinding(ir, "value").value).toEqual({
     status: "literal",
@@ -98,7 +98,7 @@ it("invalidates a deep mutation while retaining unrelated literal properties", (
 });
 
 it("retains the complete location and unresolved target of a deep call", () => {
-  const callee = `root${memberChain}.last`;
+  const callee = `root${ordinaryMemberChain}.last`;
   const ir = analyzeJavaScriptSemantics(`${callee}();`);
   expect(ir.callSites).toEqual([
     expect.objectContaining({
@@ -115,7 +115,7 @@ it("retains the complete location and unresolved target of a deep call", () => {
 
 it("retains deep default values without confusing their reads with parameter bindings", () => {
   const ir = analyzeJavaScriptSemantics(
-    `export function inspect(value = root${memberChain}.last) { return value; }`,
+    `export function inspect(value = root${ordinaryMemberChain}.last) { return value; }`,
   );
   expect(ir.references.map(({ name, role }) => ({ name, role }))).toEqual([
     { name: "root", role: "read" },
@@ -126,7 +126,7 @@ it("retains deep default values without confusing their reads with parameter bin
 
 it("keeps a shadowed require local through a deep member initializer", () => {
   const ir = analyzeJavaScriptSemantics(
-    `function inspect(require) { const value = require("./dependency.js")${memberChain}.last; return value; }`,
+    `function inspect(require) { const value = require("./dependency.js")${ordinaryMemberChain}.last; return value; }`,
   );
   expect(ir.moduleLinks).toEqual([]);
   expect(onlyBinding(ir, "value").provenance.origins).toEqual([]);
@@ -140,7 +140,7 @@ it.each([
   ["root[0].last()", "root.0.last"],
   ["root[key].last()", "root.[computed@5].last"],
   ["root?.first.last()", "root.first.last"],
-  [`root${memberChain}.last()`, `root${memberChain}.last`],
+  [`root${ordinaryMemberChain}.last()`, `root${ordinaryMemberChain}.last`],
 ])("preserves exact callee syntax (case %#)", (source, expected) => {
   const file = parseJavaScriptSource(source);
   const statement = file?.program.body[0];

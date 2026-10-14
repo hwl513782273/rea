@@ -1,3 +1,4 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -9,6 +10,10 @@ import { z } from "zod";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { createAnalysisProfile } from "../../../src/domain/analysisProfile.js";
 import { createEvidence } from "../../../src/domain/evidence.js";
+import type { ProviderAvailability } from "../../../src/application/AnalysisProvider.js";
+import type { AndroidAnalysisPort } from "../../../src/application/android/AndroidAnalysisPort.js";
+import type { AdbDeviceAnalysisPort } from "../../../src/application/adb/AdbDeviceAnalysisPort.js";
+import type { ApktoolResourceAnalysisPort } from "../../../src/application/apktool/ApktoolResourceAnalysisPort.js";
 import {
   createEvidenceBundle,
   evidenceBundleSchema,
@@ -22,6 +27,38 @@ const SNAPSHOT_PROFILE = createAnalysisProfile(
   { id: "fixture", name: "Fixture analysis provider", version: "1" },
   { fixture: true },
 );
+
+const HOST_TOOLS_NOT_CONFIGURED: ProviderAvailability = {
+  status: "unavailable",
+  code: "not_configured",
+  reason: "The target-free MCP fixture does not probe host tools.",
+  diagnostics: { source: "test_fixture" },
+};
+
+const unusedHostToolExecution = async (): Promise<never> => {
+  throw new Error("Host-tool execution is outside the target-free fixture");
+};
+
+// These fixed ports keep this fake-session harness independent of whichever
+// Android tools happen to be installed on the test host. The dedicated public
+// availability test below continues to exercise status projection separately.
+const androidAnalysis: AndroidAnalysisPort = {
+  inspectAvailability: async () => HOST_TOOLS_NOT_CONFIGURED,
+  close: async () => {},
+  execute: unusedHostToolExecution,
+};
+
+const adbDeviceAnalysis: AdbDeviceAnalysisPort = {
+  inspectAvailability: async () => HOST_TOOLS_NOT_CONFIGURED,
+  close: async () => {},
+  execute: unusedHostToolExecution,
+};
+
+const apktoolAnalysis: ApktoolResourceAnalysisPort = {
+  inspectAvailability: async () => HOST_TOOLS_NOT_CONFIGURED,
+  close: async () => {},
+  execute: unusedHostToolExecution,
+};
 
 export interface SessionMcpHarness {
   readonly mcp: Client;
@@ -41,11 +78,17 @@ export const createSessionMcpHarness = async (
   const closed: string[] = [];
   const session = createTestBinarySession(provider(closed), {
     resolveAnalysisProfile: () =>
-      Promise.resolve(ok({ profile: SNAPSHOT_PROFILE, compatibility: {} })),
+      Promise.resolve(ok({ profile: SNAPSHOT_PROFILE })),
   });
-  const server = createServer(session, session, {
-    logger: silentLogger,
-  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      androidAnalysis,
+      adbDeviceAnalysis,
+      apktoolAnalysis,
+      logger: silentLogger,
+    },
+  );
   const mcp = new Client({ name: "session-test", version: "1.0.0" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -151,6 +194,7 @@ export const snapshotAndRecordUnknown = async (
 };
 
 const structured = (result: CallToolResult): Record<string, unknown> => {
+  if (result.isError === true) return parseMcpToolError(result);
   if (
     typeof result.structuredContent !== "object" ||
     result.structuredContent === null

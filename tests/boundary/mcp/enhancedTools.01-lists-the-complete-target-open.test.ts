@@ -7,7 +7,7 @@ import { MANAGED_WORKFLOW_TOOL_CONTRACTS } from "../../../src/contracts/managed/
 import { ENHANCED_TOOL_CONTRACTS } from "../../../src/contracts/enhancedToolContracts.js";
 import { SESSION_TOOL_CONTRACTS } from "../../../src/contracts/sessionToolContracts.js";
 import { TOOL_CONTRACTS } from "../../../src/contracts/toolContracts.js";
-import {} from "../../../src/domain/jsonValue.js";
+import type {} from "../../../src/domain/jsonValue.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed as ok } from "../../fixtures/analysisExecution.js";
 import { createAnalysisExecution } from "../../../src/application/AnalysisProvider.js";
@@ -35,12 +35,38 @@ const targetObservation = (value: unknown) =>
     ),
   );
 
+const functionDossier = {
+  procedure: {
+    address: "0x1",
+    name: "entry",
+    classification: null,
+    body: {
+      available: false,
+      reason: "The provider did not report complete function body ranges.",
+    },
+    signature: null,
+    locals: [],
+  },
+  pseudocode: "return 0;",
+  assembly: [],
+  comments: [],
+  callers: [],
+  callees: [],
+  incoming_references: [],
+  outgoing_references: [],
+  referenced_strings: [],
+  referenced_names: [],
+  basic_blocks: [],
+  native_api: null,
+  native_value_flow: null,
+  limitations: [],
+};
+
 const fixturePort = (): AnalysisOperationPort => ({
   // oxlint-disable-next-line complexity -- this fixture exhaustively serves the registered MCP surface.
   execute: (name, arguments_) => {
     switch (name) {
       case "inspect_native_dispatch_metadata":
-      case "procedure_address":
         return Promise.resolve(
           err(
             new AnalysisCapabilityUnavailableError(
@@ -50,6 +76,24 @@ const fixturePort = (): AnalysisOperationPort => ({
             ),
           ),
         );
+      case "procedure_address": {
+        const procedure = inventory(PROCEDURES).find(
+          (item) =>
+            item.address === arguments_.procedure ||
+            item.value === arguments_.procedure,
+        );
+        return Promise.resolve(
+          procedure === undefined
+            ? err(
+                new AnalysisCapabilityUnavailableError(
+                  "fixture",
+                  name,
+                  "No matching procedure in this symbol-only fixture",
+                ),
+              )
+            : ok(procedure.address),
+        );
+      }
       case "list_procedures":
         return Promise.resolve(ok(inventory(PROCEDURES)));
       case "list_names":
@@ -60,7 +104,16 @@ const fixturePort = (): AnalysisOperationPort => ({
               "0x11": "_OBJC_CLASS_$_Fixture",
               "0x12": "_OBJC_PROTOCOL_$_FixtureDelegate",
               "0x13": "entry",
-            }),
+            }).map((entry) => ({
+              ...entry,
+              symbol: {
+                primary: true,
+                dynamic: false,
+                external: false,
+                type: "label",
+                source: "analysis",
+              },
+            })),
           ),
         );
       case "decode_interface_builder":
@@ -121,8 +174,19 @@ const fixturePort = (): AnalysisOperationPort => ({
         );
       case "list_segments":
         return Promise.resolve(
-          ok([{ name: "__TEXT", start: "0x1000", end: "0x2000" }]),
+          ok([
+            {
+              name: "__TEXT",
+              start: "0x1000",
+              end: "0x2000",
+              readable: null,
+              writable: null,
+              executable: null,
+            },
+          ]),
         );
+      case "current_document":
+        return Promise.resolve(ok("fixture"));
       case "list_documents":
         return Promise.resolve(ok(["fixture"]));
       case "list_strings":
@@ -132,28 +196,9 @@ const fixturePort = (): AnalysisOperationPort => ({
       case "search_procedures":
         return Promise.resolve(ok(inventory({})));
       case "analyze_function":
-        return Promise.resolve(
-          targetObservation({
-            procedure: {
-              address: "0x1",
-              name: "entry",
-              signature: null,
-              locals: [],
-            },
-            pseudocode: "return 0;",
-            assembly: [],
-            comments: [],
-            callers: [],
-            callees: [],
-            incoming_references: [],
-            outgoing_references: [],
-            referenced_strings: [],
-            referenced_names: [],
-            basic_blocks: [],
-          }),
-        );
+        return Promise.resolve(targetObservation(functionDossier));
       default:
-        return Promise.resolve(ok(null));
+        throw new Error(`Unexpected analysis operation: ${name}`);
     }
   },
 });
@@ -167,7 +212,7 @@ afterEach(async () => {
 });
 
 const connect = async (analysis: AnalysisOperationPort = fixturePort()) => {
-  const server = createServer(analysis);
+  const server = createServer({ kind: "fixed", analysis });
   const client = new Client({ name: "enhanced-test", version: "1.0.0" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -234,19 +279,61 @@ describe("enhanced MCP tools", () => {
     });
     expect(results[2]).toEqual({
       items: [
-        { address: "0x1", status: "ok", pseudocode: "pseudo:0x1" },
-        { address: "0x2", status: "ok", pseudocode: "pseudo:0x2" },
+        {
+          address: "0x1",
+          procedure: { status: "resolved", address: "0x1", name: "0x1" },
+          status: "ok",
+          pseudocode: "pseudo:0x1",
+        },
+        {
+          address: "0x2",
+          procedure: { status: "resolved", address: "0x2", name: "0x2" },
+          status: "ok",
+          pseudocode: "pseudo:0x2",
+        },
       ],
       total: 2,
       succeeded: 2,
       failed: 0,
     });
     expect(results[3]).toEqual({
-      "0": [{ address: "0x1", status: "ok", calls: ["0x2", "0x3"] }],
-      "1": [
-        { address: "0x2", status: "ok", calls: ["0x1"] },
-        { address: "0x3", status: "ok", calls: [] },
-      ],
+      graph: {
+        "0": [
+          {
+            address: "0x1",
+            status: "ok",
+            calls: ["0x2", "0x3"],
+            limitations: ["Provider did not report relationship coverage."],
+            relationship_coverage: {
+              status: "unknown",
+              reason: "Provider did not report relationship coverage.",
+            },
+          },
+        ],
+        "1": [
+          {
+            address: "0x2",
+            status: "ok",
+            calls: ["0x1"],
+            limitations: ["Provider did not report relationship coverage."],
+            relationship_coverage: {
+              status: "unknown",
+              reason: "Provider did not report relationship coverage.",
+            },
+          },
+          {
+            address: "0x3",
+            status: "ok",
+            calls: [],
+            limitations: ["Provider did not report relationship coverage."],
+            relationship_coverage: {
+              status: "unknown",
+              reason: "Provider did not report relationship coverage.",
+            },
+          },
+        ],
+      },
+      limitations: [],
     });
     expect(results[4]).toMatchObject({
       total: 1,
@@ -308,7 +395,7 @@ describe("enhanced MCP tools", () => {
         { address: "0x1", depth: 0 },
         { address: "0x2", depth: 1 },
       ],
-      truncated: false,
+      truncated: true,
     });
     expect(results[11]).toMatchObject({
       start: "missing-selector",

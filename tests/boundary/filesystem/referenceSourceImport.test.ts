@@ -1,21 +1,19 @@
 import fs from "node:fs";
-import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { add, commit, init } from "isomorphic-git";
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
+import { normalizeHistoricalSourceParseFailures } from "../../../src/application/ReferenceSourceImport.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 import {
-  importReferenceSource,
-  normalizeHistoricalSourceParseFailures,
-} from "../../../src/application/ReferenceSourceImport.js";
-import { projectReferenceSourceEntryFailure } from "../../../src/application/ReferenceSourceImportEntries.js";
-import {
-  projectReferenceSourceImportError,
-  type ReferenceSourceImportError,
-} from "../../../src/application/ReferenceSourceImportTypes.js";
+  parseReferenceSourceEntries,
+  projectReferenceSourceEntryFailure,
+} from "../../../src/application/ReferenceSourceImportEntries.js";
+import type { ReferenceSourceRead } from "../../../src/reference/ReferenceSourceReaderTypes.js";
 import { createHistoricalSourceManifest } from "../../../src/domain/referenceSourceGraph.js";
 
 const fixture = async (parent: string, name: string): Promise<string> => {
@@ -45,7 +43,7 @@ const importTree = (
     ...(signal === undefined ? {} : { signal }),
   });
 
-describe("reference source import error projection", () => {
+describe("reference source import projections", () => {
   it("deduplicates exact parse failures without collapsing distinct reasons", () => {
     const malformed = {
       path: "src/main.ts",
@@ -88,32 +86,131 @@ describe("reference source import error projection", () => {
       expect(message).toMatch(/Check|try again|when ready|Exclude/u);
     }
   });
-
-  it("projects every import failure without raw parser or policy text", () => {
-    const expectedCategories = {
-      cancelled: "cancelled",
-      "invalid-root": "invalid_input",
-      unsupported: "unsupported_host",
-      io: "execution_failure",
-      parse: "execution_failure",
-    } as const;
-    for (const [code, category] of Object.entries(expectedCategories)) {
-      const projected = projectReferenceSourceImportError({
-        tag: "reference-source-import",
-        code: code as ReferenceSourceImportError["code"],
-        message: "SECRET parser stack and /private/path",
-      });
-      expect(projected.category).toBe(category);
-      expect(projected.message).not.toContain("SECRET");
-      expect(projected.message).not.toContain("/private/path");
-      expect(projected.message).toMatch(
-        /try again|when ready|Check that|REA on Linux/u,
-      );
-    }
-  });
 });
 
 describe("reference source symlink import", () => {
+  it.each([
+    { target: "dist", reason: "default-ignored", pattern: "dist/" },
+    { target: "generated", reason: "project-ignored", pattern: "generated/" },
+    { target: "cache", reason: "caller-excluded", pattern: "cache/" },
+  ])(
+    "retains links into a $reason directory without importing it",
+    async ({ target, reason, pattern }) => {
+      const root = await createTestTempDirectory(
+        "rea-reference-excluded-links-",
+      );
+      await mkdir(join(root, target, "nested"), { recursive: true });
+      await writeFile(
+        join(root, target, "nested", "output.js"),
+        "export const generated = true;\n",
+      );
+      await writeFile(join(root, "source.ts"), "export const value = 1;\n");
+      if (reason === "project-ignored")
+        await writeFile(join(root, ".gitignore"), `${pattern}\n`);
+      await symlink(target, join(root, "alias"));
+      await symlink(`${target}/nested/output.js`, join(root, "output-link"));
+
+      const result = await importReferenceSource({
+        root,
+        caller: "reference-import-test",
+        policy: { secretPatterns: [] },
+        ...(reason === "caller-excluded" ? { excludePaths: [pattern] } : {}),
+      });
+      if (!result.ok) throw result.error;
+      expect(result.value.inventory_state).toBe("partial");
+      expect(result.value.exclusions).toContainEqual({
+        path: target,
+        entry_kind: "directory",
+        reason,
+        pattern,
+      });
+      expect(result.value.entries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "source.ts",
+            kind: "file",
+            content_state: "hashed",
+          }),
+          expect.objectContaining({
+            path: "alias",
+            kind: "symlink",
+            target,
+            target_state: "internal",
+          }),
+          expect.objectContaining({
+            path: "output-link",
+            kind: "symlink",
+            target: `${target}/nested/output.js`,
+            target_state: "internal",
+          }),
+        ]),
+      );
+      expect(
+        result.value.entries.some(
+          ({ path }) => path === target || path.startsWith(`${target}/`),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("does not treat an excluded file as an excluded directory for a child link", async () => {
+    const root = await createTestTempDirectory(
+      "rea-reference-excluded-file-link-",
+    );
+    await writeFile(join(root, "secret.txt"), "secret\n");
+    await writeFile(join(root, "source.ts"), "export const value = 1;\n");
+    await symlink("secret.txt/child", join(root, "alias"));
+
+    const result = await importReferenceSource({
+      root,
+      caller: "reference-import-test",
+      policy: { secretPatterns: [] },
+      excludePaths: ["secret.txt"],
+    });
+    if (!result.ok) throw new Error(result.error.message);
+    expect(result.value.inventory_state).toBe("partial");
+    expect(
+      result.value.entries.find(({ path }) => path === "alias"),
+    ).toMatchObject({
+      kind: "symlink",
+      target: "secret.txt/child",
+      target_state: "missing",
+    });
+    expect(result.value.exclusions).toContainEqual({
+      path: "secret.txt",
+      entry_kind: "file",
+      reason: "caller-excluded",
+      pattern: "secret.txt",
+    });
+  });
+
+  it("preserves an unreadable target as unknown instead of a synthetic path", () => {
+    const read: ReferenceSourceRead = {
+      root: "/reference",
+      entries: [
+        {
+          status: "failed",
+          kind: "symlink",
+          path: "src/link.ts",
+          code: "io",
+          message: "Symbolic link target could not be read",
+        },
+      ],
+      bytesRead: 0,
+      limitations: [],
+    };
+
+    const parsed = parseReferenceSourceEntries(read, new Set());
+    expect(parsed.entries).toContainEqual(
+      expect.objectContaining({
+        kind: "symlink",
+        path: "src/link.ts",
+        target: null,
+        target_state: "unreadable",
+      }),
+    );
+  });
+
   it("retains external symlink targets as local graph diagnostics", async () => {
     const root = await createTestTempDirectory("rea-reference-links-");
     const outside = await createTestTempDirectory("rea-reference-outside-");
@@ -123,8 +220,7 @@ describe("reference source symlink import", () => {
 
     const imported = await importTree(root);
 
-    expect(imported.ok).toBe(true);
-    if (!imported.ok) return;
+    if (!imported.ok) throw imported.error;
     expect(imported.value.entries).toContainEqual(
       expect.objectContaining({
         kind: "symlink",
@@ -141,37 +237,71 @@ describe("reference source symlink import", () => {
 });
 
 describe("reference source manifest inventory", () => {
-  it("retains CMake build manifests in the imported inventory", async () => {
-    const root = await createTestTempDirectory("rea-reference-cmake-");
-    await mkdir(join(root, "src"));
-    await Promise.all([
-      writeFile(join(root, "CMakeLists.txt"), "project(example)\n"),
-      writeFile(
-        join(root, "src", "CMakeLists.txt"),
-        "add_library(example main.cpp)\n",
-      ),
-      writeFile(join(root, "notes.txt"), "Build notes.\n"),
-    ]);
+  it("retains manifest, test, generated and language classifications through import", async () => {
+    const root = await createTestTempDirectory("rea-reference-classification-");
+    const files = [
+      ["CMakeLists.txt", "Text", ["documentation", "manifest"]],
+      ["src/CMAKELISTS.TXT", "Text", ["documentation", "manifest", "source"]],
+      ["CMakeLists.txt.backup", null, ["unknown"]],
+      ["Dockerfile.dev.ts", "Dockerfile", ["source"]],
+      ["DockerfileGuide.d.mts", "TypeScript", ["generated", "source"]],
+      ["DockerfileHelper.py", "Python", ["source"]],
+      ["dockerfiles", null, ["unknown"]],
+      ["Widget_TeSt.TS", "TypeScript", ["source", "test"]],
+      ["parser_spec.rs", "Rust", ["source", "test"]],
+      ["main_test_helper.go", "Go", ["source"]],
+      ["main_spec.ts.bak", null, ["unknown"]],
+      ["tests/main.go", "Go", ["source", "test"]],
+      ["out/widget_spec.js", "JavaScript", ["generated", "source", "test"]],
+      ["vendor/widget_test.go", "Go", ["source", "test", "vendor"]],
+      ["settings_spec.json", "JSON", ["config", "test"]],
+      [
+        "docs/api/client.ts",
+        "TypeScript",
+        ["documentation", "generated", "source"],
+      ],
+      [
+        "packages/widget/Docs/API/client.ts",
+        "TypeScript",
+        ["documentation", "generated", "source"],
+      ],
+      ["docs/apis/client.ts", "TypeScript", ["documentation", "source"]],
+      ["mydocs/api/client.ts", "TypeScript", ["source"]],
+      ["docs/manual/api/client.ts", "TypeScript", ["documentation", "source"]],
+      ["docs/api.ts", "TypeScript", ["documentation", "source"]],
+      ["public/client.ts", "TypeScript", ["generated", "source"]],
+      [".github", null, ["config"]],
+      [".husky", null, ["config"]],
+      [".gitignore", null, ["config"]],
+    ] as const;
+    await Promise.all(
+      files.map(async ([path]) => {
+        const target = join(root, path);
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, "");
+      }),
+    );
 
     const result = await importTree(root);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value.manifests).toEqual([
       "CMakeLists.txt",
-      "src/CMakeLists.txt",
+      "src/CMAKELISTS.TXT",
     ]);
-    expect(result.value.entries).toContainEqual(
-      expect.objectContaining({
-        path: "CMakeLists.txt",
-        classifications: ["documentation", "manifest"],
-      }),
+    const entries = new Map(
+      result.value.entries.map((entry) => [entry.path, entry]),
     );
-    expect(result.value.entries).toContainEqual(
-      expect.objectContaining({
-        path: "src/CMakeLists.txt",
-        classifications: ["documentation", "manifest", "source"],
-      }),
-    );
+    for (const [path, language, classifications] of files)
+      expect(entries.get(path), path).toMatchObject({
+        kind: "file",
+        language,
+        classifications,
+      });
+    for (const path of ["docs/api", "packages/widget/Docs/API"])
+      expect(entries.get(path), path).toMatchObject({
+        kind: "directory",
+        classifications: ["documentation", "generated"],
+      });
   });
 });
 
@@ -210,8 +340,7 @@ describe("reference source import behavior", () => {
       policy: { secretPatterns: [] },
     });
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     // The importer always reports one standing advisory about pathname races,
     // so completeness is asserted per entry rather than globally.
     const limited = result.value.entries.filter(
@@ -262,8 +391,7 @@ describe("reference source import behavior", () => {
         ),
       );
       const result = await importTree(root);
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
+      if (!result.ok) throw result.error;
       expect(result.value.entries.map(({ path }) => path)).toEqual(paths);
       const repeated = await importTree(root);
       expect(repeated).toEqual(result);
@@ -281,8 +409,6 @@ describe("reference source import behavior", () => {
         importTree(leftRoot),
         importTree(rightRoot),
       ]);
-      expect(left.ok).toBe(true);
-      expect(right.ok).toBe(true);
       if (!left.ok || !right.ok) throw new Error("expected imports to pass");
       expect(createHistoricalSourceManifest(left.value)).toEqual(
         createHistoricalSourceManifest(right.value),
@@ -297,7 +423,9 @@ describe("reference source import behavior", () => {
       expect(left.value.parse_failures).toHaveLength(1);
       expect(left.value.exclusions).toContainEqual({
         path: ".env",
+        entry_kind: "file",
         reason: "configured-secret",
+        pattern: ".env",
       });
       expect(JSON.stringify(left.value)).not.toContain("SECRET_SENTINEL");
       expect(JSON.stringify(left.value)).not.toContain(leftRoot);
@@ -337,7 +465,6 @@ describe("reference source import behavior", () => {
         message: "fixture",
       });
       const result = await importTree(root);
-      expect(result.ok).toBe(true);
       if (!result.ok) throw result.error;
       expect(result.value.vcs).toEqual({ kind: "git", head: oid, dirty: null });
     } finally {
@@ -352,8 +479,7 @@ describe("reference source path selection", () => {
     try {
       const root = await fixture(parent, "tree");
       const result = await importTree(root, undefined, []);
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
+      if (!result.ok) throw result.error;
       expect(result.value.entries).toContainEqual(
         expect.objectContaining({
           path: ".env",
@@ -371,6 +497,44 @@ describe("reference source path selection", () => {
 });
 
 describe("reference source rooted module specifiers", () => {
+  it("keeps dot-prefixed bare specifiers external while resolving explicit relative paths", async () => {
+    const root = await createTestTempDirectory("rea-reference-dot-prefix-");
+    await Promise.all([
+      writeFile(
+        join(root, "main.js"),
+        'import ".hidden.js"; import "..pkg.js"; import "./.hidden.js"; require(".hidden.js");\n',
+      ),
+      writeFile(join(root, ".hidden.js"), "export {};\n"),
+      writeFile(join(root, "..pkg.js"), "export {};\n"),
+    ]);
+    const result = await importTree(root);
+    if (!result.ok) throw result.error;
+    expect(result.value.relationships).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          to: ".hidden.js",
+          kind: "imports",
+          resolution: "external",
+        }),
+        expect.objectContaining({
+          to: "..pkg.js",
+          kind: "imports",
+          resolution: "external",
+        }),
+        expect.objectContaining({
+          to: ".hidden.js",
+          kind: "imports",
+          resolution: "internal",
+        }),
+        expect.objectContaining({
+          to: ".hidden.js",
+          kind: "requires",
+          resolution: "external",
+        }),
+      ]),
+    );
+  });
+
   it("does not rebase an absolute import onto a coincidentally matching source member", async () => {
     const root = await createTestTempDirectory("rea-reference-rooted-");
     await mkdir(join(root, "src", "outside"), { recursive: true });
@@ -383,8 +547,7 @@ describe("reference source rooted module specifiers", () => {
       "export const value = 1;\n",
     );
     const result = await importTree(root);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value.relationships).toContainEqual({
       from_path: "src/main.js",
       to: "/outside/dep.js",
@@ -401,3 +564,156 @@ describe("reference source rooted module specifiers", () => {
     });
   });
 });
+
+describe.skipIf(process.platform === "win32")(
+  "reference source exclusion provenance",
+  () => {
+    it("preserves ordered ignore rules and reports each winning rule origin", async () => {
+      const root = await createTestTempDirectory(
+        "rea-reference-ignore-origin-",
+      );
+      const directories = [
+        "dist",
+        "project-parent",
+        "caller-parent",
+        "node_modules/pkg",
+        "empty-ignored",
+        "secret-dir",
+        "keep-as-dir",
+        "link-target",
+      ];
+      await Promise.all(
+        directories.map((path) => mkdir(join(root, path), { recursive: true })),
+      );
+      const secretChild = join(root, "secret-dir", "unreadable.ts");
+      await Promise.all([
+        writeFile(
+          join(root, ".gitignore"),
+          "project.tmp\n*.log\n!keep.log\nproject-parent/\n!project-parent/keep.ts\n!default.log\nempty-ignored/\nkeep-as-dir\n!keep-as-dir/\nlinkdir/\n",
+        ),
+        writeFile(join(root, "project.tmp"), "project rule\n"),
+        writeFile(join(root, "project.log"), "project rule\n"),
+        writeFile(join(root, "keep.log"), "later default rule wins\n"),
+        writeFile(join(root, "default.log"), "default rule\n"),
+        writeFile(join(root, "caller-keep.log"), "caller negation\n"),
+        writeFile(join(root, "dist", "output.js"), "generated output\n"),
+        writeFile(join(root, "project-parent", "keep.ts"), "parent ignored\n"),
+        writeFile(join(root, "caller-parent", "keep.ts"), "caller parent\n"),
+        writeFile(join(root, "node_modules/pkg/package.json"), "{}\n"),
+        writeFile(join(root, "secret-dir", "unreadable.ts"), "secret\n"),
+        writeFile(join(root, "keep-as-dir", "kept.ts"), "re-included\n"),
+        writeFile(join(root, "link-target", "source.ts"), "target\n"),
+        writeFile(join(root, "selected.ts"), "selected source\n"),
+      ]);
+      await symlink(join(root, "link-target"), join(root, "linkdir"));
+
+      const canRestrictPermissions =
+        process.platform !== "win32" && process.getuid?.() !== 0;
+      if (canRestrictPermissions) await chmod(secretChild, 0);
+
+      try {
+        const imported = await importReferenceSource({
+          root,
+          caller: "reference-import-test",
+          policy: { secretPatterns: ["project.log", "secret-dir/"] },
+          excludePaths: ["caller-parent/", "!selected.ts", "!caller-keep.log"],
+        });
+        if (!imported.ok) throw imported.error;
+
+        expect(imported.value.exclusions).toEqual(
+          expect.arrayContaining([
+            {
+              path: "project.tmp",
+              entry_kind: "file",
+              reason: "project-ignored",
+              pattern: "project.tmp",
+            },
+            {
+              path: "project.log",
+              entry_kind: "file",
+              reason: "configured-secret",
+              pattern: "project.log",
+            },
+            {
+              path: "keep.log",
+              entry_kind: "file",
+              reason: "default-ignored",
+              pattern: "*.log",
+            },
+            {
+              path: "dist",
+              entry_kind: "directory",
+              reason: "default-ignored",
+              pattern: "dist/",
+            },
+            {
+              path: "node_modules",
+              entry_kind: "directory",
+              reason: "default-ignored",
+              pattern: "node_modules/",
+            },
+            {
+              path: "empty-ignored",
+              entry_kind: "directory",
+              reason: "project-ignored",
+              pattern: "empty-ignored/",
+            },
+            {
+              path: "project-parent",
+              entry_kind: "directory",
+              reason: "project-ignored",
+              pattern: "project-parent/",
+            },
+            {
+              path: "caller-parent",
+              entry_kind: "directory",
+              reason: "caller-excluded",
+              pattern: "caller-parent/",
+            },
+            {
+              path: "secret-dir",
+              entry_kind: "directory",
+              reason: "configured-secret",
+              pattern: "secret-dir/",
+            },
+          ]),
+        );
+        expect(imported.value.entries).toContainEqual(
+          expect.objectContaining({ path: "selected.ts", kind: "file" }),
+        );
+        expect(imported.value.entries).toContainEqual(
+          expect.objectContaining({ path: "caller-keep.log", kind: "file" }),
+        );
+        expect(imported.value.entries).toContainEqual(
+          expect.objectContaining({
+            path: "keep-as-dir/kept.ts",
+            kind: "file",
+          }),
+        );
+        expect(imported.value.entries).toContainEqual(
+          expect.objectContaining({ path: "linkdir", kind: "symlink" }),
+        );
+        for (const path of [
+          "dist",
+          "node_modules",
+          "empty-ignored",
+          "project-parent",
+          "caller-parent",
+          "secret-dir",
+        ])
+          expect(
+            imported.value.entries.some(
+              (entry) =>
+                entry.path === path || entry.path.startsWith(`${path}/`),
+            ),
+            path,
+          ).toBe(false);
+        expect(imported.value.exclusions).not.toContainEqual(
+          expect.objectContaining({ path: "selected.ts" }),
+        );
+      } finally {
+        if (canRestrictPermissions) await chmod(secretChild, 0o600);
+      }
+    });
+  },
+);

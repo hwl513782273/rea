@@ -1,7 +1,3 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { readFile } from "node:fs/promises";
-
 import {
   createAnalysisExecution,
   type AnalysisClient,
@@ -11,24 +7,26 @@ import {
   type ExecutionOptions,
   type ProviderIdentity,
 } from "../application/AnalysisProvider.js";
-import {
-  MANAGED_STATIC_PROVIDER_IDENTITY as IDENTITY,
-  managedStaticCapabilities,
-} from "./ManagedStaticProviderMetadata.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { managedStaticCapabilities } from "./ManagedStaticProviderMetadata.js";
+import { MANAGED_STATIC_PROVIDER } from "../application/InvestigationProviders.js";
 import {
   MANAGED_TOOL_CONTRACTS,
-  managedArtifactInputSchema,
-  managedMemberInputSchema,
-  managedNativeBoundaryInputSchema,
+  managedMembersInputSchema,
+  managedTargetInputSchema,
   type ManagedToolName,
 } from "../contracts/managed/managedToolContracts.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
+  AnalysisInputError,
 } from "../domain/analysisErrorCore.js";
 import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import type { EvidenceLocation } from "../domain/evidence.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type {
@@ -36,10 +34,17 @@ import type {
   ManagedMemberInspection,
   ManagedNativeBoundaryInspection,
 } from "../domain/managed/managedArtifact.js";
-import { err, ok } from "../domain/result.js";
+import { err, ok, type Result } from "../domain/result.js";
 import { inspectManagedArtifactBytes } from "./ManagedArtifactInspector.js";
 import { inspectManagedMembersBytes } from "./ManagedMemberInspector.js";
 import { inspectManagedNativeBoundariesBytes } from "./ManagedNativeBoundaryInspector.js";
+import { RegularFileCleanupFailure } from "../application/RegularFileRead.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
+import {
+  hashManagedSource,
+  managedCleanupError,
+  readManagedSnapshot,
+} from "./ManagedSnapshot.js";
 
 /** Execution-free managed PE/CLI auxiliary provider. */
 export class ManagedStaticProvider implements AnalysisProvider {
@@ -47,7 +52,7 @@ export class ManagedStaticProvider implements AnalysisProvider {
     managedStaticCapabilities();
 
   identity(): ProviderIdentity {
-    return IDENTITY;
+    return MANAGED_STATIC_PROVIDER;
   }
 
   capabilities(): readonly CapabilityDescriptor[] {
@@ -61,6 +66,7 @@ export class ManagedStaticProvider implements AnalysisProvider {
 
 class ManagedStaticClient implements AnalysisClient {
   #snapshotBytes: Buffer | undefined;
+  readonly #resources = new ArtifactResourceScope();
 
   constructor(private readonly target: BinaryTarget) {}
 
@@ -70,11 +76,11 @@ class ManagedStaticClient implements AnalysisClient {
     options?: ExecutionOptions,
   ) {
     if (operation === "health")
-      return ok(createAnalysisExecution(null, IDENTITY));
+      return ok(createAnalysisExecution(null, MANAGED_STATIC_PROVIDER));
     if (!isManagedOperation(operation))
       return err(
         new AnalysisCapabilityUnavailableError(
-          IDENTITY.id,
+          MANAGED_STATIC_PROVIDER.id,
           operation,
           "Operation is not implemented by the managed static provider.",
         ),
@@ -82,7 +88,7 @@ class ManagedStaticClient implements AnalysisClient {
     if (this.target.format !== "pe")
       return err(
         new AnalysisCapabilityUnavailableError(
-          IDENTITY.id,
+          MANAGED_STATIC_PROVIDER.id,
           operation,
           `Managed static triage requires a PE target; observed ${this.target.format}.`,
         ),
@@ -93,8 +99,14 @@ class ManagedStaticClient implements AnalysisClient {
       const snapshot = this.#snapshotBytes;
       const observed =
         snapshot === undefined
-          ? await readManagedSnapshot(this.target.path, options?.signal)
-          : await hashManagedSource(this.target.path, options?.signal);
+          ? await readManagedSnapshot(this.target.path, operation, {
+              signal: options?.signal,
+              resources: this.#resources,
+            })
+          : await hashManagedSource(this.target.path, operation, {
+              signal: options?.signal,
+              resources: this.#resources,
+            });
       if (observed.sha256 !== this.target.sha256)
         return err(
           new EvidenceIntegrityError(
@@ -112,7 +124,7 @@ class ManagedStaticClient implements AnalysisClient {
         this.target,
       );
       return ok(
-        createAnalysisExecution(result, IDENTITY, {
+        createAnalysisExecution(result, MANAGED_STATIC_PROVIDER, {
           rawResult: null,
           limitations: result.limitations,
           subject: this.target,
@@ -120,59 +132,64 @@ class ManagedStaticClient implements AnalysisClient {
         }),
       );
     } catch (cause: unknown) {
+      if (isCleanupFailure(cause))
+        return err(this.#cleanupError(operation, cause));
+      if (cause instanceof AnalysisError) return err(cause);
       if (options?.signal?.aborted === true)
         return err(new AnalysisCancelledError(operation));
-      return err(new ProviderAdapterError(IDENTITY.id, operation, { cause }));
+      // A PE header or section table the reader cannot map is malformed input.
+      if (
+        cause instanceof ManagedReaderFailure &&
+        cause.issue.code !== "resource-limit"
+      )
+        return err(
+          new AnalysisInputError(operation, { cause }, [
+            {
+              path: ["path"],
+              reason: "invalid_format",
+              message: `Selected artifact ${this.target.path}: ${cause.issue.detail}`,
+            },
+          ]),
+        );
+      return err(
+        new ProviderAdapterError(MANAGED_STATIC_PROVIDER.id, operation, {
+          cause,
+        }),
+      );
     }
   }
 
-  close(): Promise<void> {
+  async close(): Promise<Result<null, AnalysisError>> {
     this.#snapshotBytes = undefined;
-    return Promise.resolve();
+    try {
+      await this.#resources.close();
+      return ok(null);
+    } catch (cause: unknown) {
+      return err(this.#cleanupError("close", cause));
+    }
+  }
+
+  #cleanupError(operation: string, cause: unknown): ProviderCleanupError {
+    const failure = managedCleanupError(cause, this.target.path, operation);
+    if (failure instanceof ProviderCleanupError) return failure;
+    const cleanup =
+      cause instanceof ArtifactReaderFailure ? cause.cleanup : undefined;
+    return new ProviderCleanupError(
+      MANAGED_STATIC_PROVIDER.id,
+      cleanup?.resources ?? [this.target.path],
+      {
+        reason:
+          cleanup?.reason ??
+          (cause instanceof Error ? cause.message : String(cause)),
+      },
+      { cause, operation },
+    );
   }
 }
 
-interface ManagedSourceObservation {
-  readonly byteLength: number;
-  readonly sha256: string;
-  readonly bytes?: Buffer;
-}
-
-const readManagedSnapshot = async (
-  path: string,
-  signal?: AbortSignal,
-): Promise<ManagedSourceObservation> => {
-  const bytes = await readFile(
-    path,
-    signal === undefined ? undefined : { signal },
-  );
-  return {
-    byteLength: bytes.length,
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-    bytes,
-  };
-};
-
-const hashManagedSource = async (
-  path: string,
-  signal?: AbortSignal,
-): Promise<ManagedSourceObservation> => {
-  const digest = createHash("sha256");
-  let byteLength = 0;
-  const stream = createReadStream(
-    path,
-    signal === undefined ? undefined : { signal },
-  );
-  for await (const chunk of stream) {
-    if (!Buffer.isBuffer(chunk))
-      throw new TypeError("Managed source stream returned non-buffer data");
-    if (chunk.length > Number.MAX_SAFE_INTEGER - byteLength)
-      throw new RangeError("Managed source byte length overflowed");
-    byteLength += chunk.length;
-    digest.update(chunk);
-  }
-  return { byteLength, sha256: digest.digest("hex") };
-};
+const isCleanupFailure = (cause: unknown): boolean =>
+  cause instanceof RegularFileCleanupFailure ||
+  (cause instanceof ArtifactReaderFailure && cause.cleanup !== undefined);
 
 const isManagedOperation = (
   operation: AnalysisOperation,
@@ -188,16 +205,20 @@ const inspectManagedOperation = (
   | ManagedArtifactInspection
   | ManagedMemberInspection
   | ManagedNativeBoundaryInspection => {
+  if (operation === "inspect_managed_members") {
+    const { type_names: typeNames } =
+      managedMembersInputSchema.parse(parameters);
+    return inspectManagedMembersBytes(
+      bytes,
+      target,
+      typeNames === undefined ? {} : { typeNames },
+    );
+  }
+  managedTargetInputSchema.parse(parameters);
   if (operation === "inspect_managed_artifact") {
-    managedArtifactInputSchema.parse(parameters);
     return inspectManagedArtifactBytes(bytes, target);
   }
-  if (operation === "inspect_managed_native_boundaries") {
-    managedNativeBoundaryInputSchema.parse(parameters);
-    return inspectManagedNativeBoundariesBytes(bytes, target);
-  }
-  managedMemberInputSchema.parse(parameters);
-  return inspectManagedMembersBytes(bytes, target);
+  return inspectManagedNativeBoundariesBytes(bytes, target);
 };
 
 const managedLocations = (

@@ -13,6 +13,7 @@ The published diagrams are SVG source assets:
 - `public/assets/figures/rea-investigation-flow.svg` — 1774 × 887 viewBox.
 - `public/assets/figures/dx-ball-sound-pan-investigation.svg` — 1774 × 887 viewBox.
 - `public/assets/figures/th04-bullet-ring.svg` — 1000 × 520 viewBox.
+- `public/assets/figures/analyst-thinking.svg` — 160 × 120 viewBox.
 
 Two original layout references were generated with the built-in image generation
 tool and reviewed visually. Their prompts are retained below. The final SVGs
@@ -41,6 +42,81 @@ Check spelling, arithmetic order, arrow directions and the separate verification
 branches when changing these figures. Match progress claims to the pinned
 reconstruction checkpoint. Validate the SVG as XML and inspect its browser
 rendering at desktop and mobile widths.
+
+## Sharing preview
+
+`public/assets/social-card.svg` is the 1200 × 630 preview source. It uses the
+homepage's direct headline, the site's white/charcoal/slate/blue palette, and a
+short agent → REA → evidence flow. CairoSVG renders the ignored PNG during asset
+preparation. Check the rendered image for readable text and spacing before
+publishing. The build uses DejaVu Sans for consistent typography; only the SVG
+source is committed. Metadata and build instructions are in the website README.
+
+## Beginner homepage and dinosaur reconstruction
+
+The manual/agent comparison and Calculator percentage controls are semantic
+HTML. Calculator’s assembly comes from a real installed model DLL; the named
+calculation is a readable summary crosschecked against Microsoft’s public source. See
+[evidence/calculator-and-dino.md](evidence/calculator-and-dino.md).
+
+The introduction pairs selected Calculator instructions with three selectable
+analyst thoughts: decode operator branches, trace arithmetic calls, then name
+the percentage rule. The small analyst illustration is authored SVG; the
+thought bubbles, findings and labels are selectable HTML. The thoughts
+illustrate the analysis rather than reproduce a recorded conversation. The
+agent side asks the same question and separates REA’s evidence from the
+agent’s explanation. Keep those roles and the instruction highlights aligned
+when changing a step.
+
+The homepage explains reverse engineering before the worked examples. Each
+example opens with its goal and reason for inspecting the program. A selected
+highlight marks the intended result; the “REA returned” block identifies the
+evidence. The flows label REA’s inspection and the agent’s interpretation or
+reconstruction explicitly. Preserve this context when moving a demo.
+
+The dinosaur sequence uses an HTML flow: inspect the loaded script, rebuild the
+speed rule, then change and play. Its canvas mini-game and static SVG fallback
+are authored code, without generated images or copied game sprites. The game
+imports the recovered rule from `public/assets/dino-speed.js`; other mechanics
+are new teaching code. Check that the fallback is visible with JavaScript
+disabled and hidden when the playable canvas loads. Keep the speed settings,
+source excerpt, reconstruction and original-result table consistent.
+
+## Aegis login-code figure
+
+The Aegis overview and adjustable-clock figure are semantic HTML. The clock
+diagram shows seconds, the 30-second block and the resulting six-digit code,
+using the public RFC 6238 test key. It retains a static 59-second example when
+JavaScript is disabled. The three code selections connect each operation to the
+APK's selected Java and an explanatory summary.
+
+[evidence/aegis-login-code.md](evidence/aegis-login-code.md) records the inspected
+APK, methods, source attribution and reconstruction checks. Keep the block
+formula, default settings, slider outputs and reference cases consistent.
+
+## Touhou reconstruction essay
+
+The essay opens with a takeaway and a flywheel explaining how experience
+compounds. The figure uses selectable HTML labels and inline SVG connectors:
+an autonomous agent proposes an experiment, an oracle tests it against a
+reference, and code, evidence, checks and lessons remain in the repository.
+A dashed mismatch branch returns to the agent for revision. The repository
+supplies a better starting point for the next investigation; TH08 → TH095 →
+TH04 illustrates knowledge carried between projects. Human direction names
+the goal and acceptance criteria above the cycle.
+
+The caption connects reuse with improving the checks themselves. The TH08
+floating-literal case in the essay explains why a passing result can need
+reexamination when an oracle's blind spot is discovered. Preserve that link
+between the figure's ideal loop and the infrastructure lessons in the prose.
+
+The shared stylesheet positions the labels and gives narrow screens separate
+connector geometry. Keep the arrows clear of the text and retain the same
+meaning at every width. This is an explanatory model, with no measured speed
+or productivity multiplier. Project dates and the attributed README excerpt
+support the narrative; detailed milestone references are available in a native
+disclosure. Their provenance is documented in
+[evidence/touhou-reconstruction-method.md](evidence/touhou-reconstruction-method.md).
 
 ## Original image generation prompts
 
@@ -114,3 +190,17 @@ Second check labels verbatim:
 Use enough horizontal space for clear check names and generous typography. A two-line label is fine where needed.
 
 Text constraints: render every supplied English label and number verbatim with correct spelling. No extra claims, no additional labels, no footnotes, no source code or assembly, no logos or watermarks. Keep all connectors complete and directed correctly. Large legible labels matter more than decorative density. Never say full reconstruction, exact game clone, all bytes, or automatic source recovery.
+
+## CTF masked-squares figure
+
+`public/assets/figures/ctf-mask-equation.svg` explains the seventh check in
+DownUnderCTF 2023's masked-squares flag checker. The original encoded mask is
+`-21, +1, -14, 0`: expand it to 36 cells, highlight zero-based cell 21 and
+compare its code with the recorded target 55 (`7`). Labels and selected cells
+come from the fresh REA byte reads documented in
+[evidence/ctf-masked-squares.md](evidence/ctf-masked-squares.md).
+
+The diagram is maintained as SVG source using the shared blue/gray palette.
+It illustrates one equation; the downloadable Python solver uses all 26.
+Keep code selectable in HTML and use the existing scrollable figure viewport
+on smaller screens.

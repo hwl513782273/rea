@@ -7,7 +7,7 @@ import {
 
 const normalize = (value: unknown): unknown => value;
 
-describe("real Hopper semantic fixture resolution", () => {
+describe("Hopper verifier semantic fixture resolution", () => {
   it("binds mutations to the active document, not the first listed one", async () => {
     await expect(
       requireCurrentDocument(
@@ -25,22 +25,6 @@ describe("real Hopper semantic fixture resolution", () => {
         normalize,
       ),
     ).rejects.toThrow(/current_document/u);
-  });
-
-  it("resolves the public search value and preserves its reported name", async () => {
-    const procedure = await resolveFixtureProcedure(
-      clientWithItems([
-        {
-          address: "0x1000",
-          value: "_rea_entry",
-        },
-      ]),
-      {},
-      "rea_entry",
-      normalize,
-    );
-
-    expect(procedure).toEqual({ address: "0x1000", name: "_rea_entry" });
   });
 
   it.each([

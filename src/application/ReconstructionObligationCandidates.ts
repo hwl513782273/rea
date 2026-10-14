@@ -7,7 +7,7 @@ import {
   parseEvidenceBundle,
   type EvidenceBundle,
 } from "../domain/evidenceBundle.js";
-import { parseProcessCapture } from "../domain/processCapture.js";
+import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
 import type {
   ReconstructionObligation,
   ReviewedReconstructionObligation,
@@ -18,6 +18,7 @@ import {
   semanticObligationPolicy,
   type ReconstructionObligationCandidatePolicy,
 } from "./ReconstructionObligationPolicies.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 type CandidateFields = Omit<
   ReconstructionObligation,
@@ -54,7 +55,7 @@ export const deriveReconstructionObligationCandidates = (
     addCandidate(candidates, reviewedCandidate(obligation, records));
   return {
     candidates: [...candidates.values()].sort((left, right) =>
-      left.obligation_id.localeCompare(right.obligation_id),
+      compareUnicodeCodePoints(left.obligation_id, right.obligation_id),
     ),
     limitations: [...limitations].sort(),
   };
@@ -75,7 +76,14 @@ const deriveApplicationCandidates = (
   )
     return;
   try {
-    const source = parseApplicationGraphEvidence(evidence);
+    const parsed = parseApplicationGraphEvidence(evidence);
+    if (!parsed.ok) {
+      limitations.add(
+        `Application Evidence ${evidence.evidence_id} could not generate candidates because it failed graph validation.`,
+      );
+      return;
+    }
+    const source = parsed.value;
     for (const node of source.graph.nodes) {
       const candidatePolicy = applicationObligationPolicy(node.kind);
       if (candidatePolicy === undefined) {
@@ -107,10 +115,21 @@ const deriveApplicationCandidates = (
         }),
       );
     }
-    if (source.semanticGraph !== null)
+    if (source.semanticGraph !== null) {
+      const evidenceContexts = new Map(
+        source.semanticGraph.evidence_contexts.map((context) => [
+          context.context_id,
+          context,
+        ]),
+      );
       for (const node of source.semanticGraph.nodes) {
         const candidatePolicy = semanticObligationPolicy(node.kind);
         if (candidatePolicy === undefined) continue;
+        const evidenceContext = evidenceContexts.get(node.evidence.context_id);
+        if (evidenceContext === undefined)
+          throw new TypeError(
+            "Semantic evidence reference names an absent context",
+          );
         addCandidate(
           candidates,
           generatedCandidate({
@@ -125,13 +144,14 @@ const deriveApplicationCandidates = (
               graphReference(
                 evidence,
                 records,
-                node.evidence,
+                evidenceContext,
                 `${source.semanticGraph.graph_id}/node/${node.node_id}`,
               ),
             ],
           }),
         );
       }
+    }
     if (source.graph.coverage.status !== "complete")
       limitations.add(
         `Application graph ${source.graph.graph_id} coverage is ${source.graph.coverage.status}; omitted candidates remain unknown.`,
@@ -176,6 +196,12 @@ const deriveProcessCandidate = (
           ]
         : []),
     ];
+    if (capture.manifest.executable_sha256 === null) {
+      limitations.add(
+        `Process capture ${evidence.evidence_id} has no validated executable artifact identity; packaged-process lifecycle obligation was not bound to an artifact.`,
+      );
+      return;
+    }
     addCandidate(candidates, {
       obligation_id: obligationId(
         `process:${capture.manifest.executable_sha256}:${capture.manifest.full_scenario_sha256}`,
@@ -405,7 +431,7 @@ const uniqueBy = <Value>(
   key: (value: Value) => string,
 ): Value[] =>
   [...new Map(values.map((value) => [key(value), value])).values()].sort(
-    (left, right) => key(left).localeCompare(key(right)),
+    (left, right) => compareUnicodeCodePoints(key(left), key(right)),
   );
 
 const obligationId = (key: string): string =>

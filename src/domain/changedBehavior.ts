@@ -2,25 +2,33 @@ import { z } from "zod";
 
 import { artifactComparisonResultSchema } from "./artifactComparison.js";
 import { uniqueSorted } from "./canonicalOrdering.js";
+import {
+  compositeKey,
+  compareUnicodeCodePoints,
+} from "./unicodeCodePointOrder.js";
+import {
+  assertComparisonFindingLinks,
+  comparisonSourceEvidenceIds,
+} from "./comparisonSourceEvidence.js";
 import { evidenceSchema, parseEvidence, type Evidence } from "./evidence.js";
-import { functionComparisonResultSchema } from "./functionComparison.js";
+import { functionComparisonResultSchema } from "./functionComparisonSchemas.js";
 import {
   PROCESS_PROVIDER,
   isProcessEvidenceProvider,
-} from "./processEvidenceProvider.js";
+} from "./process/processEvidenceProvider.js";
 import {
   comparisonStatusSchema,
   deriveProcessComparisonStatus,
   PROCESS_COMPARISON_DIMENSIONS,
   processCaptureComparisonSchema,
-} from "./processCapture.js";
+} from "./process/processComparison.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
 
 /** Input for aggregating existing comparison Evidence. */
-export const changedBehaviorInputSchema = z.object({
-  comparisons: z.array(evidenceSchema).default([]),
+export const changedBehaviorInputSchema = z.strictObject({
+  comparisons: z.array(evidenceSchema).min(1),
 });
 
 const findingSchema = z.object({
@@ -34,7 +42,7 @@ const findingSchema = z.object({
   ]),
   status: comparisonStatusSchema,
   source_comparison_id: evidenceIdSchema,
-  evidence_links: z.array(evidenceIdSchema).min(3),
+  evidence_links: z.array(evidenceIdSchema).min(2),
   limitations: z.array(z.string()),
 });
 
@@ -56,7 +64,7 @@ export const changedBehaviorResultSchema = z
     findings: z.object({
       items: z.array(findingSchema),
     }),
-    evidence_links: z.array(evidenceIdSchema).min(3),
+    evidence_links: z.array(evidenceIdSchema).min(2),
     limitations: z.array(z.string()),
   })
   .superRefine((result, context) => {
@@ -86,6 +94,22 @@ export const changedBehaviorResultSchema = z
 export type ChangedBehaviorResult = z.infer<typeof changedBehaviorResultSchema>;
 type Finding = z.infer<typeof findingSchema>;
 type RuntimeStatus = z.infer<typeof processCaptureComparisonSchema>["status"];
+type ParsedComparison =
+  | {
+      readonly operation: "compare_process_captures";
+      readonly evidence: Evidence;
+      readonly result: z.infer<typeof processCaptureComparisonSchema>;
+    }
+  | {
+      readonly operation: "compare_functions";
+      readonly evidence: Evidence;
+      readonly result: z.infer<typeof functionComparisonResultSchema>;
+    }
+  | {
+      readonly operation: "compare_artifacts";
+      readonly evidence: Evidence;
+      readonly result: z.infer<typeof artifactComparisonResultSchema>;
+    };
 
 const EXPECTED_PROVIDERS = {
   compare_process_captures: {
@@ -112,24 +136,37 @@ const acceptsPredicate = (
 ): boolean => expected.some((predicate) => predicate === actual);
 
 /** Find observed runtime changes and separately report static change candidates. */
-export const findChangedBehavior = (
-  comparisonsInput: unknown,
-): ChangedBehaviorResult => {
-  const parsedInput = changedBehaviorInputSchema.parse({
-    comparisons: comparisonsInput,
-  });
-  const comparisons = parsedInput.comparisons;
+interface FoundChangedBehavior {
+  readonly result: ChangedBehaviorResult;
+  /** Authenticated IDs retained from the comparisons used to compute result. */
+  readonly comparisonEvidenceIds: readonly string[];
+}
+
+export const findChangedBehavior = (input: unknown): FoundChangedBehavior => {
+  // The public input schema remains available to clients; this internal
+  // admission only checks the list shape because parseEvidence below owns
+  // validation and authentication of each retained Evidence item.
+  const { comparisons } = z
+    .strictObject({ comparisons: z.array(z.unknown()).min(1) })
+    .parse(input);
   const evidence = comparisons.map(parseComparisonEvidence);
   assertUnique(
-    evidence.map(({ evidence_id: id }) => id),
+    evidence.map(({ evidence: { evidence_id: id } }) => id),
     "comparison Evidence",
   );
   const findings = evidence.flatMap(findingsFor).sort(compareFindings);
-  const runtimeStatuses = evidence.flatMap(runtimeStatus);
-  const links = uniqueSorted(
-    evidence.flatMap((item) => [item.evidence_id, ...item.evidence_links]),
+  const runtimeStatuses = evidence.flatMap((comparison) =>
+    comparison.operation === "compare_process_captures"
+      ? [comparison.result.status]
+      : [],
   );
-  return changedBehaviorResultSchema.parse({
+  const links = uniqueSorted(
+    evidence.flatMap(({ evidence: item }) => [
+      item.evidence_id,
+      ...item.evidence_links,
+    ]),
+  );
+  const result = changedBehaviorResultSchema.parse({
     behavior_status: behaviorStatus(runtimeStatuses),
     summary: {
       observed_changes: count(findings, "observed_change"),
@@ -142,7 +179,7 @@ export const findChangedBehavior = (
     },
     evidence_links: links,
     limitations: uniqueSorted([
-      ...evidence.flatMap(({ limitations }) => limitations),
+      ...evidence.flatMap(({ evidence: item }) => item.limitations),
       ...(evidence.some(
         ({ operation }) => operation !== "compare_process_captures",
       )
@@ -155,9 +192,15 @@ export const findChangedBehavior = (
         : []),
     ]),
   });
+  return {
+    result,
+    comparisonEvidenceIds: evidence.map(
+      ({ evidence: { evidence_id } }) => evidence_id,
+    ),
+  };
 };
 
-const parseComparisonEvidence = (input: unknown): Evidence => {
+const parseComparisonEvidence = (input: unknown): ParsedComparison => {
   const evidence = parseEvidence(input);
   if (!(evidence.operation in EXPECTED_PROVIDERS))
     throw new TypeError(
@@ -185,17 +228,25 @@ const parseComparisonEvidence = (input: unknown): Evidence => {
     throw new TypeError(
       "Comparison Evidence operation, predicate, and provider disagree",
     );
-  if (evidence.evidence_links.length < 2)
+  if (
+    !comparisonSourceEvidenceIds(evidence).every((id) =>
+      evidence.evidence_links.includes(id),
+    )
+  )
     throw new TypeError(
-      "Comparison Evidence must cite both source observations",
+      "Comparison Evidence must cite both selected source observations",
     );
-  assertUnique(evidence.evidence_links, "source Evidence links");
-  parseResult(evidence);
-  return evidence;
+  return parseResult(evidence, operation);
 };
 
-const parseResult = (evidence: Evidence): void => {
-  if (evidence.operation === "compare_process_captures") {
+const parseResult = (
+  evidence: Evidence,
+  operation:
+    | "compare_process_captures"
+    | "compare_artifacts"
+    | "compare_functions",
+): ParsedComparison => {
+  if (operation === "compare_process_captures") {
     const result = processCaptureComparisonSchema.parse(
       evidence.normalized_result,
     );
@@ -206,50 +257,43 @@ const parseResult = (evidence: Evidence): void => {
       throw new TypeError(
         "Process comparison status contradicts its dimensions",
       );
-    return;
+    return { operation, evidence, result };
   }
-  if (evidence.operation === "compare_functions") {
+  if (operation === "compare_functions") {
     const result = functionComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    assertNestedLinks(
+    assertComparisonFindingLinks(
       evidence,
       result.dimensions.flatMap(({ evidence_links: links }) => links),
     );
-    return;
+    return { operation, evidence, result };
   }
   const result = artifactComparisonResultSchema.parse(
     evidence.normalized_result,
   );
-  assertNestedLinks(
+  assertComparisonFindingLinks(
     evidence,
     result.changes.flatMap(({ evidence_links: links }) => links),
   );
+  return { operation, evidence, result };
 };
 
-const assertNestedLinks = (
-  evidence: Evidence,
-  nestedLinks: readonly string[],
-): void => {
-  const topLevel = new Set(evidence.evidence_links);
-  if (nestedLinks.some((evidenceId) => !topLevel.has(evidenceId)))
-    throw new TypeError(
-      "Comparison finding cites Evidence outside its top-level closure",
-    );
+const findingsFor = (comparison: ParsedComparison): Finding[] => {
+  if (comparison.operation === "compare_process_captures")
+    return processFindings(comparison);
+  if (comparison.operation === "compare_functions")
+    return functionFindings(comparison);
+  return artifactFindings(comparison);
 };
 
-const findingsFor = (evidence: Evidence): Finding[] => {
-  if (evidence.operation === "compare_process_captures")
-    return processFindings(evidence);
-  if (evidence.operation === "compare_functions")
-    return functionFindings(evidence);
-  return artifactFindings(evidence);
-};
-
-const processFindings = (evidence: Evidence): Finding[] => {
-  const result = processCaptureComparisonSchema.parse(
-    evidence.normalized_result,
-  );
+const processFindings = (
+  comparison: Extract<
+    ParsedComparison,
+    { readonly operation: "compare_process_captures" }
+  >,
+): Finding[] => {
+  const { evidence, result } = comparison;
   const dimensions = [
     ["terminal", result.terminal, "runtime"],
     ["interaction", result.interaction, "runtime"],
@@ -275,10 +319,13 @@ const processFindings = (evidence: Evidence): Finding[] => {
   );
 };
 
-const functionFindings = (evidence: Evidence): Finding[] => {
-  const result = functionComparisonResultSchema.parse(
-    evidence.normalized_result,
-  );
+const functionFindings = (
+  comparison: Extract<
+    ParsedComparison,
+    { readonly operation: "compare_functions" }
+  >,
+): Finding[] => {
+  const { evidence, result } = comparison;
   return result.dimensions.flatMap((dimension) =>
     dimension.status === "unchanged"
       ? []
@@ -289,7 +336,7 @@ const functionFindings = (evidence: Evidence): Finding[] => {
             scope: "static_candidate",
             status: dimension.status,
             classification:
-              dimension.status === "unknown" || dimension.status === "truncated"
+              dimension.status === "unknown"
                 ? "unresolved_branch"
                 : dimension.conclusion_kind,
             limitations: dimension.limitations,
@@ -299,10 +346,13 @@ const functionFindings = (evidence: Evidence): Finding[] => {
   );
 };
 
-const artifactFindings = (evidence: Evidence): Finding[] => {
-  const result = artifactComparisonResultSchema.parse(
-    evidence.normalized_result,
-  );
+const artifactFindings = (
+  comparison: Extract<
+    ParsedComparison,
+    { readonly operation: "compare_artifacts" }
+  >,
+): Finding[] => {
+  const { evidence, result } = comparison;
   const changes = result.changes.map((change) =>
     makeFinding({
       evidence,
@@ -359,11 +409,6 @@ const makeFinding = (input: {
     limitations: uniqueSorted(input.limitations),
   });
 
-const runtimeStatus = (evidence: Evidence): RuntimeStatus[] =>
-  evidence.operation === "compare_process_captures"
-    ? [processCaptureComparisonSchema.parse(evidence.normalized_result).status]
-    : [];
-
 const behaviorStatus = (
   statuses: readonly RuntimeStatus[],
 ): ChangedBehaviorResult["behavior_status"] => {
@@ -384,12 +429,10 @@ const count = (
     .length;
 
 const compareFindings = (left: Finding, right: Finding): number =>
-  [left.scope, left.dimension, left.source_comparison_id]
-    .join("\0")
-    .localeCompare(
-      [right.scope, right.dimension, right.source_comparison_id].join("\0"),
-      "en",
-    );
+  compareUnicodeCodePoints(
+    compositeKey([left.scope, left.dimension, left.source_comparison_id]),
+    compositeKey([right.scope, right.dimension, right.source_comparison_id]),
+  );
 
 const assertUnique = (values: readonly string[], label: string): void => {
   if (new Set(values).size !== values.length)

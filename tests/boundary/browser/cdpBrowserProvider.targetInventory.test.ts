@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { describe, expect, it } from "vitest";
 
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
+import { listBrowserTargetsInputSchema } from "../../../src/domain/browserObservation.js";
 
 describe("CDP target inventory", () => {
   it("returns every allowed target within the bounded discovery payload", async () => {
@@ -14,7 +15,7 @@ describe("CDP target inventory", () => {
         type: "page",
         title: `Page ${String(index)}`,
         url: `https://allowed.example/page/${String(index)}`,
-        attached: false,
+        ...(index === 0 ? {} : { attached: index === 1 ? false : true }),
         webSocketDebuggerUrl: `ws://127.0.0.1:${String(port)}/devtools/page/${id}`,
       };
     });
@@ -51,16 +52,25 @@ describe("CDP target inventory", () => {
       port = address.port;
       const endpoint = `http://127.0.0.1:${String(port)}`;
 
-      const result = await new CdpBrowserProvider().listTargets({
-        cdp_endpoint: endpoint,
-        allowed_origins: ["https://allowed.example"],
-      });
+      const result = await new CdpBrowserProvider().listTargets(
+        listBrowserTargetsInputSchema.parse({
+          cdp_endpoint: endpoint,
+          allowed_origins: ["https://allowed.example"],
+        }),
+      );
 
-      expect(result.ok).toBe(true);
       if (!result.ok) throw result.error;
       expect(result.value.targets).toHaveLength(targets.length);
       expect(result.value.targets[0]?.target_id).toBe("target-0000");
       expect(result.value.targets.at(-1)?.target_id).toBe("target-1100");
+      expect(
+        result.value.targets.slice(0, 3).map(({ attached }) => attached),
+      ).toEqual([null, false, true]);
+      expect(
+        result.value.limitations.some((item) =>
+          item.includes("attachment state"),
+        ),
+      ).toBe(true);
     } finally {
       if (server.listening)
         await new Promise<void>((resolve, reject) => {

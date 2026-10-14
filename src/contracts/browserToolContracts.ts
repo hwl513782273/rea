@@ -1,10 +1,12 @@
-import type { ToolContract } from "./toolContracts.js";
+import type { ToolContract } from "./toolContractTypes.js";
 import {
-  browserTargetListSchema,
   inspectWebPageInputSchema,
   listBrowserTargetsInputSchema,
-  webPageInspectionSchema,
 } from "../domain/browserObservation.js";
+import {
+  browserTargetListSchema,
+  webPageInspectionSchema,
+} from "../domain/browserObservationSchemas.js";
 import {
   analyzeWebBundleInputSchema,
   webBundleAnalysisSchema,
@@ -28,19 +30,20 @@ import {
   webScreenshotSchema,
 } from "../domain/webScreenshot.js";
 import { toolContractMetadata } from "./toolEffects.js";
-import { evidenceResultOf } from "./toolOutputSchemas.js";
+import { evidenceResultOf } from "./toolOutputSchemaPrimitives.js";
 
-const evidenceResult = evidenceResultOf;
-const listOutputSchema = evidenceResult(browserTargetListSchema);
-const inspectionOutputSchema = evidenceResult(webPageInspectionSchema);
-const bundleOutputSchema = evidenceResult(webBundleAnalysisSchema);
-const observationSessionOutputSchema = evidenceResult(
+const listOutputSchema = evidenceResultOf(browserTargetListSchema);
+const inspectionOutputSchema = evidenceResultOf(webPageInspectionSchema);
+const bundleOutputSchema = evidenceResultOf(webBundleAnalysisSchema);
+const observationSessionOutputSchema = evidenceResultOf(
   webObservationSessionSchema,
 );
-const webMcpOutputSchema = evidenceResult(webMcpDiscoverySchema);
-const captureDiffOutputSchema = evidenceResult(browserCaptureComparisonSchema);
-const screenshotOutputSchema = evidenceResult(webScreenshotSchema);
-const screenshotDiffOutputSchema = evidenceResult(webScreenshotDiffSchema);
+const webMcpOutputSchema = evidenceResultOf(webMcpDiscoverySchema);
+const captureDiffOutputSchema = evidenceResultOf(
+  browserCaptureComparisonSchema,
+);
+const screenshotOutputSchema = evidenceResultOf(webScreenshotSchema);
+const screenshotDiffOutputSchema = evidenceResultOf(webScreenshotDiffSchema);
 
 const endpoint = "http://127.0.0.1:9222";
 const origin = "https://app.example.test";
@@ -76,6 +79,12 @@ const exampleScenarioCapture = () => ({
     start_origin: origin,
     action_count: 1,
     secret_references: [],
+    network_content: {
+      request_body: false,
+      response_body: false,
+      header_values: false,
+    },
+    event_families: [],
   },
   duration_ms: 10,
   steps: [
@@ -215,7 +224,7 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "compare_web_captures",
     ...toolContractMetadata("compare_web_captures"),
     description:
-      "Compare passive web captures by providing before and after, or compare recorded scenarios by providing before_scenario and after_scenario with an optional normalization policy. Use exactly one input group. Scenario comparison aligns exact step IDs, records deterministic literal normalization, and returns every artifact-level difference plus alignment failures inline. Missing or truncated evidence never proves equality.",
+      "Compare passive web captures by providing before and after, each with the complete inspect_web_page normalized_result in inspection and an optional complete discover_webmcp_tools normalized_result in webmcp; or compare recorded scenarios by passing complete capture_browser_scenario normalized_result objects in before_scenario and after_scenario with an optional normalization policy. Use exactly one input group. Network comparison includes observed HTTP requests and WebSocket frame streams; same-URL connections are compared as an unordered collection of ordered streams, retaining connection counts without claiming stable identity between individual connections. Scenario comparison aligns exact step IDs, records deterministic literal normalization, and returns every artifact-level difference plus alignment failures inline. Missing or truncated evidence never proves equality.",
     kind: "browser-provider",
     inputSchema: browserCaptureComparisonInputSchema,
     outputSchema: captureDiffOutputSchema,

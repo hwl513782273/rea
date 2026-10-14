@@ -7,6 +7,10 @@ This passive runtime surface is distinct from the target-free static
 workflow. Static analysis reads a local ASAR or extracted directory without
 executing application code. Passive observation inspects an existing Electron
 page. The results keep static inferences and runtime observations distinct.
+Packaged fuse state is a separate static read:
+[`inspect_electron_fuses`](electron-fuses.md) reports whether this binary will
+honor Inspector flags, `ELECTRON_RUN_AS_NODE`, embedded ASAR integrity, and
+`app.asar`-only loading.
 Use the separate
 [`reconcile_javascript_runtime`](javascript-runtime-reconciliation.md) workflow
 when both Evidence sets already exist.
@@ -15,7 +19,11 @@ when both Evidence sets already exist.
 
 The request supplies a literal-port loopback endpoint and, for inspection, a
 target ID. REA accepts local hostless `file://` URLs that resolve to regular
-files; remote hosts, encoded path separators, and nonexistent paths are
+files, including pages a packaged application serves from inside `app.asar`.
+For those, the first `.asar` path component that is a regular file is the
+archive, the remainder must name a regular file in its header, and the reported
+path is the canonical archive path joined with that member. Remote hosts,
+encoded path separators, ASAR directories or links, and nonexistent paths are
 rejected. The endpoint exposes every eligible target and its local path
 metadata.
 
@@ -86,16 +94,33 @@ rea capture-electron-scenario scenario.json --json
 
 The result records action status and targets, correlated app/window/WebContents,
 preload, session, navigation, shell, permission, popup, download, protocol,
-native-addon, process, and IPC timeline events. IPC channels are capped at
-1,024 characters and argument-shape metadata at 32 entries; values are never
-retained. Renderer crash/restart and deep-link actions are synthetic
+native-addon, process, and IPC timeline events. IPC channels and argument-shape
+metadata retain their observed lengths; payload values are never retained.
+Renderer crash/restart and deep-link actions are synthetic
 scenario controls; their attempted and observed outcomes remain in the
 timeline. The active hook blocks and records external shell/navigation,
 permission, download, popup, updater, and OS-integration effects. The timeline
 is explicitly partial when attachment starts after application activity. The
-owned experiment has an internal 60-second deadline and a 5-second per-action
-timeout so hung work reaches process cleanup; these are lifecycle timeouts, not
-caller-selected capture limits.
+startup has a 60-second deadline. Actions wait until completion or request
+cancellation; a click whose target never appears remains pending until cancelled.
+CLI SIGINT/SIGTERM requests cancellation and awaits owned-process cleanup.
+Window IDs, URLs, and cached titles come from one main-process Electron snapshot,
+so a crashed renderer does not require a successful renderer-side title query.
+Window instrumentation uses Electron's window-created event, including runtimes
+with a read-only `BrowserWindow` export. Preload configuration comes from the
+window's runtime metadata, including Electron's optional internal preload
+descriptor when web preferences omit it. This descriptor is verified on
+Electron 44.7.0; runtimes that expose neither representation retain an unavailable
+path. A configured path or working IPC handler does not prove preload execution.
+If cleanup cannot be verified, the error retains collected observations in
+`details.partial_observation` and marks their application cleanup `unverified`.
+Cleanup uncertainty does not authorize signaling unrelated processes.
+
+The real verifier exercises compiled CLI and stdio MCP discovery, page/script
+inspection, static/runtime reconciliation, active observation, and CLI SIGTERM
+cleanup before checking the IPC, renderer crash/reload, utility/child-process,
+deep-link, and blocked-effect fixture. A cleanup error keeps the full lane failed
+even when the retained capture contains useful observations.
 
 Active Electron Evidence can also be supplied to
 [`reconcile_javascript_runtime`](javascript-runtime-reconciliation.md). That
@@ -103,3 +128,5 @@ projection is intentionally target-only and partial: it binds the selected
 application path and capture outcome to the static graph, while frames, scripts,
 workers, and execution claims remain unavailable until a separate passive runtime
 capture provides them.
+
+ASAR observation reads the header through one open file handle, validates its declared lengths against the archive size, and limits encoded JSON headers to 16 MiB before parsing. The header cache also retains at most 16 MiB of encoded headers across eight archives. Oversized headers produce a scope refusal.

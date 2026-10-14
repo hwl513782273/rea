@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { nativeMetadataRecoverySummarySchema } from "./nativeMetadataRecovery.js";
 import { jsonValueSchema } from "../jsonValue.js";
+import { binaryArchitectureSchema } from "../rawBinary.js";
 
 const integer = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const digest = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -84,7 +85,7 @@ export const nativeLoadImageCheckSchema = z.strictObject({
 });
 
 /** Read-only native image verification; verified applies only to declared coverage. */
-export const nativeLoadImageSchema = z.discriminatedUnion("status", [
+export const nativeLoadImageSchema = z.union([
   z.strictObject({
     status: z.literal("unsupported"),
     reason: z.string().min(1),
@@ -103,6 +104,23 @@ export const nativeLoadImageSchema = z.discriminatedUnion("status", [
       relative_segment: integer.max(0xffff),
       offset: integer.max(0xffff),
       linear_address: address,
+    }),
+    observations: nativeLoadImageObservationSchema,
+    checks: z.array(nativeLoadImageCheckSchema),
+    limitations: z.array(z.string().min(1)),
+  }),
+  z.strictObject({
+    status: z.enum(["verified", "mismatch"]),
+    format: z.literal("raw-binary"),
+    target_sha256: digest,
+    architecture: binaryArchitectureSchema,
+    language_id: z.string().min(1),
+    compiler_spec_id: z.string().min(1),
+    base_address: address,
+    file_bytes: integer.min(1),
+    entry: z.strictObject({
+      address: address,
+      file_offset: z.literal(0),
     }),
     observations: nativeLoadImageObservationSchema,
     checks: z.array(nativeLoadImageCheckSchema),

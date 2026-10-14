@@ -1,5 +1,5 @@
-import { compareCodePoints } from "../canonicalOrdering.js";
-import type { ApplicationNode } from "./javascriptApplicationGraph.js";
+import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
 import {
   featureSeedMatchMode,
   type ApplicationFeatureSeed,
@@ -30,7 +30,7 @@ export const findApplicationFeatureSeeds = (
   nodes
     .flatMap((node) => seedMatch(node, seed))
     .sort((left, right) =>
-      compareCodePoints(
+      compareUnicodeCodePoints(
         `${left.node_id}\0${left.basis}\0${left.field}`,
         `${right.node_id}\0${right.basis}\0${right.field}`,
       ),
@@ -40,22 +40,29 @@ const seedMatch = (
   node: ApplicationNode,
   seed: ApplicationFeatureSeed,
 ): ApplicationFeatureSeedMatch[] => {
-  if (seed.kind === "node-id")
-    return node.node_id === seed.value
-      ? [
-          {
-            node_id: node.node_id,
-            kind: node.kind,
-            basis: "node-id",
-            field: "node_id",
-          },
-        ]
-      : [];
-  if (!kindMatches(node, seed.kind)) return [];
   const mode = featureSeedMatchMode(seed);
-  const query = normalized(seed.value, seed.case_sensitive);
+  const caseSensitive = seed.case_sensitive;
+  const query = normalized(seed.value, caseSensitive);
+  if (!kindMatches(node, seed.kind)) return [];
+  const requestedEntryPath =
+    seed.kind === "api" && "entry_path" in seed ? seed.entry_path : undefined;
+  if (
+    seed.kind === "api" &&
+    requestedEntryPath !== undefined &&
+    !node.observations.some(({ properties }) => {
+      const entryPath = properties.entry_path;
+      return (
+        Array.isArray(entryPath) &&
+        entryPath.length === requestedEntryPath.length &&
+        entryPath.every(
+          (segment, index) => segment === requestedEntryPath[index],
+        )
+      );
+    })
+  )
+    return [];
   const match = candidateFields(node, seed.kind).find((candidate) => {
-    const value = normalized(candidate.value, seed.case_sensitive);
+    const value = normalized(candidate.value, caseSensitive);
     return mode === "exact" ? value === query : value.includes(query);
   });
   return match === undefined
@@ -72,9 +79,9 @@ const seedMatch = (
 
 const kindMatches = (
   node: ApplicationNode,
-  kind: Exclude<ApplicationFeatureSeed["kind"], "node-id">,
+  kind: ApplicationFeatureSeed["kind"],
 ): boolean => {
-  if (kind === "string") return true;
+  if (kind === "string" || kind === "node-id") return true;
   if (kind === "route")
     return (
       node.kind === "endpoint" &&
@@ -82,7 +89,12 @@ const kindMatches = (
         ({ properties }) => properties.endpoint_kind === "route",
       )
     );
-  if (kind === "api") return node.kind === "context-bridge-api";
+  if (kind === "api")
+    return (
+      node.kind === "context-bridge-api" ||
+      (node.kind === "javascript-expression" &&
+        node.observations.some((o) => o.properties.step_kind === "exposure"))
+    );
   if (kind === "channel") return node.kind === "ipc-channel";
   if (kind === "module")
     return ["javascript-asset", "javascript-module", "source-module"].includes(
@@ -93,8 +105,25 @@ const kindMatches = (
 
 const candidateFields = (
   node: ApplicationNode,
-  seedKind: Exclude<ApplicationFeatureSeed["kind"], "node-id">,
+  seedKind: ApplicationFeatureSeed["kind"],
 ): CandidateField[] => {
+  if (seedKind === "node-id")
+    return [{ basis: "node-id", field: "node_id", value: node.node_id }];
+  if (seedKind === "route")
+    return node.observations.flatMap((observation, index) =>
+      (["value", "path"] as const).flatMap((key) => {
+        const value = observation.properties[key];
+        return typeof value === "string"
+          ? [
+              {
+                basis: "property" as const,
+                field: `observations[${String(index)}].properties.${key}`,
+                value,
+              },
+            ]
+          : [];
+      }),
+    );
   const fields: CandidateField[] = [
     ...identityFields(node),
     ...node.observations.flatMap((observation, index) => [
@@ -107,6 +136,16 @@ const candidateFields = (
               value: observation.label,
             },
           ]),
+      ...(observation.source_map_reference !== null &&
+      observation.source_map_reference.resolution.kind !== "unresolved"
+        ? [
+            {
+              basis: "property" as const,
+              field: `observations[${String(index)}].source_map_reference.resolution.path`,
+              value: observation.source_map_reference.resolution.path,
+            },
+          ]
+        : []),
       ...propertyFields(
         observation.properties,
         `observations[${String(index)}].properties`,
@@ -140,6 +179,7 @@ const relevantFields = {
     ".path",
     ".source",
     ".original_source",
+    ".source_root",
     ".exports",
   ],
   "native-export": [".label", ".key", ".requested_members", ".members"],
@@ -156,6 +196,15 @@ const identityFields = (node: ApplicationNode): CandidateField[] => {
         field: "identity.original_source",
         value: identity.original_source,
       },
+      ...(identity.source_root === null
+        ? []
+        : [
+            {
+              basis: "identity" as const,
+              field: "identity.source_root",
+              value: identity.source_root,
+            },
+          ]),
     ];
   if (identity.strategy === "canonical-path")
     return [
@@ -210,7 +259,9 @@ const propertyFields = (
       continue;
     }
     if (current !== null && typeof current === "object") {
-      for (const key of Object.keys(current).sort(compareCodePoints).reverse())
+      for (const key of Object.keys(current)
+        .sort(compareUnicodeCodePoints)
+        .reverse())
         pending.push({
           current: current[key] ?? null,
           path: `${path}.${key}`,

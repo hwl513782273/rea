@@ -1,13 +1,21 @@
 import { createEvidence } from "../../domain/evidence.js";
-import { reconcileJavaScriptRuntime } from "../../domain/javascript/javascriptRuntimeReconciliation.js";
+import {
+  parseRuntimeReconciliationInput,
+  reconcileJavaScriptRuntime,
+} from "../../domain/javascript/javascriptRuntimeReconciliation.js";
 import {
   JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
   JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE,
 } from "./javascriptRuntimeReconciliationExample.js";
 import { createHistoricalSourceGraph } from "../../domain/referenceSourceGraph.js";
+import { reconcileJavaScriptRuntimeInputSchema } from "../../domain/javascript/javascriptRuntimeReconciliationSchemas.js";
 
 const reconciliation = reconcileJavaScriptRuntime(
-  JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE,
+  parseRuntimeReconciliationInput(
+    reconcileJavaScriptRuntimeInputSchema.parse(
+      JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE,
+    ),
+  ),
 );
 const reconciliationEvidence = createEvidence(
   undefined,
@@ -46,7 +54,6 @@ const TRACE_SEED = {
   match: "exact" as const,
   case_sensitive: false,
 };
-
 /** Natural trace request with the producer's complete Evidence inline. */
 export const JAVASCRIPT_FEATURE_TRACE_EXAMPLE = {
   application: JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
@@ -100,27 +107,4 @@ export const SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE = {
     limitations: [],
   }),
   application: JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
-};
-
-/** Exact static return-shape comparison with both Evidence records inline. */
-export const JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE = {
-  left: JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
-  right: reconciliationEvidence,
-  left_module_path: "parser.mjs",
-  left_export_name: "default",
-  right_module_path: "parser.mjs",
-  right_export_name: "default",
-};
-
-/** Full-Evidence compatibility fixture used by pure domain and adapter tests. */
-export const JAVASCRIPT_FEATURE_TRACE_FULL_EVIDENCE_EXAMPLE = {
-  application: JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
-  seed: TRACE_SEED,
-  direction: "both" as const,
-};
-
-/** Full-Evidence compatibility comparison fixture. */
-export const JAVASCRIPT_VERSION_COMPARISON_FULL_EVIDENCE_EXAMPLE = {
-  left: JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
-  right: reconciliationEvidence,
 };

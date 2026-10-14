@@ -1,41 +1,62 @@
 import { z } from "zod";
+import { sqliteDatabaseCapability } from "./sqlite/SqliteDatabaseCapability.js";
 import type {
   OptionalProviderLoadFailures,
   OptionalProviderLoadFailure,
 } from "./OptionalObservationProviders.js";
 
 import {
-  providerCapability,
+  expandProviderCapabilities,
+  providerCapabilitySet,
+  toolAvailabilityInventory,
+  TOOL_ANNOTATION_NAMES,
+  TOOL_EFFECT_NAMES,
   type ClientFeatureAvailability,
   type ProviderCapability,
+  type ToolAvailabilityInventory,
   type ToolAvailability,
   type ToolAvailabilityMode,
   type ToolUnavailabilityReason,
 } from "../contracts/toolOutputSchemaPrimitives.js";
 import type { ToolKind } from "../contracts/toolContractTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
+import { isMachOFormat } from "../domain/binaryTargetTypes.js";
+import type { ProviderAvailability } from "./AnalysisProvider.js";
 import { TOOL_CONTRACTS } from "../contracts/toolContracts.js";
+import { FRIDA_TOOL_CONTRACTS } from "../contracts/fridaToolContracts.js";
 import {
   clientRequirementsFor,
   NO_CLIENT_FEATURES,
 } from "./CapabilityClientRequirements.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 const statusSchema = z.object({
   open: z.boolean(),
   kind: z.enum(["executable", "database", "archive", "artifact"]).optional(),
   format: z.string().optional(),
-  capabilities: z.array(providerCapability),
+  capabilities: z
+    .array(providerCapabilitySet)
+    .transform(expandProviderCapabilities),
 });
 
 type ToolAvailabilityReason = "available" | ToolUnavailabilityReason;
 
 type ProviderDescriptor = ProviderCapability;
 export type AvailabilityPolicy = {
+  readonly packetCaptureEnabled?: boolean;
+  readonly signalRecordingEnabled?: boolean;
+  readonly wasmArtifactEnabled?: boolean;
+  readonly evmInterfaceEnabled?: boolean;
   readonly processCaptureEnabled: boolean;
   readonly optionalProviderLoadFailures?: OptionalProviderLoadFailures;
+  readonly binaryLayoutEnabled?: boolean;
+  readonly recordedCrashEnabled?: boolean;
   readonly firmwareInspectionEnabled?: boolean;
   readonly firmwareExtractionEnabled?: boolean;
-  readonly androidAnalysisEnabled?: boolean;
+  readonly androidAnalysisAvailability?: ProviderAvailability;
+  readonly adbAnalysisAvailability?: ProviderAvailability;
+  readonly apktoolAnalysisAvailability?: ProviderAvailability;
+  readonly jebAnalysisAvailability?: ProviderAvailability;
   readonly javascriptRecoveryEnabled?: boolean;
   readonly webModuleResolutionEnabled?: boolean;
   readonly browserObservationEnabled?: boolean;
@@ -74,11 +95,14 @@ type AvailabilityContext = {
     | "archive"
     | "artifact"
     | undefined;
+  readonly targetFormat: string | undefined;
   readonly descriptors: ReadonlyMap<string, ProviderDescriptor>;
   readonly policy: AvailabilityPolicy;
 };
 
-const ENHANCED_REQUIREMENTS: Readonly<Record<string, readonly string[]>> = {
+const ENHANCED_REQUIREMENTS: Readonly<
+  Record<string, readonly (string | readonly string[])[]>
+> = {
   trace_native_values: ["analyze_function", "resolve_native_call_targets"],
   trace_native_ui_action: [
     "decode_interface_builder",
@@ -93,20 +117,40 @@ const ENHANCED_REQUIREMENTS: Readonly<Record<string, readonly string[]>> = {
   analyze_swift_types: ["list_procedures"],
   find_xrefs_to_name: ["list_names", "xrefs"],
   binary_overview: [
-    "list_segments",
-    "list_documents",
+    ["current_document", "list_documents"],
     "list_procedures",
     "list_strings",
   ],
   analyze_function: ["analyze_function"],
   inspect_native_api: ["analyze_function"],
   trace_feature: [
-    "list_strings",
-    "list_procedures",
+    "search_strings",
+    "search_procedures",
     "xrefs",
     "resolve_containing_procedure",
   ],
 };
+
+/** Contract kinds whose operations run on the active session target. */
+const ACTIVE_TARGET_KINDS: ReadonlySet<ToolKind> = new Set([
+  "official-proxy",
+  "enhanced",
+  "native-provider",
+  "artifact-provider",
+]);
+const FRIDA_OPERATION_NAMES: ReadonlySet<string> = new Set(
+  FRIDA_TOOL_CONTRACTS.map(({ name }) => name),
+);
+
+/** Native contracts defined only for an active Mach-O executable. */
+const MACHO_TARGET_OPERATIONS: ReadonlySet<string> = new Set([
+  "inspect_signature",
+  "inspect_macho",
+  "list_architectures",
+  "observe_native_calls",
+  "observe_native_ui",
+  "capture_native_ui_scenario",
+]);
 
 const NAVIGATION_CONTEXT_MODES = [
   {
@@ -139,6 +183,7 @@ export const buildCapabilityInventory = (
       kind: contract.kind,
       targetOpen: status.open,
       targetKind: status.kind,
+      targetFormat: status.format,
       descriptors,
       policy,
     });
@@ -185,7 +230,61 @@ export const buildCapabilityInventory = (
           reason: availability.reason,
           remediation: availability.remediation,
         };
-  }).sort((left, right) => left.name.localeCompare(right.name));
+  }).sort((left, right) => compareUnicodeCodePoints(left.name, right.name));
+};
+
+type ClientRequirements = ToolAvailability["client_requirements"];
+type MutableAvailabilityGroup = Omit<
+  ToolAvailabilityInventory["groups"][number],
+  "names"
+> & { names: string[] };
+
+const EMPTY_CLIENT_REQUIREMENTS: ClientRequirements = {
+  required: [],
+  optional: [],
+  missing_required: [],
+  missing_optional: [],
+};
+
+/** Compact repeated metadata while retaining every operation's current availability inline. */
+export const compactToolAvailability = (
+  availability: readonly ToolAvailability[],
+): ToolAvailabilityInventory => {
+  const clientRequirements =
+    availability[0]?.client_requirements ?? EMPTY_CLIENT_REQUIREMENTS;
+  const groups = new Map<string, MutableAvailabilityGroup>();
+
+  for (const entry of availability) {
+    const effects = TOOL_EFFECT_NAMES.filter((name) => entry.effects[name]);
+    const annotations = TOOL_ANNOTATION_NAMES.filter(
+      (name) => entry.annotations[name],
+    );
+    const groupFacts = {
+      surface: entry.surface,
+      effects,
+      annotations,
+      available: entry.available,
+      reason: entry.reason,
+      remediation: entry.remediation,
+      ...(entry.default_mode_available === undefined
+        ? {}
+        : { default_mode_available: entry.default_mode_available }),
+      ...(entry.modes === undefined ? {} : { modes: [...entry.modes] }),
+      ...(JSON.stringify(entry.client_requirements) ===
+      JSON.stringify(clientRequirements)
+        ? {}
+        : { client_requirements: entry.client_requirements }),
+    };
+    const key = JSON.stringify(groupFacts);
+    const existing = groups.get(key);
+    if (existing) existing.names.push(entry.name);
+    else groups.set(key, { ...groupFacts, names: [entry.name] });
+  }
+
+  return toolAvailabilityInventory.parse({
+    client_requirements: clientRequirements,
+    groups: [...groups.values()],
+  });
 };
 
 const availabilityFor = (context: AvailabilityContext): Availability => {
@@ -207,6 +306,8 @@ const availabilityFor = (context: AvailabilityContext): Availability => {
     };
   const workflowAvailability = workflowAvailabilityFor(context);
   if (workflowAvailability !== null) return workflowAvailability;
+  const hostDecision = hostAvailability(context);
+  if (hostDecision !== null) return hostDecision;
   const targetDecision = targetAvailability(context);
   if (targetDecision !== null) return targetDecision;
   return providerAvailability(context);
@@ -226,6 +327,7 @@ const optionalProviderFailureFor = ({
   if (kind === "electron-provider") return failures?.electronObservation;
   if (kind === "runtime-provider")
     return failures?.javascriptRuntimeObservation;
+  if (FRIDA_OPERATION_NAMES.has(name)) return failures?.fridaInstrumentation;
   return undefined;
 };
 
@@ -244,6 +346,21 @@ const workflowAvailabilityFor = ({
   kind,
   policy,
 }: AvailabilityContext): Availability | null => {
+  if (
+    name === "inspect_go_binary" ||
+    name === "inspect_rust_binary" ||
+    name === "inspect_electron_fuses"
+  )
+    return { reason: "available", remediation: null };
+  if (name === "inspect_sqlite_database") {
+    const capability = sqliteDatabaseCapability(process.versions.node);
+    return capability.available
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_unavailable",
+          remediation: capability.reason,
+        };
+  }
   if (name === "trace_web_module_imports")
     return {
       reason: "available",
@@ -278,7 +395,57 @@ const workflowAvailabilityFor = ({
       : {
           reason: "provider_missing",
           remediation:
-            "On Linux x64, provide an absolute REA_WAKARU_COMMAND for Wakaru 1.13.0 and util-linux prlimit. No binary target is required.",
+            "On Linux x64, provide an absolute REA_WAKARU_COMMAND for Wakaru ^1.13.0 (verified with 1.14.0) and util-linux prlimit; see docs/javascript-recovery.md#install-wakaru. No binary target is required.",
+        };
+  if (name === "inspect_binary_layout")
+    return policy.binaryLayoutEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "On Linux x64, set absolute REA_PWNTOOLS_PYTHON to caller-supplied Python with pwntools 4.15.0. No active binary target is required.",
+        };
+  if (name === "inspect_packet_capture" || name === "inspect_packet_fields")
+    return policy.packetCaptureEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "On Linux, supply TShark 4.x via absolute REA_TSHARK_COMMAND and util-linux prlimit (REA_TSHARK_PRLIMIT_COMMAND, default /usr/bin/prlimit). No active binary target or hardware is required; the tool is checked at execution.",
+        };
+  if (name === "decode_signal_recording" || name === "inspect_signal_decoders")
+    return policy.signalRecordingEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "On Linux, supply sigrok-cli 0.7.2 via absolute REA_SIGROK_COMMAND and util-linux prlimit (REA_SIGROK_PRLIMIT_COMMAND, default /usr/bin/prlimit). No active binary target or hardware is required; the tool is checked at execution.",
+        };
+  if (name === "inspect_wasm_artifact")
+    return policy.wasmArtifactEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "Supply WABT 1.0.42 via absolute REA_WABT_BIN_DIRECTORY. No active binary target is required; tools are checked at execution.",
+        };
+  if (name === "inspect_pe_resources")
+    return { reason: "available", remediation: null };
+  if (name === "inspect_evm_interface")
+    return policy.evmInterfaceEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "The bundled offline EVM interface profile is currently real-verified on Linux x64. No active binary target or chain endpoint is required.",
+        };
+  if (name === "inspect_recorded_crash")
+    return policy.recordedCrashEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "On Linux x64, set absolute REA_PWNTOOLS_PYTHON to caller-supplied Python with pwntools 4.15.0. No active binary target is required.",
         };
   if (kind === "firmware-provider") {
     const enabled =
@@ -294,12 +461,38 @@ const workflowAvailabilityFor = ({
         };
   }
   if (kind === "android-provider")
-    return policy.androidAnalysisEnabled === true
+    return policy.androidAnalysisAvailability?.status === "available"
+      ? { reason: "available", remediation: null }
+      : {
+          reason:
+            policy.androidAnalysisAvailability?.code === "unsupported_host"
+              ? "unsupported_host"
+              : policy.androidAnalysisAvailability?.code ===
+                  "runtime_unavailable"
+                ? "provider_unavailable"
+                : "provider_missing",
+          remediation:
+            policy.androidAnalysisAvailability?.reason ??
+            "Set REA_JADX_MCP_JAR to a caller-supplied jadx-headless-mcp 0.7.1 JAR and provide a full JDK on Linux, macOS, or Windows x64 with its matching bundled native controls.",
+        };
+  if (kind === "adb-provider")
+    return ownerProbeAvailability(
+      policy.adbAnalysisAvailability,
+      "Set REA_ADB_PATH to a caller-supplied adb executable or make adb available on PATH. This checks the client version only; device and serial availability depend on the request.",
+    );
+  if (kind === "apktool-provider")
+    return ownerProbeAvailability(
+      policy.apktoolAnalysisAvailability,
+      "Set REA_APKTOOL_COMMAND to a caller-supplied Apktool executable or make Apktool 2.7.0 or newer available on PATH.",
+    );
+  if (kind === "jeb-provider")
+    return policy.jebAnalysisAvailability?.status === "available"
       ? { reason: "available", remediation: null }
       : {
           reason: "provider_missing",
           remediation:
-            "Set REA_JADX_MCP_JAR to a caller-supplied jadx-headless-mcp 0.7.1 JAR and provide Java on Linux or macOS. Only Linux has real-provider verification.",
+            policy.jebAnalysisAvailability?.reason ??
+            "Start a JEB client serving MCP (GUI client, or headless via its programmatic launcher) and point REA_JEB_MCP_URL at it (default http://127.0.0.1:8425/mcp). REA does not install or launch JEB.",
         };
   const browser = browserProviderAvailability(name, kind, policy);
   if (browser !== null) return browser;
@@ -309,6 +502,8 @@ const workflowAvailabilityFor = ({
       remediation: "Run process capture on a supported Linux or macOS host.",
     };
   if (kind === "application") return { reason: "available", remediation: null };
+  if (kind === "pcap-provider" || kind === "flutter-provider")
+    return { reason: "available", remediation: null };
   const electron = electronProviderAvailability(name, kind, policy);
   if (electron !== null) return electron;
   if (kind === "runtime-provider")
@@ -321,6 +516,25 @@ const workflowAvailabilityFor = ({
         };
   if (kind === "session") return { reason: "available", remediation: null };
   return null;
+};
+
+const ownerProbeAvailability = (
+  observation: ProviderAvailability | undefined,
+  missingRemediation: string,
+): Availability => {
+  if (observation === undefined)
+    return { reason: "provider_missing", remediation: missingRemediation };
+  if (observation.status === "available")
+    return { reason: "available", remediation: null };
+  return {
+    reason:
+      observation.code === "unsupported_host"
+        ? "unsupported_host"
+        : observation.code === "not_configured"
+          ? "provider_missing"
+          : "provider_unavailable",
+    remediation: observation.reason,
+  };
 };
 
 const electronProviderAvailability = (
@@ -369,12 +583,33 @@ const browserProviderAvailability = (
       };
 };
 
+/**
+ * Opening another target cannot make an operation run on an unsupported host.
+ * Composed operations are decided by their requirements, which another
+ * provider may satisfy.
+ */
+const hostAvailability = ({
+  descriptors,
+  kind,
+  name,
+}: AvailabilityContext): Availability | null => {
+  if (kind === "enhanced") return null;
+  const descriptor = descriptors.get(name);
+  return descriptor?.available === false &&
+    descriptor.availability_code === "unsupported_host"
+    ? { reason: "unsupported_host", remediation: descriptor.reason }
+    : null;
+};
+
 const targetAvailability = ({
+  name,
   kind,
   targetKind,
+  targetFormat,
   targetOpen,
 }: AvailabilityContext): Availability | null => {
-  if (!targetOpen && (kind === "official-proxy" || kind === "enhanced"))
+  if (FRIDA_OPERATION_NAMES.has(name)) return null;
+  if (!targetOpen && ACTIVE_TARGET_KINDS.has(kind))
     return {
       reason: "target_required",
       remediation: "Call open_binary with a supported local target.",
@@ -389,6 +624,16 @@ const targetAvailability = ({
       reason: "target_unsupported",
       remediation:
         "Inventory or extract a native executable, then call open_binary on that executable.",
+    };
+  if (
+    targetOpen &&
+    MACHO_TARGET_OPERATIONS.has(name) &&
+    (targetKind !== "executable" || !isMachOFormat(targetFormat))
+  )
+    return {
+      reason: "target_unsupported",
+      remediation:
+        "Call open_binary with a Mach-O executable or an app bundle whose main executable is Mach-O.",
     };
   return null;
 };
@@ -413,14 +658,6 @@ const providerAvailability = ({
       remediation:
         "Install or configure a provider that declares this operation.",
     };
-  if (
-    !descriptor.available &&
-    descriptor.availability_code === "unsupported_host"
-  )
-    return {
-      reason: "unsupported_host",
-      remediation: descriptor.reason,
-    };
   return descriptor.available
     ? { reason: "available", remediation: null }
     : {
@@ -444,27 +681,62 @@ const composedAvailability = (
 };
 
 const composedAvailabilityFor = (
-  requirements: readonly string[],
+  requirements: readonly (string | readonly string[])[],
   descriptors: ReadonlyMap<string, ProviderDescriptor>,
 ): Availability => {
-  const missing = requirements.find((operation) => !descriptors.has(operation));
-  if (missing !== undefined)
-    return {
-      reason: "provider_missing",
-      remediation: `Configure a provider for required operation ${missing}.`,
-    };
-  const unavailable = requirements
-    .map((operation) => descriptors.get(operation))
-    .find((descriptor) => descriptor?.available === false);
-  if (unavailable !== undefined)
-    return {
-      reason:
-        unavailable.availability_code === "unsupported_host"
-          ? "unsupported_host"
-          : "provider_unavailable",
-      remediation:
-        unavailable.reason ?? "Choose another target or configured provider.",
-    };
+  for (const requirement of requirements) {
+    if (typeof requirement === "string") {
+      if (!descriptors.has(requirement))
+        return {
+          reason: "provider_missing",
+          remediation: `Configure a provider for required operation ${requirement}.`,
+        };
+    } else {
+      const declared = requirement.some((operation) =>
+        descriptors.has(operation),
+      );
+      if (!declared)
+        return {
+          reason: "provider_missing",
+          remediation: `Configure a provider for one of: ${requirement.join(", ")}.`,
+        };
+    }
+  }
+
+  for (const requirement of requirements) {
+    if (typeof requirement === "string") {
+      const descriptor = descriptors.get(requirement);
+      if (descriptor?.available === false)
+        return {
+          reason:
+            descriptor.availability_code === "unsupported_host"
+              ? "unsupported_host"
+              : "provider_unavailable",
+          remediation:
+            descriptor.reason ??
+            "Choose another target or configured provider.",
+        };
+    } else {
+      const anyAvailable = requirement.some(
+        (operation) => descriptors.get(operation)?.available === true,
+      );
+      if (!anyAvailable) {
+        const unavailable = requirement
+          .map((operation) => descriptors.get(operation))
+          .find((descriptor) => descriptor?.available === false);
+        if (unavailable !== undefined)
+          return {
+            reason:
+              unavailable.availability_code === "unsupported_host"
+                ? "unsupported_host"
+                : "provider_unavailable",
+            remediation:
+              unavailable.reason ??
+              "Choose another target or configured provider.",
+          };
+      }
+    }
+  }
   return { reason: "available", remediation: null };
 };
 
@@ -529,14 +801,15 @@ const navigationContextAvailability = (
   };
   if (availableMode !== undefined)
     return { ...facts, reason: "available", remediation: null };
+  const missingOperations = [
+    ...new Set(modes.flatMap((mode) => mode.missing_operations)),
+  ];
   return {
     ...facts,
     reason: failure?.reason ?? "provider_missing",
     remediation:
       specificFailureRemediation ??
-      `Configure a provider for one of: ${modes
-        .flatMap((mode) => mode.missing_operations)
-        .join(", ")}.`,
+      `Configure a provider for one of: ${missingOperations.join(", ")}.`,
   };
 };
 

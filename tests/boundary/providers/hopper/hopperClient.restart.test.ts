@@ -12,7 +12,9 @@ describe("HopperClient restart", () => {
       launcher: new FixtureLauncher(),
       startupTimeoutMs: 1_000,
     });
-    onTestFinished(() => client.close());
+    onTestFinished(async () => {
+      await client.close();
+    });
 
     const starting = client.start();
     await client.close();
@@ -28,7 +30,11 @@ describe("HopperClient restart", () => {
 
     await expect(client.start()).resolves.toEqual({
       ok: true,
-      value: { name: "REA Hopper bridge", version: "1.0.0" },
+      value: {
+        name: "REA Hopper bridge",
+        version: "1.0.0",
+        processId: expect.any(Number),
+      },
     });
   });
 
@@ -40,7 +46,11 @@ describe("HopperClient restart", () => {
     await closing;
     await expect(restarting).resolves.toEqual({
       ok: true,
-      value: { name: "REA Hopper bridge", version: "1.0.0" },
+      value: {
+        name: "REA Hopper bridge",
+        version: "1.0.0",
+        processId: expect.any(Number),
+      },
     });
     await expect(client.callTool("echo", { value: "fresh" })).resolves.toEqual({
       ok: true,

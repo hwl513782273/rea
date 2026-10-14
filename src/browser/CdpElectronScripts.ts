@@ -2,13 +2,14 @@ import type {
   ElectronPageInspection,
   InspectElectronPageInput,
 } from "../domain/javascript/electronObservation.js";
-import { canonicalDigest } from "../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import { createWebTextArtifact } from "../domain/webContentArtifact.js";
 import type { CdpConnection } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
-import { requiredRecord, cdpStringValue } from "./CdpCaptureValues.js";
+import { requiredScriptSource } from "./CdpCaptureValues.js";
 import type { ElectronScriptDraft } from "./CdpElectronScriptEvents.js";
 import { authorizedElectronFile } from "./ElectronFileScope.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 interface ElectronScriptCaptureInput {
   readonly connection: CdpConnection;
@@ -49,7 +50,7 @@ export const captureElectronScripts = async (
       is_module: script.isModule,
       language: script.language,
     };
-    const scriptKey = `electron_script_${canonicalDigest(identity, "CDP capture")}`;
+    const scriptKey = `electron_script_${digestCanonicalValue(identity, "CDP capture")}`;
     if (seen.has(scriptKey)) continue;
     seen.add(scriptKey);
     total += 1;
@@ -65,7 +66,7 @@ export const captureElectronScripts = async (
   return {
     total,
     items: items.sort((left, right) =>
-      left.script_key.localeCompare(right.script_key),
+      compareUnicodeCodePoints(left.script_key, right.script_key),
     ),
   };
 };
@@ -86,15 +87,15 @@ const captureScriptSource = async (
         reason: "source capture was not selected",
       },
     };
-  const result = requiredRecord(
+  const text = requiredScriptSource(
     await input.connection.send(
       "Debugger.getScriptSource",
       { scriptId: script.scriptId },
       input.sessionId,
       input.signal,
     ),
+    "inspect_electron_page",
   );
-  const text = cdpStringValue(result.scriptSource) ?? "";
   return {
     source: {
       included: true,

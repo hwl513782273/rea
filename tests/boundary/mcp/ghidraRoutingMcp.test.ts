@@ -1,5 +1,8 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { describe, expect, it } from "vitest";
 import { connectGhidraMcp } from "./ghidraMcpHarness.js";
+import { toolContract } from "../../../src/contracts/toolContracts.js";
+import { expandToolAvailability } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
 
 describe("Ghidra MCP capability routing", () => {
   it("routes composed and capability tools", async () => {
@@ -12,7 +15,7 @@ describe("Ghidra MCP capability routing", () => {
       });
       expect(batch.isError).not.toBe(true);
       expect(batch.structuredContent).toMatchObject({
-        result: {
+        normalized_result: {
           succeeded: 1,
           failed: 0,
           items: [{ status: "ok" }],
@@ -28,7 +31,7 @@ describe("Ghidra MCP capability routing", () => {
         arguments: { address: "0x1000", comment: "must not mutate" },
       });
       expect(denied.isError).toBe(true);
-      expect(denied.structuredContent).toMatchObject({
+      expect(parseMcpToolError(denied)).toMatchObject({
         error: {
           code: "capability_unavailable",
           category: "unsupported_provider",
@@ -40,44 +43,35 @@ describe("Ghidra MCP capability routing", () => {
         name: "binary_session",
         arguments: {},
       });
-      expect(status.structuredContent).toMatchObject({
-        result: {
-          open: true,
-          analysis_provider_binding: {
-            provider: { id: "ghidra", version: "12.1.4" },
-          },
-          tool_availability: expect.arrayContaining([
-            expect.objectContaining({
-              name: "binary_overview",
-              available: true,
-            }),
-            expect.objectContaining({
-              name: "get_objc_classes",
-              available: true,
-            }),
-            expect.objectContaining({
-              name: "batch_decompile",
-              available: true,
-            }),
-            expect.objectContaining({
-              name: "trace_feature",
-              available: true,
-            }),
-            expect.objectContaining({
-              name: "get_call_graph",
-              available: true,
-            }),
-            expect.objectContaining({
-              name: "find_xrefs_to_name",
-              available: true,
-            }),
-            expect.objectContaining({
-              name: "set_comment",
-              available: false,
-            }),
-          ]),
+      const sessionStatus = toolContract("binary_session").outputSchema.parse(
+        status.structuredContent,
+      );
+      expect(sessionStatus.result).toMatchObject({
+        open: true,
+        analysis_provider_binding: {
+          provider: { id: "ghidra", version: "12.1.4" },
         },
       });
+      const availability = expandToolAvailability(
+        sessionStatus.result.tool_availability,
+      );
+      expect(availability).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: "binary_overview", available: true }),
+          expect.objectContaining({
+            name: "get_objc_classes",
+            available: true,
+          }),
+          expect.objectContaining({ name: "batch_decompile", available: true }),
+          expect.objectContaining({ name: "trace_feature", available: true }),
+          expect.objectContaining({ name: "get_call_graph", available: true }),
+          expect.objectContaining({
+            name: "find_xrefs_to_name",
+            available: true,
+          }),
+          expect.objectContaining({ name: "set_comment", available: false }),
+        ]),
+      );
     } finally {
       await harness.close();
     }

@@ -1,21 +1,17 @@
 import { canonicalJson } from "./comparisonSemantics.js";
 import { diffLines } from "diff";
 
-import type {
-  FunctionCollection,
-  FunctionSnapshot,
-} from "./functionDossierEvidence.js";
+import type { FunctionSnapshot } from "./functionDossierEvidence.js";
 import {
   commentProjection,
-  combineCoverage,
   identityProjection,
   isAutoName,
   normalizeCfg,
-  project,
   referenceKindProjection,
   referenceProjection,
   sorted,
   stringAndNameProjection,
+  swiftLiteralSitesConflict,
 } from "./functionComparisonNormalization.js";
 import type {
   DimensionName,
@@ -23,113 +19,142 @@ import type {
 } from "./functionComparisonSchemas.js";
 import {
   dimensionResult,
-  unresolvedDimension as buildUnresolvedDimension,
+  unresolvedDimension,
+  type DimensionResultInput,
 } from "./functionComparisonResults.js";
 
-const unresolvedDimension = (
-  ...[dimension, status, links, leftCount, rightCount, limitations]: readonly [
-    DimensionName,
-    "truncated" | "unknown",
-    readonly string[],
-    number | null,
-    number | null,
-    readonly string[],
-  ]
-): FunctionDimension =>
-  buildUnresolvedDimension({
-    dimension,
-    status,
-    links,
-    leftCount,
-    rightCount,
-    limitations,
-  });
+type ComparisonContext = Pick<
+  DimensionResultInput,
+  "links" | "providersDiffer"
+>;
 
 export const compareDimensions = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
-): FunctionDimension[] => [
-  compareIdentity(left, right, links, providersDiffer),
-  compareText(
-    "pseudocode",
-    left.pseudocode.text,
-    right.pseudocode.text,
-    left.pseudocode.complete,
-    right.pseudocode.complete,
-    links,
-    providersDiffer,
-  ),
-  compareText(
-    "assembly",
-    left.collections.assembly.items.join("\n"),
-    right.collections.assembly.items.join("\n"),
-    left.collections.assembly.complete,
-    right.collections.assembly.complete,
-    links,
-    providersDiffer,
-    left.collections.assembly.truncated || right.collections.assembly.truncated,
-    "Assembly is opaque provider text; relocation normalization is unavailable.",
-  ),
-  compareComments(left, right, links, providersDiffer),
-  compareCalls(left, right, links, providersDiffer),
-  compareReferences(left, right, links, providersDiffer),
-  compareStringsAndNames(left, right, links, providersDiffer),
-  compareCfg(left, right, links, providersDiffer),
-];
+  context: ComparisonContext,
+): FunctionDimension[] => {
+  return [
+    compareIdentity(left, right, context),
+    compareText(
+      "pseudocode",
+      left.dossier.pseudocode,
+      right.dossier.pseudocode,
+      context,
+    ),
+    compareText(
+      "assembly",
+      left.dossier.assembly.join("\n"),
+      right.dossier.assembly.join("\n"),
+      context,
+    ),
+    compareComments(left, right, context),
+    compareCalls(left, right, context),
+    compareReferences(left, right, context),
+    compareStringsAndNames(left, right, context),
+    compareCfg(left, right, context),
+  ].map((result) => {
+    const limitations = [
+      ...facetLimitations(left, result.dimension).map(
+        (reason) => `Left: ${reason}`,
+      ),
+      ...facetLimitations(right, result.dimension).map(
+        (reason) => `Right: ${reason}`,
+      ),
+    ];
+    return limitations.length === 0
+      ? result
+      : unresolvedDimension({
+          dimension: result.dimension,
+          links: context.links,
+          leftCount: null,
+          rightCount: null,
+          limitations: [...result.limitations, ...limitations],
+        });
+  });
+};
+
+/** An empty undeclared facet is not evidence of observed absence. */
+const facetLimitations = (
+  snapshot: FunctionSnapshot,
+  dimension: DimensionName,
+): string[] => {
+  const { dossier } = snapshot;
+  const fields = {
+    identity: [],
+    pseudocode: [["pseudocode", dossier.pseudocode.length]],
+    assembly: [["assembly", dossier.assembly.length]],
+    comments: [["comments", dossier.comments.length]],
+    calls: [
+      ["callers", dossier.callers.length],
+      ["callees", dossier.callees.length],
+    ],
+    references: [
+      [
+        "references",
+        dossier.incoming_references.length + dossier.outgoing_references.length,
+      ],
+    ],
+    strings_names: [
+      [
+        "strings_names",
+        dossier.referenced_strings.length + dossier.referenced_names.length,
+      ],
+    ],
+    cfg: [["cfg", dossier.basic_blocks.length]],
+  } satisfies Record<
+    DimensionName,
+    [keyof NonNullable<typeof dossier.facet_availability>, number][]
+  >;
+  return fields[dimension].flatMap(([field, count]) => {
+    const availability = dossier.facet_availability?.[field];
+    if (availability?.available === false)
+      return [`${field}: ${availability.reason}`];
+    return availability === undefined && count === 0
+      ? [`${field}: Provider did not declare coverage for this empty facet.`]
+      : [];
+  });
+};
 
 const compareText = (
-  ...[
-    dimension,
-    left,
-    right,
-    leftComplete,
-    rightComplete,
-    links,
-    providersDiffer,
-    explicitTruncation,
-    limitation,
-  ]: readonly [
-    "pseudocode" | "assembly",
-    string,
-    string,
-    boolean,
-    boolean,
-    readonly string[],
-    boolean,
-    boolean?,
-    string?,
-  ]
+  dimension: "pseudocode" | "assembly",
+  left: string,
+  right: string,
+  context: ComparisonContext,
 ): FunctionDimension => {
-  const truncated = explicitTruncation ?? (!leftComplete || !rightComplete);
-  if (!leftComplete || !rightComplete || providersDiffer)
-    return unresolvedDimension(
+  const limitations = [
+    "Exact provider text is compared without address or generated-name normalization; layout-only differences do not establish a behavior change.",
+    ...(dimension === "assembly"
+      ? [
+          "Assembly is opaque provider text; relocation normalization is unavailable.",
+        ]
+      : []),
+  ];
+  if (context.providersDiffer)
+    return unresolvedDimension({
       dimension,
-      truncated ? "truncated" : "unknown",
-      links,
-      left.length,
-      right.length,
-      [
-        ...(limitation === undefined ? [] : [limitation]),
-        ...(providersDiffer
-          ? ["Exact text comparison requires one provider identity."]
-          : []),
+      links: context.links,
+      leftCount: [...left].length,
+      rightCount: [...right].length,
+      limitations: [
+        ...limitations,
+        "Exact text comparison requires one provider identity.",
       ],
-    );
+    });
   const changes = diffLines(left, right, {
     timeout: 100,
     maxEditLength: 10_000,
   });
   if (changes === undefined)
-    return unresolvedDimension(
+    return unresolvedDimension({
       dimension,
-      "unknown",
-      links,
-      left.length,
-      right.length,
-      ["Bounded line diff exceeded its time or edit-distance limit."],
-    );
+      links: context.links,
+      leftCount: [...left].length,
+      rightCount: [...right].length,
+      limitations: [
+        ...limitations,
+        "Bounded line diff exceeded its time or edit-distance limit.",
+      ],
+    });
   const delta = changes.reduce(
     (summary, change) => ({
       added_lines:
@@ -145,138 +170,94 @@ const compareText = (
     status: delta.hunks === 0 ? "unchanged" : "changed",
     left,
     right,
-    links,
-    providersDiffer,
+    ...context,
     leftCount: [...left].length,
     rightCount: [...right].length,
     textDelta: delta,
-    limitations: limitation === undefined ? [] : [limitation],
+    limitations,
   });
-};
-
-const compareCollections = (
-  ...[
-    dimension,
-    left,
-    right,
-    leftCoverage,
-    rightCoverage,
-    links,
-    providersDiffer,
-  ]: readonly [
-    DimensionName,
-    readonly unknown[],
-    readonly unknown[],
-    Pick<FunctionCollection, "complete" | "truncated">,
-    Pick<FunctionCollection, "complete" | "truncated">,
-    readonly string[],
-    boolean,
-  ]
-): FunctionDimension => {
-  if (!leftCoverage.complete || !rightCoverage.complete)
-    return unresolvedDimension(
-      dimension,
-      leftCoverage.truncated || rightCoverage.truncated
-        ? "truncated"
-        : "unknown",
-      links,
-      left.length,
-      right.length,
-      [],
-    );
-  return compareValues(
-    dimension,
-    sorted(left),
-    sorted(right),
-    links,
-    true,
-    true,
-    providersDiffer,
-  );
 };
 
 const compareComments = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
+  context: ComparisonContext,
 ): FunctionDimension => {
   const leftValues = commentProjection(left);
   const rightValues = commentProjection(right);
   if (leftValues === null || rightValues === null)
-    return unresolvedDimension(
-      "comments",
-      "unknown",
-      links,
-      left.collections.comments.items.length,
-      right.collections.comments.items.length,
-      ["Comment locations could not be normalized relative to the function."],
-    );
-  return compareCollections(
-    "comments",
-    leftValues,
-    rightValues,
-    left.collections.comments,
-    right.collections.comments,
-    links,
-    providersDiffer,
-  );
+    return unresolvedDimension({
+      dimension: "comments",
+      links: context.links,
+      leftCount: left.dossier.comments.length,
+      rightCount: right.dossier.comments.length,
+      limitations: [
+        "Comment locations could not be normalized relative to the function.",
+      ],
+    });
+  return compareValues("comments", leftValues, rightValues, context);
 };
 
 const compareStringsAndNames = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
+  context: ComparisonContext,
 ): FunctionDimension => {
-  const leftValues = stringAndNameProjection(left);
-  const rightValues = stringAndNameProjection(right);
+  const complete =
+    swiftLiteralCoverage(left) === swiftLiteralCoverage(right) &&
+    swiftLiteralCoverage(left) !== "partial";
+  // Facts both dossiers record decide a change before Swift literal coverage can.
+  const leftValues = stringAndNameProjection(left, complete);
+  const rightValues = stringAndNameProjection(right, complete);
   if (leftValues === null || rightValues === null)
-    return unresolvedDimension("strings_names", "unknown", links, null, null, [
-      "Reference source locations could not be normalized to function offsets.",
-    ]);
-  return compareCollections(
+    return unresolvedDimension({
+      dimension: "strings_names",
+      links: context.links,
+      leftCount: null,
+      rightCount: null,
+      limitations: [
+        "Reference source locations could not be normalized to function offsets.",
+      ],
+    });
+  const compared = compareValues(
     "strings_names",
     leftValues,
     rightValues,
-    combineCoverage(
-      left.collections.referenced_strings,
-      left.collections.referenced_names,
-    ),
-    combineCoverage(
-      right.collections.referenced_strings,
-      right.collections.referenced_names,
-    ),
-    links,
-    providersDiffer,
+    context,
   );
+  if (complete || compared.status === "changed") return compared;
+  // A retained literal differs only when the opposite dossier establishes its absence.
+  if (swiftLiteralSitesConflict(left, right)) {
+    const leftAll = stringAndNameProjection(left);
+    const rightAll = stringAndNameProjection(right);
+    if (leftAll !== null && rightAll !== null)
+      return compareValues("strings_names", leftAll, rightAll, context);
+  }
+  return unresolvedDimension({
+    dimension: "strings_names",
+    links: context.links,
+    leftCount: null,
+    rightCount: null,
+    limitations: [
+      "Swift String literal coverage differs or is partial; referenced strings and names match, and complete coverage does not establish a differing literal.",
+    ],
+  });
 };
+
+const swiftLiteralCoverage = (
+  snapshot: FunctionSnapshot,
+): "absent" | "complete" | "partial" =>
+  (snapshot.dossier.swift_string_literal_omissions ?? []).length > 0
+    ? "partial"
+    : snapshot.dossier.swift_string_literals === undefined
+      ? "absent"
+      : "complete";
 
 const compareReferences = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
+  context: ComparisonContext,
 ): FunctionDimension => {
-  const leftCoverage = combineCoverage(
-    left.collections.incoming_references,
-    left.collections.outgoing_references,
-  );
-  const rightCoverage = combineCoverage(
-    right.collections.incoming_references,
-    right.collections.outgoing_references,
-  );
-  if (!leftCoverage.complete || !rightCoverage.complete)
-    return unresolvedDimension(
-      "references",
-      leftCoverage.truncated || rightCoverage.truncated
-        ? "truncated"
-        : "unknown",
-      links,
-      leftCoverage.items.length,
-      rightCoverage.items.length,
-      [],
-    );
   const leftProjection = referenceProjection(left);
   const rightProjection = referenceProjection(right);
   if (leftProjection.length === 0 && rightProjection.length === 0)
@@ -284,10 +265,7 @@ const compareReferences = (
       "references",
       leftProjection,
       rightProjection,
-      links,
-      true,
-      true,
-      providersDiffer,
+      context,
     );
   if (
     canonicalJson(leftProjection, "Function comparison") !==
@@ -298,8 +276,7 @@ const compareReferences = (
       status: "changed",
       left: leftProjection,
       right: rightProjection,
-      links,
-      providersDiffer,
+      ...context,
       leftCount: leftProjection.length,
       rightCount: rightProjection.length,
       textDelta: null,
@@ -310,82 +287,87 @@ const compareReferences = (
   const leftKinds = referenceKindProjection(left);
   const rightKinds = referenceKindProjection(right);
   if (leftKinds !== null && rightKinds !== null)
-    return compareValues(
-      "references",
-      leftKinds,
-      rightKinds,
-      links,
-      true,
-      true,
-      providersDiffer,
-    );
-  return unresolvedDimension(
-    "references",
-    "unknown",
-    links,
-    leftProjection.length,
-    rightProjection.length,
-    [
+    return compareValues("references", leftKinds, rightKinds, context);
+  return unresolvedDimension({
+    dimension: "references",
+    links: context.links,
+    leftCount: leftProjection.length,
+    rightCount: rightProjection.length,
+    limitations: [
       "At least one provider did not expose reference kinds, so equal endpoints do not prove equal edge semantics.",
     ],
-  );
+  });
 };
 
 const compareIdentity = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
+  context: ComparisonContext,
 ): FunctionDimension => {
-  if (isAutoName(left.procedure.name) || isAutoName(right.procedure.name))
-    return unresolvedDimension("identity", "unknown", links, null, null, [
-      "Address-derived function names are not stable cross-version identity.",
-    ]);
+  if (
+    isAutoName(left.dossier.procedure.name) ||
+    isAutoName(right.dossier.procedure.name)
+  )
+    return unresolvedDimension({
+      dimension: "identity",
+      links: context.links,
+      leftCount: null,
+      rightCount: null,
+      limitations: [
+        "Address-derived function names are not stable cross-version identity.",
+      ],
+    });
   return compareValues(
     "identity",
     identityProjection(left),
     identityProjection(right),
-    links,
-    true,
-    true,
-    providersDiffer,
+    context,
   );
 };
 
 const compareCalls = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
+  context: ComparisonContext,
 ): FunctionDimension => {
   const leftValues = callProjection(left);
   const rightValues = callProjection(right);
+  const coverageLimitations = [
+    ...left.callCoverageLimitations.map((reason) => `Left: ${reason}`),
+    ...right.callCoverageLimitations.map((reason) => `Right: ${reason}`),
+  ];
+  if (coverageLimitations.length > 0)
+    return unresolvedDimension({
+      dimension: "calls",
+      links: context.links,
+      leftCount: leftValues.length,
+      rightCount: rightValues.length,
+      limitations: coverageLimitations,
+    });
   if ([...leftValues, ...rightValues].some(({ name }) => isAutoName(name)))
-    return unresolvedDimension(
-      "calls",
-      "unknown",
-      links,
-      leftValues.length,
-      rightValues.length,
-      ["Address-derived callee or caller names cannot be matched safely."],
-    );
-  return compareCollections(
+    return unresolvedDimension({
+      dimension: "calls",
+      links: context.links,
+      leftCount: leftValues.length,
+      rightCount: rightValues.length,
+      limitations: [
+        "Address-derived callee or caller names cannot be matched safely.",
+      ],
+    });
+  return compareValues(
     "calls",
-    leftValues,
-    rightValues,
-    combineCoverage(left.collections.callers, left.collections.callees),
-    combineCoverage(right.collections.callers, right.collections.callees),
-    links,
-    providersDiffer,
+    sorted(leftValues),
+    sorted(rightValues),
+    context,
   );
 };
 
 const callProjection = (snapshot: FunctionSnapshot) => [
-  ...project(snapshot.collections.callers, ({ name }) => ({
+  ...snapshot.dossier.callers.map(({ name }) => ({
     direction: "in" as const,
     name,
   })),
-  ...project(snapshot.collections.callees, ({ name }) => ({
+  ...snapshot.dossier.callees.map(({ name }) => ({
     direction: "out" as const,
     name,
   })),
@@ -394,63 +376,31 @@ const callProjection = (snapshot: FunctionSnapshot) => [
 const compareCfg = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
-  links: readonly string[],
-  providersDiffer: boolean,
+  context: ComparisonContext,
 ): FunctionDimension => {
-  const leftBlocks = left.collections.basic_blocks;
-  const rightBlocks = right.collections.basic_blocks;
-  if (!leftBlocks.complete || !rightBlocks.complete)
-    return unresolvedDimension(
-      "cfg",
-      leftBlocks.truncated || rightBlocks.truncated ? "truncated" : "unknown",
-      links,
-      leftBlocks.items.length,
-      rightBlocks.items.length,
-      [],
-    );
-  const leftGraph = normalizeCfg(leftBlocks.items);
-  const rightGraph = normalizeCfg(rightBlocks.items);
+  const leftBlocks = left.dossier.basic_blocks;
+  const rightBlocks = right.dossier.basic_blocks;
+  const leftGraph = normalizeCfg(leftBlocks);
+  const rightGraph = normalizeCfg(rightBlocks);
   if (leftGraph === null || rightGraph === null)
-    return unresolvedDimension(
-      "cfg",
-      "unknown",
-      links,
-      leftBlocks.items.length,
-      rightBlocks.items.length,
-      ["CFG addresses could not be normalized to local block indices."],
-    );
-  return compareValues(
-    "cfg",
-    leftGraph,
-    rightGraph,
-    links,
-    true,
-    true,
-    providersDiffer,
-  );
+    return unresolvedDimension({
+      dimension: "cfg",
+      links: context.links,
+      leftCount: leftBlocks.length,
+      rightCount: rightBlocks.length,
+      limitations: [
+        "CFG addresses could not be normalized to local block indices.",
+      ],
+    });
+  return compareValues("cfg", leftGraph, rightGraph, context);
 };
 
 const compareValues = (
-  ...[
-    dimension,
-    left,
-    right,
-    links,
-    leftComplete,
-    rightComplete,
-    providersDiffer,
-  ]: readonly [
-    DimensionName,
-    unknown,
-    unknown,
-    readonly string[],
-    boolean,
-    boolean,
-    boolean,
-  ]
+  dimension: DimensionName,
+  left: unknown,
+  right: unknown,
+  context: ComparisonContext,
 ): FunctionDimension => {
-  if (!leftComplete || !rightComplete)
-    return unresolvedDimension(dimension, "unknown", links, null, null, []);
   const leftJson = canonicalJson(left, "Function comparison");
   const rightJson = canonicalJson(right, "Function comparison");
   return dimensionResult({
@@ -458,8 +408,7 @@ const compareValues = (
     status: leftJson === rightJson ? "unchanged" : "changed",
     left,
     right,
-    links,
-    providersDiffer,
+    ...context,
     leftCount: Array.isArray(left) ? left.length : null,
     rightCount: Array.isArray(right) ? right.length : null,
     textDelta: null,

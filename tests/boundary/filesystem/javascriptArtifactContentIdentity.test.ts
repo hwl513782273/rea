@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { createPackage } from "@electron/asar";
 import { describe, expect, it } from "vitest";
 
-import { scanArtifactInventory } from "../../../src/application/ArtifactInventory.js";
-import { readJavaScriptArtifactFiles } from "../../../src/artifacts/javascript/JavaScriptArtifactFiles.js";
+import { scanArtifactInventory } from "../../fixtures/artifactInventory.js";
+import { readJavaScriptArtifactFiles } from "../../support/javascriptApplicationScope.js";
 import { AsarArtifactReader } from "../../../src/artifacts/AsarArtifactReader.js";
 import { DirectoryArtifactReader } from "../../../src/artifacts/DirectoryArtifactReader.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
@@ -122,7 +122,7 @@ describe("JavaScript artifact ingestion content identities", () => {
     }
   });
 
-  it("retains native filesystem errors for outer IO classification", async () => {
+  it("retains filesystem error context in typed IO failures", async () => {
     const { archive } = await fixture();
     const snapshot = await scanArtifactInventory(archive);
     await rm(archive);
@@ -130,7 +130,7 @@ describe("JavaScript artifact ingestion content identities", () => {
     try {
       await expect(
         readJavaScriptArtifactFiles(reader, snapshot),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+      ).rejects.toMatchObject({ reason: "io", cause: { code: "ENOENT" } });
     } finally {
       await reader.close();
     }

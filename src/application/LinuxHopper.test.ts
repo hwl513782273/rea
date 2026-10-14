@@ -2,29 +2,54 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import {
+  formatCommandForDisplay,
   installLinuxHopper,
   linuxHopperLauncherDigestSupported,
-  linuxHopperInstallDisclosure,
   linuxPackageManagerCommands,
   linuxSharedLibrariesAvailable,
   parseLinuxDistribution,
+  supportsReaHost,
+  LinuxHopperTemporaryCleanupOwner,
   type LinuxDistribution,
   type LinuxHopperDownload,
   type LinuxHopperInstallHost,
   type LinuxHopperLauncherStatus,
   type LinuxPackageFamily,
+  type LinuxPackageInstallFailure,
+  type LinuxPackageInstallOutcome,
 } from "./LinuxHopper.js";
+
+describe("Linux package-manager command display", () => {
+  it("preserves argument boundaries for paths with spaces and quotes", () => {
+    expect(
+      formatCommandForDisplay("pkexec", [
+        "pacman",
+        "-U",
+        "/tmp/rea test/hopper.arch",
+        "apostrophe'path",
+      ]),
+    ).toBe('pkexec pacman -U "/tmp/rea test/hopper.arch" "apostrophe\'path"');
+  });
+});
 
 class RecordingLinuxHost implements LinuxHopperInstallHost {
   distributionValue: LinuxDistribution | undefined = {
     id: "ubuntu",
     versionId: "24.04",
     packageFamily: "deb",
-    supported: true,
+    hopperSetupSupported: true,
   };
   archive = new Uint8Array([1, 2, 3]);
   archiveOk = true;
   installSucceeds = true;
+  cleanupFails = false;
+  packageFailure: LinuxPackageInstallFailure = {
+    command: "pacman -U --noconfirm /tmp/rea test/hopper.arch",
+    exitCode: 1,
+    stdout: "",
+    stderr: "error: failed to prepare transaction",
+    outputTruncated: false,
+  };
   launcherStatusValue: LinuxHopperLauncherStatus = "ready";
   downloads: string[] = [];
   installed: Array<{ family: LinuxPackageFamily; archive: string }> = [];
@@ -42,15 +67,20 @@ class RecordingLinuxHost implements LinuxHopperInstallHost {
   installPackage = (
     family: LinuxPackageFamily,
     archive: string,
-  ): Promise<boolean> => {
+  ): Promise<LinuxPackageInstallOutcome> => {
     this.installed.push({ family, archive });
-    return Promise.resolve(this.installSucceeds);
+    const outcome: LinuxPackageInstallOutcome = this.installSucceeds
+      ? { status: "installed" }
+      : { status: "failed", failure: this.packageFailure };
+    return Promise.resolve(outcome);
   };
   launcherStatus = (): Promise<LinuxHopperLauncherStatus> =>
     Promise.resolve(this.launcherStatusValue);
   cleanup = (path: string): Promise<void> => {
     this.cleaned.push(path);
-    return Promise.resolve();
+    return this.cleanupFails
+      ? Promise.reject(new Error("temporary path is busy"))
+      : Promise.resolve();
   };
 }
 
@@ -58,14 +88,19 @@ describe("Linux Hopper host classification", () => {
   it.each([
     ['ID=ubuntu\nVERSION_ID="24.04"\n', "deb"],
     ["ID=fedora\nVERSION_ID=41\n", "rpm"],
+    ['ID=nobara\nVERSION_ID="44"\nID_LIKE="rhel centos fedora"\n', "rpm"],
     ["ID=arch\n", "arch"],
     ["ID=cachyos\nID_LIKE=arch\n", "arch"],
-  ] as const)("accepts an official Hopper distribution", (document, family) => {
-    expect(parseLinuxDistribution(document)).toMatchObject({
-      packageFamily: family,
-      supported: true,
-    });
-  });
+    ['ID=omarchy\nID_LIKE=arch\nVERSION_ID="4.0.4"\n', "arch"],
+  ] as const)(
+    "accepts an explicitly supported distribution",
+    (document, family) => {
+      expect(parseLinuxDistribution(document)).toMatchObject({
+        packageFamily: family,
+        hopperSetupSupported: true,
+      });
+    },
+  );
 
   it("detects unresolved or loader-reported shared libraries", () => {
     expect(
@@ -88,11 +123,39 @@ describe("Linux Hopper host classification", () => {
   it.each([
     'ID=ubuntu\nVERSION_ID="22.04"\n',
     "ID=fedora\nVERSION_ID=40\n",
+    'ID=nobara\nVERSION_ID="43"\nID_LIKE="rhel centos fedora"\n',
+    'ID=derivative\nVERSION_ID="44"\nID_LIKE="rhel centos fedora"\n',
     'ID=debian\nVERSION_ID="13"\nID_LIKE=debian\n',
     "ID=manjaro\nID_LIKE=arch\n",
     "ID=garuda\nID_LIKE=arch\n",
-  ])("rejects unsupported vendor/version combinations", (document) => {
-    expect(parseLinuxDistribution(document).supported).toBe(false);
+    "ID=omarchy\n",
+    "ID=omarchy\nID_LIKE=debian\n",
+  ])(
+    "rejects vendor/version combinations without a tested Hopper installer",
+    (document) => {
+      expect(parseLinuxDistribution(document).hopperSetupSupported).toBe(false);
+    },
+  );
+
+  it.each([
+    'ID=kali\nVERSION_ID="2026.3"\nID_LIKE=debian\n',
+    'ID=debian\nVERSION_ID="13"\nID_LIKE=debian\n',
+    'ID=linuxmint\nVERSION_ID="22.1"\nID_LIKE="ubuntu debian"\n',
+    "ID=manjaro\nID_LIKE=arch\n",
+    "ID=derivative\nID_LIKE='debian'\n",
+    "ID='debian'\nVERSION_ID='13'\n",
+  ])(
+    "hosts REA on a distribution Hopper has no tested package for: %s",
+    (document) => {
+      const distribution = parseLinuxDistribution(document);
+      expect(distribution.hopperSetupSupported).toBe(false);
+      expect(supportsReaHost(distribution)).toBe(true);
+    },
+  );
+
+  it("withholds host support from a distribution with no package family", () => {
+    expect(supportsReaHost(parseLinuxDistribution("ID=nixos\n"))).toBe(false);
+    expect(supportsReaHost(undefined)).toBe(false);
   });
 });
 
@@ -111,44 +174,11 @@ describe("Linux Hopper installation", () => {
     expect(linuxHopperLauncherDigestSupported("0".repeat(64))).toBe(false);
   });
 
-  it("discloses the exact download, integrity evidence, and privileged command", () => {
-    expect(linuxHopperInstallDisclosure("deb", false)).toEqual({
-      downloadUrl:
-        "https://www.hopperapp.com:443/downloader/public/Hopper-6.4.2-Linux-demo.deb",
-      expectedBytes: 35_755_772,
-      expectedSha1: "e4f79dff602648a8ff4a88b773875b6bfac0dc65",
-      commands: [
-        "pkexec apt-get install -y <verified-hopper.deb> xvfb xauth python3 libx11-6 libxtst6",
-      ],
-    });
-  });
-
   it.each([
-    ["deb", "apt-get"],
-    ["rpm", "dnf"],
-    ["arch", "pacman"],
-  ] as const)("selects the %s native package manager", (family, executable) => {
-    expect(
-      linuxPackageManagerCommands(family, "/tmp/Hopper package", true),
-    ).toContainEqual(
-      expect.objectContaining({
-        executable,
-      }),
-    );
-    expect(
-      linuxPackageManagerCommands(family, "/tmp/Hopper package", false),
-    ).toContainEqual(
-      expect.objectContaining({
-        executable: "pkexec",
-        args: expect.arrayContaining([executable, "/tmp/Hopper package"]),
-      }),
-    );
-  });
-
-  it.each([
-    ["deb", ["xvfb", "xauth", "python3", "libx11-6", "libxtst6"]],
+    ["deb", "apt-get", ["xvfb", "xauth", "python3", "libx11-6", "libxtst6"]],
     [
       "rpm",
+      "dnf",
       [
         "xorg-x11-server-Xvfb",
         "xorg-x11-xauth",
@@ -157,20 +187,35 @@ describe("Linux Hopper installation", () => {
         "libXtst",
       ],
     ],
-    ["arch", ["xorg-server-xvfb", "xorg-xauth", "python", "libx11", "libxtst"]],
+    [
+      "arch",
+      "pacman",
+      ["xorg-server-xvfb", "xorg-xauth", "python", "libx11", "libxtst"],
+    ],
   ] as const)(
-    "installs the %s demo-session dependencies",
-    (family, packages) => {
+    "selects the %s native package manager and dependencies",
+    (family, executable, packages) => {
       expect(
         linuxPackageManagerCommands(family, "/tmp/Hopper package", true),
       ).toContainEqual(
         expect.objectContaining({
+          executable,
           args: expect.arrayContaining([...packages]),
+        }),
+      );
+      expect(
+        linuxPackageManagerCommands(family, "/tmp/Hopper package", false),
+      ).toContainEqual(
+        expect.objectContaining({
+          executable: "pkexec",
+          args: expect.arrayContaining([executable, "/tmp/Hopper package"]),
         }),
       );
     },
   );
+});
 
+describe("Linux Hopper package installation", () => {
   it.each(["deb", "rpm", "arch"] as const)(
     "downloads, verifies, installs, reads back, and cleans a %s package",
     async (family) => {
@@ -178,7 +223,7 @@ describe("Linux Hopper installation", () => {
       host.distributionValue = {
         id: family,
         packageFamily: family,
-        supported: true,
+        hopperSetupSupported: true,
       };
       const result = await installFixture(host);
       expect(result).toEqual({
@@ -191,7 +236,9 @@ describe("Linux Hopper installation", () => {
       expect(host.cleaned).toEqual(["/tmp/rea test"]);
     },
   );
+});
 
+describe("Linux Hopper installation failure classification", () => {
   it.each([
     ["unsupported host", "unsupported_host"],
     ["package request failure", "download"],
@@ -206,7 +253,7 @@ describe("Linux Hopper installation", () => {
       host.distributionValue = {
         id: "debian",
         packageFamily: "deb",
-        supported: false,
+        hopperSetupSupported: false,
       };
     if (scenario === "package request failure") host.archiveOk = false;
     if (scenario === "checksum mismatch") host.archive = new Uint8Array([9]);
@@ -219,11 +266,65 @@ describe("Linux Hopper installation", () => {
     expect(await installFixture(host)).toEqual({
       status: "failed",
       reason,
+      ...(scenario === "package manager failure"
+        ? { packageFailure: host.packageFailure }
+        : {}),
     });
     if (host.installed.length > 0)
       expect(host.cleaned).toEqual(["/tmp/rea test"]);
   });
+});
 
+describe("Linux Hopper cleanup and failure details", () => {
+  it("preserves the failing package-manager command and its output", async () => {
+    const host = new RecordingLinuxHost();
+    host.installSucceeds = false;
+    host.packageFailure = {
+      command: "pkexec pacman -U --noconfirm /tmp/rea test/hopper.arch",
+      exitCode: 1,
+      stdout: "loading packages...",
+      stderr:
+        "\u001b[31merror: unresolvable package conflicts detected\u001b[0m",
+      outputTruncated: false,
+    };
+    expect(await installFixture(host)).toEqual({
+      status: "failed",
+      reason: "authorization_or_package_manager",
+      packageFailure: host.packageFailure,
+    });
+    expect(host.cleaned).toEqual(["/tmp/rea test"]);
+  });
+
+  it("preserves a successful install result when temporary cleanup fails", async () => {
+    const host = new RecordingLinuxHost();
+    host.cleanupFails = true;
+    expect(await installFixture(host)).toEqual({
+      status: "installed",
+      launcherPath: "/opt/hopper/bin/Hopper",
+      cleanupFailure: {
+        path: "/tmp/rea test",
+        reason: "temporary path is busy",
+      },
+    });
+  });
+
+  it("preserves an install failure when temporary cleanup also fails", async () => {
+    const host = new RecordingLinuxHost();
+    host.installSucceeds = false;
+    host.cleanupFails = true;
+    expect(await installFixture(host)).toMatchObject({
+      status: "failed",
+      reason: "authorization_or_package_manager",
+      packageFailure: host.packageFailure,
+      cleanupFailure: {
+        path: "/tmp/rea test",
+        reason: "temporary path is busy",
+      },
+    });
+  });
+});
+
+describe("Linux Hopper cancellation", () => {
   it("cancels before network or mutation", async () => {
     const host = new RecordingLinuxHost();
     const controller = new AbortController();
@@ -236,6 +337,27 @@ describe("Linux Hopper installation", () => {
     });
     expect(host.downloads).toEqual([]);
     expect(host.installed).toEqual([]);
+  });
+});
+
+describe("Linux Hopper temporary cleanup ownership", () => {
+  it("retains a failed cleanup for a later successful retry", async () => {
+    const owner = new LinuxHopperTemporaryCleanupOwner();
+    owner.retain({ path: "/tmp/rea-hopper", reason: "busy" });
+    let attempts = 0;
+
+    expect(
+      await owner.retry(async () => {
+        attempts += 1;
+        throw new Error("still busy");
+      }),
+    ).toContain("/tmp/rea-hopper");
+    expect(
+      await owner.retry(async () => {
+        attempts += 1;
+      }),
+    ).toBeUndefined();
+    expect(attempts).toBe(2);
   });
 });
 

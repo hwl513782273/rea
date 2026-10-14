@@ -1,7 +1,12 @@
+import {
+  requireMcpLifecycleResult,
+  requireMcpToolError,
+} from "./lib/mcp-verifier-results.mjs";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { readFile, rm } from "node:fs/promises";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -15,18 +20,18 @@ const execute = promisify(execFile);
 const verifyMcpToolsAndPrompts = async (client, mcpOptions) => {
   await verifyCompleteToolCatalog(client, mcpOptions);
   await prompts.verifyPromptCatalog(client, mcpOptions, prompts.names);
-  await prompts.verifyPromptCompletion(client, mcpOptions, false);
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
 };
 
 const verifyMcpTargetFree = async (client, mcpOptions) => {
-  const status = await client.callTool(
+  const result = await client.callTool(
     { name: "binary_session", arguments: {} },
     mcpOptions,
   );
-  const currentDocument =
-    status.structuredContent?.result?.tool_availability?.find(
-      ({ name }) => name === "current_document",
-    );
+  const status = requireMcpLifecycleResult(result, "binary_session");
+  const currentDocument = status.tool_availability.find(
+    ({ name }) => name === "current_document",
+  );
   if (
     currentDocument?.available !== false ||
     currentDocument.reason !== "target_required"
@@ -49,7 +54,7 @@ const verifyMcpUnknownProvider = async (client, mcpOptions) => {
   );
   if (
     unknownProvider.isError !== true ||
-    unknownProvider.structuredContent?.error?.details?.selection_reason !==
+    requireMcpToolError(unknownProvider)?.details?.selection_reason !==
       "unknown_provider"
   )
     throw new Error("packaged MCP accepted an unknown analysis provider");
@@ -65,15 +70,13 @@ const verifyMcpOpenAndBind = async (client, mcpOptions) => {
   );
   if (opened.isError === true)
     throw new Error("packaged MCP could not open a binary");
-  const providerStatusEnvelope = json(
-    prompts.mcpText(
-      await client.callTool(
-        { name: "binary_session", arguments: {} },
-        mcpOptions,
-      ),
+  const providerStatus = requireMcpLifecycleResult(
+    await client.callTool(
+      { name: "binary_session", arguments: {} },
+      mcpOptions,
     ),
+    "binary_session",
   );
-  const providerStatus = providerStatusEnvelope.result;
   if (
     providerStatus.analysis_provider_binding?.provider?.id !== "hopper" ||
     providerStatus.analysis_provider_binding?.selection_source !== "request"
@@ -95,7 +98,7 @@ const verifyMcpNonLinuxCurrentDocument = async (
   mcpOptions,
   current,
 ) => {
-  if (json(prompts.mcpText(current)).result !== "fixture")
+  if (json(prompts.mcpText(current)).normalized_result !== "fixture")
     throw new Error("packaged MCP bridge call failed");
   const batch = await client.callTool(
     {
@@ -104,7 +107,7 @@ const verifyMcpNonLinuxCurrentDocument = async (
     },
     mcpOptions,
   );
-  const batchResult = json(prompts.mcpText(batch)).result;
+  const batchResult = json(prompts.mcpText(batch)).normalized_result;
   if (
     batch.isError === true ||
     batchResult?.total !== 1 ||
@@ -118,11 +121,8 @@ const verifyMcpNonLinuxCurrentDocument = async (
 
 const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
   await verifyMcpOpenAndBind(client, mcpOptions);
-  await prompts.verifyPromptCompletion(
-    client,
-    mcpOptions,
-    process.platform !== "linux",
-  );
+  // Completion never starts a provider; only an ordinary operation readies it.
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
   if (process.platform === "linux") {
     await verifyMcpLinuxToolAvailability(client, mcpOptions);
   } else {
@@ -131,6 +131,7 @@ const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
       mcpOptions,
     );
     await verifyMcpNonLinuxCurrentDocument(client, mcpOptions, current);
+    await prompts.verifyPromptCompletion(client, mcpOptions, ["fixture"]);
   }
   const closed = await client.callTool(
     { name: "close_binary", arguments: {} },
@@ -138,7 +139,7 @@ const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
   );
   if (closed.isError === true)
     throw new Error("packaged MCP could not close its binary");
-  await prompts.verifyPromptCompletion(client, mcpOptions, false);
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
 };
 
 const verifyMcpEvidenceBundle = async (client, mcpOptions, evidenceRoot) => {
@@ -167,16 +168,17 @@ const verifyMcpInlineArtifactEvidence = async (
     mcpOptions,
   );
   assert.notEqual(opened.isError, true, JSON.stringify(opened));
+  let outputRoot;
   try {
     const inspected = await client.callTool(
       { name: "inspect_artifact", arguments: {} },
       mcpOptions,
     );
     assert.notEqual(inspected.isError, true, JSON.stringify(inspected));
-    const source = parseEvidence(inspected.structuredContent?.evidence);
+    const source = parseEvidence(inspected.structuredContent);
     assert.deepEqual(
       source.normalized_result,
-      inspected.structuredContent?.result,
+      inspected.structuredContent?.normalized_result,
     );
     assert.deepEqual(
       json(prompts.mcpText(inspected)),
@@ -186,17 +188,17 @@ const verifyMcpInlineArtifactEvidence = async (
       {
         name: "compare_artifacts",
         arguments: {
-          left: inspected.structuredContent.evidence,
-          right: inspected.structuredContent.evidence,
+          left: inspected.structuredContent,
+          right: inspected.structuredContent,
         },
       },
       mcpOptions,
     );
     assert.notEqual(compared.isError, true, JSON.stringify(compared));
-    const comparison = parseEvidence(compared.structuredContent?.evidence);
+    const comparison = parseEvidence(compared.structuredContent);
     assert.deepEqual(
       comparison.normalized_result,
-      compared.structuredContent?.result,
+      compared.structuredContent?.normalized_result,
     );
     assert.ok(comparison.evidence_links.includes(source.evidence_id));
     const bundle = await client.callTool(
@@ -212,12 +214,35 @@ const verifyMcpInlineArtifactEvidence = async (
         evidence,
       );
     }
-  } finally {
-    const closed = await client.callTool(
-      { name: "close_binary", arguments: {} },
+    const extracted = await client.callTool(
+      { name: "extract_artifact", arguments: {} },
       mcpOptions,
     );
-    assert.notEqual(closed.isError, true, JSON.stringify(closed));
+    assert.notEqual(extracted.isError, true, JSON.stringify(extracted));
+    const extraction = parseEvidence(extracted.structuredContent);
+    assert.deepEqual(
+      extraction.normalized_result,
+      extracted.structuredContent?.normalized_result,
+    );
+    const materialized = extracted.structuredContent?.normalized_result;
+    assert.equal(typeof materialized?.output_root, "string");
+    outputRoot = materialized.output_root;
+    assert.equal(materialized.containment_verified, true);
+    assert.equal(
+      await readFile(join(outputRoot, "app/main.js"), "utf8"),
+      "main();",
+    );
+  } finally {
+    try {
+      const closed = await client.callTool(
+        { name: "close_binary", arguments: {} },
+        mcpOptions,
+      );
+      assert.notEqual(closed.isError, true, JSON.stringify(closed));
+    } finally {
+      if (outputRoot !== undefined)
+        await rm(outputRoot, { recursive: true, force: true });
+    }
   }
 };
 

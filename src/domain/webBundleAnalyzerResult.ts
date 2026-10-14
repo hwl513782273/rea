@@ -1,4 +1,4 @@
-import type { WebPageInspection } from "./browserObservation.js";
+import type { WebPageInspection } from "./browserObservationSchemas.js";
 import {
   webBundleAnalysisSchema,
   type WebBundleAnalysis,
@@ -17,12 +17,20 @@ export const buildWebBundleAnalysis = (
   const unavailable = inspection.scripts.items
     .filter((script) => !script.source.included)
     .map(({ script_key }) => script_key);
+  const omittedScripts = captureBudgetOmission(inspection, "scripts");
+  const omittedSourceMaps =
+    sourceMaps.status === "not_requested"
+      ? undefined
+      : captureBudgetOmission(inspection, "source_maps");
   const sourceMapIncomplete =
     sourceMaps.status === "partial" || sourceMaps.status === "unavailable";
   const partial =
-    accumulator.parseFailures > 0 ||
+    accumulator.failedScripts.length > 0 ||
+    accumulator.recoveredScripts.length > 0 ||
     unavailable.length > 0 ||
-    sourceMapIncomplete;
+    sourceMapIncomplete ||
+    omittedScripts !== undefined ||
+    omittedSourceMaps !== undefined;
   return webBundleAnalysisSchema.parse({
     capture: buildCaptureObservation(inspection, sourceScripts),
     observations: {
@@ -37,15 +45,17 @@ export const buildWebBundleAnalysis = (
     },
     inferences: accumulator.inferences,
     unknowns: buildUnknowns({
-      sourceScripts,
       unavailable,
-      parseFailures: accumulator.parseFailures,
+      failedScripts: accumulator.failedScripts,
+      recoveredScripts: accumulator.recoveredScripts,
       sourceMaps,
+      omittedScripts,
+      omittedSourceMaps,
     }),
     completeness: buildCompleteness({
       partial,
       parsedScripts: accumulator.parsedScripts,
-      parseFailures: accumulator.parseFailures,
+      parseFailures: accumulator.failedScripts.length,
       visitedNodes: accumulator.visitedNodes,
     }),
     limitations: bundleLimitations(),
@@ -79,13 +89,24 @@ const chunkNode = (script: IncludedScript) => {
 };
 
 interface UnknownsInput {
-  readonly sourceScripts: IncludedScript[];
   readonly unavailable: string[];
-  readonly parseFailures: number;
+  readonly failedScripts: readonly string[];
+  readonly recoveredScripts: readonly string[];
   readonly sourceMaps: WebBundleAnalysis["observations"]["source_maps"];
+  readonly omittedScripts: number | null | undefined;
+  readonly omittedSourceMaps: number | null | undefined;
 }
 
 const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
+  ...(input.omittedScripts === undefined
+    ? []
+    : [
+        {
+          dimension: "script_inventory",
+          reason: captureBudgetReason("script records", input.omittedScripts),
+          affected_script_keys: [],
+        },
+      ]),
   ...(input.unavailable.length === 0
     ? []
     : [
@@ -95,15 +116,35 @@ const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
           affected_script_keys: input.unavailable,
         },
       ]),
-  ...(input.parseFailures === 0
+  ...(input.failedScripts.length === 0
     ? []
     : [
         {
           dimension: "javascript_ast" as const,
           reason: "One or more source artifacts could not be parsed",
-          affected_script_keys: input.sourceScripts.map(
-            ({ script_key }) => script_key,
+          affected_script_keys: [...input.failedScripts],
+        },
+      ]),
+  ...(input.recoveredScripts.length === 0
+    ? []
+    : [
+        {
+          dimension: "javascript_ast" as const,
+          reason:
+            "The parser recovered from errors in one or more source artifacts; findings may be incomplete",
+          affected_script_keys: [...input.recoveredScripts],
+        },
+      ]),
+  ...(input.omittedSourceMaps === undefined
+    ? []
+    : [
+        {
+          dimension: "source_maps" as const,
+          reason: captureBudgetReason(
+            "source-map declarations",
+            input.omittedSourceMaps,
           ),
+          affected_script_keys: [],
         },
       ]),
   ...(input.sourceMaps.status === "not_requested" ||
@@ -113,6 +154,7 @@ const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
         {
           dimension: "source_maps" as const,
           reason:
+            input.sourceMaps.limitation ??
             "One or more requested source maps were unavailable or incomplete",
           affected_script_keys: input.sourceMaps.items
             .filter(({ status }) => status !== "included")
@@ -121,6 +163,25 @@ const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
         },
       ]),
 ];
+
+const captureBudgetOmission = (
+  inspection: WebPageInspection,
+  section: "scripts" | "source_maps",
+): number | null | undefined => {
+  const exclusions = inspection.completeness.excluded.filter(
+    (exclusion) =>
+      exclusion.section === section &&
+      exclusion.reason === "resource_budget_exhausted",
+  );
+  if (exclusions.length === 0) return undefined;
+  if (exclusions.some(({ count }) => count === null)) return null;
+  return exclusions.reduce((sum, { count }) => sum + (count ?? 0), 0);
+};
+
+const captureBudgetReason = (label: string, count: number | null): string =>
+  count === null
+    ? `Capture omitted an unknown number of ${label} because its resource budget was exhausted.`
+    : `Capture omitted ${String(count)} ${label} because its resource budget was exhausted.`;
 
 interface CompletenessInput {
   readonly partial: boolean;
@@ -140,6 +201,8 @@ const buildCompleteness = (
 
 const bundleLimitations = (): WebBundleAnalysis["limitations"] => [
   "Static bundle findings are observations or bounded inferences; REA does not execute captured JavaScript.",
+  "Bare string arguments of unbound HTTP-method-named calls are low-confidence endpoint candidates; form, translation, storage and other APIs can use the same syntax. URL-shaped findings still do not prove network execution.",
+  'Endpoint candidates are deduplicated by script, value and detector; basis retains only the first matching source coordinate. They are not a complete call-site inventory or a runtime occurrence count. completeness.status="complete" describes examination of captured source, not a call-site census.',
   "String-built routes and endpoints, encrypted configuration, and server-side behavior may remain unknown.",
   "Page-declared WebMCP metadata is untrusted and is never registered or invoked as an REA tool.",
 ];

@@ -2,9 +2,11 @@ import { fc, it } from "@fast-check/vitest";
 import { describe, expect } from "vitest";
 
 import { createAnalysisProfile } from "./analysisProfile.js";
-import type { BinaryTarget } from "./binaryTarget.js";
+import type { BinaryTarget } from "./binaryTargetTypes.js";
 import { createEvidence, evidenceSchema, parseEvidence } from "./evidence.js";
+import { MAX_JSON_DEPTH, type JsonValue } from "./jsonValue.js";
 import { createEvidenceBundle } from "./evidenceBundle.js";
+import { freezeJsonSnapshot } from "./immutableJson.js";
 
 const TARGET: BinaryTarget = {
   path: "/tmp/fixture",
@@ -17,14 +19,230 @@ const TARGET: BinaryTarget = {
 const PROVIDER = { id: "fixture", name: "Fixture provider", version: "1" };
 const PROFILE = createAnalysisProfile(PROVIDER, { loader: "default" });
 
+it("rejects a detected Evidence subject with the raw-only 6502 architecture", () => {
+  const selected = {
+    path: TARGET.path,
+    sha256: TARGET.sha256,
+    format: "raw-binary" as const,
+    architecture: "6502" as const,
+  };
+  expect(
+    createEvidence(selected, PROVIDER, {
+      operation: "inspect",
+      parameters: {},
+      result: null,
+    }).subject,
+  ).toMatchObject({ format: "raw-binary", architecture: "6502" });
+  const malformed = {
+    ...selected,
+    format: "pe" as const,
+  };
+  expect(() =>
+    createEvidence(malformed, PROVIDER, {
+      operation: "inspect",
+      parameters: {},
+      result: null,
+    }),
+  ).toThrow();
+});
+
+it("preserves omitted relationship diagnostics and authenticates reported diagnostics", () => {
+  const observation = {
+    operation: "procedure_callees",
+    parameters: { procedure: "0x1000" },
+    result: ["0x2000"],
+  };
+  const historical = createEvidence(TARGET, PROVIDER, {
+    ...observation,
+    relationshipCoverage: { status: "complete" },
+  });
+  expect(historical.relationship_coverage).toEqual({ status: "complete" });
+  expect(parseEvidence(JSON.parse(JSON.stringify(historical)))).toEqual(
+    historical,
+  );
+  const diagnosed = createEvidence(TARGET, PROVIDER, {
+    ...observation,
+    relationshipCoverage: {
+      status: "complete",
+      diagnostics: ["Only resolved direct call references are observed."],
+    },
+  });
+  expect(parseEvidence(JSON.parse(JSON.stringify(diagnosed)))).toEqual(
+    diagnosed,
+  );
+  expect(diagnosed.evidence_id).not.toBe(historical.evidence_id);
+  expect(() =>
+    parseEvidence({
+      ...historical,
+      relationship_coverage: diagnosed.relationship_coverage,
+    }),
+  ).toThrow("semantic identifier");
+});
+
+it("projects known provider fields and preserves open JSON payloads", () => {
+  const liveProvider = { ...PROVIDER, transient_status: "starting" };
+  const evidence = createEvidence(TARGET, liveProvider, {
+    operation: "inspect",
+    parameters: { caller_metadata: { note: "kept" } },
+    result: { producer_extension: { value: "kept" } },
+    analysisProfile: PROFILE,
+    environment: {
+      id: "fixture",
+      platform: "linux",
+      architecture: "x86_64",
+      isolation: "process",
+    },
+    locations: [{ kind: "address", address: "0x1000" }],
+  });
+
+  expect(evidence.provider).toEqual(PROVIDER);
+  expect(evidence.parameters).toEqual({ caller_metadata: { note: "kept" } });
+  expect(evidence.normalized_result).toEqual({
+    producer_extension: { value: "kept" },
+  });
+  expect(parseEvidence(evidence)).toEqual(evidence);
+});
+
+it("preserves identity and bytes when reusing an owned immutable result", () => {
+  const value = { nested: { values: ["observed", 1] } };
+  const mutable = createEvidence(TARGET, PROVIDER, {
+    operation: "inspect",
+    parameters: {},
+    result: value,
+  });
+  const frozen = createEvidence(TARGET, PROVIDER, {
+    operation: "inspect",
+    parameters: {},
+    result: freezeJsonSnapshot(value),
+  });
+  expect(JSON.stringify(frozen)).toBe(JSON.stringify(mutable));
+  expect(frozen.normalized_result).toBe(value);
+  expect(Object.isFrozen(frozen)).toBe(true);
+  expect(parseEvidence(frozen)).toEqual(mutable);
+  const wire: unknown = JSON.parse(JSON.stringify(frozen));
+  expect(parseEvidence(wire)).toEqual(mutable);
+  expect(() =>
+    parseEvidence({ ...frozen, normalized_result: { changed: true } }),
+  ).toThrow("semantic identifier");
+});
+
+it("applies the JSON depth boundary to owned immutable results", () => {
+  let result: JsonValue = 1;
+  for (let index = 0; index <= MAX_JSON_DEPTH; index += 1)
+    result = { nested: result };
+  const observe = () =>
+    createEvidence(TARGET, PROVIDER, {
+      operation: "inspect",
+      parameters: {},
+      result,
+    });
+  expect(observe).toThrow("maximum nesting depth");
+  freezeJsonSnapshot(result);
+  expect(observe).toThrow("maximum nesting depth");
+});
+
+it("preserves prototype-named own members when reusing an owned result", () => {
+  const result = { ["__proto__"]: { preserved: 7 }, constructor: "ordinary" };
+  const observation = { operation: "inspect", parameters: {}, result };
+  const ordinary = createEvidence(TARGET, PROVIDER, observation);
+  const owned = createEvidence(TARGET, PROVIDER, {
+    ...observation,
+    result: freezeJsonSnapshot(result),
+  });
+  expect(owned.normalized_result).toBe(result);
+  expect(owned).toEqual(ordinary);
+  expect(parseEvidence(JSON.parse(JSON.stringify(owned)))).toEqual(owned);
+  expect(Object.getPrototypeOf(owned.normalized_result)).toBe(Object.prototype);
+  expect(Reflect.get(Object.prototype, "preserved")).toBeUndefined();
+});
+
+it("preserves producer envelope admission and profile validation", () => {
+  const unprofiled = createEvidence(TARGET, PROVIDER, {
+    operation: "inspect",
+    parameters: {},
+    result: { observed: [1, 2, 3] },
+  });
+  const profiled = createEvidence(TARGET, PROVIDER, {
+    operation: "inspect",
+    parameters: {},
+    result: { observed: [1, 2, 3] },
+    analysisProfile: PROFILE,
+  });
+  const { analysis_profile: _missingProfile, ...missingProfile } = unprofiled;
+  expect(evidenceSchema.safeParse(missingProfile).success).toBe(false);
+  expect(
+    evidenceSchema.safeParse({
+      ...unprofiled,
+      analysis_profile: undefined,
+    }).success,
+  ).toBe(false);
+  const candidates: unknown[] = [
+    missingProfile,
+    unprofiled,
+    profiled,
+    { ...unprofiled, analysis_profile: undefined },
+    { ...unprofiled, analysis_profile: null },
+    {
+      ...profiled,
+      analysis_profile: { ...PROFILE, provider: { ...PROVIDER, id: "other" } },
+    },
+    { ...unprofiled, unexpected: true },
+  ];
+  for (const candidate of candidates) {
+    const canonical = evidenceSchema.safeParse(candidate);
+    if (canonical.success)
+      expect(parseEvidence(candidate)).toEqual(canonical.data);
+    else expect(() => parseEvidence(candidate)).toThrow();
+  }
+});
+
+it("snapshots caller-owned payloads before deriving their identity", () => {
+  const result = { nested: { values: ["observed"] } };
+  const rawResult = { entries: [{ value: "raw" }] };
+  const parameters = { selected: ["target"] };
+  const evidence = createEvidence(TARGET, PROVIDER, {
+    operation: "inspect",
+    parameters,
+    result,
+    rawResult,
+  });
+  result.nested.values.push("later");
+  const rawEntry = rawResult.entries[0];
+  if (rawEntry !== undefined) rawEntry.value = "changed";
+  parameters.selected.push("other");
+  expect(evidence.normalized_result).toEqual({
+    nested: { values: ["observed"] },
+  });
+  expect(evidence.raw_result).toEqual({ entries: [{ value: "raw" }] });
+  expect(evidence.parameters).toEqual({ selected: ["target"] });
+  expect(parseEvidence(evidence)).toEqual(evidence);
+  expect(() =>
+    parseEvidence({ ...evidence, normalized_result: result }),
+  ).toThrow(/semantic identifier/u);
+});
+
 describe("analysis evidence identity", () => {
-  it("normalizes prototype-named parameter keys", () => {
+  it("preserves prototype-named parameter keys and their semantic identity", () => {
     const evidence = createEvidence(TARGET, PROVIDER, {
       operation: "health",
       parameters: Object.fromEntries([["__proto__", false]]),
       result: true,
     });
+    expect(evidence.parameters).toEqual({ ["__proto__"]: false });
+    expect(Object.hasOwn(evidence.parameters, "__proto__")).toBe(true);
     expect(parseEvidence(evidence)).toEqual(evidence);
+    const stripped = createEvidence(TARGET, PROVIDER, {
+      operation: "health",
+      parameters: {},
+      result: true,
+    });
+    expect(stripped.evidence_id).not.toBe(evidence.evidence_id);
+    expect(() =>
+      parseEvidence({
+        ...evidence,
+        parameters: { ["__proto__"]: true },
+      }),
+    ).toThrow(/semantic identifier/u);
   });
 
   it.prop([
@@ -92,13 +310,14 @@ describe("analysis evidence identity", () => {
     expect(createEvidence(TARGET, PROVIDER, observation)).toEqual(evidence);
   });
 
-  it("preserves legacy records while binding profiled Evidence to its profile", () => {
-    const legacy = createEvidence(TARGET, PROVIDER, {
+  it("records absent profiles as null and binds reported profiles into identity", () => {
+    const unprofiled = createEvidence(TARGET, PROVIDER, {
       operation: "procedure_info",
       parameters: { procedure: "main" },
       result: { name: "main" },
     });
-    expect(parseEvidence(legacy)).toEqual(legacy);
+    expect(unprofiled.analysis_profile).toBeNull();
+    expect(parseEvidence(unprofiled)).toEqual(unprofiled);
 
     const profiled = createEvidence(TARGET, PROVIDER, {
       operation: "procedure_info",
@@ -107,7 +326,7 @@ describe("analysis evidence identity", () => {
       analysisProfile: PROFILE,
     });
     expect(profiled).toMatchObject({ analysis_profile: PROFILE });
-    expect(profiled.evidence_id).not.toBe(legacy.evidence_id);
+    expect(profiled.evidence_id).not.toBe(unprofiled.evidence_id);
     expect(() =>
       createEvidence(
         TARGET,
@@ -154,6 +373,39 @@ describe("analysis evidence identity", () => {
       parseEvidence({ ...evidence, normalized_result: false }),
     ).toThrow("semantic identifier");
   });
+});
+
+it("rejects a subject local path containing NUL while admitting an empty path", () => {
+  const evidence = createEvidence(TARGET, PROVIDER, {
+    operation: "health",
+    parameters: {},
+    result: true,
+  });
+  expect(evidence.subject).not.toBeNull();
+  const withPath = (path: string) => ({
+    ...evidence,
+    subject: { ...evidence.subject, local_path: path },
+  });
+  expect(evidenceSchema.safeParse(withPath("/tmp/fixture")).success).toBe(true);
+  expect(evidenceSchema.safeParse(withPath("")).success).toBe(true);
+  expect(evidenceSchema.safeParse(withPath("a\u0000b")).success).toBe(false);
+});
+
+it("binds an explicit unknown-subject reason into the semantic Evidence identity", () => {
+  const reason = "Caller excluded the observed digest.";
+  const observation = { operation: "health", parameters: {}, result: true };
+  const explicit = createEvidence(undefined, PROVIDER, {
+    ...observation,
+    subjectUnavailableReason: reason,
+  });
+  const defaulted = createEvidence(undefined, PROVIDER, observation);
+  expect(explicit.subject).toBeNull();
+  expect(explicit.limitations).toEqual([reason]);
+  expect(defaulted.limitations).toEqual([
+    "Artifact identity is unavailable for this observation.",
+  ]);
+  expect(explicit.evidence_id).not.toBe(defaulted.evidence_id);
+  expect(parseEvidence(explicit)).toEqual(explicit);
 });
 
 it("derives byte-stable bundle manifests independent of record order", () => {
@@ -212,4 +464,122 @@ describe("DOS analysis evidence identity", () => {
         .evidence_id,
     );
   });
+});
+
+describe("evidence JSON admission before authentication", () => {
+  it.each(["parameters", "raw_result", "normalized_result"] as const)(
+    "keeps rejected accessors and proxies inert in %s",
+    (field) => {
+      const evidence = createEvidence(TARGET, PROVIDER, {
+        operation: "health",
+        parameters: {},
+        result: true,
+      });
+      for (const kind of ["accessor", "proxy"] as const) {
+        let reads = 0;
+        const value =
+          kind === "accessor"
+            ? {
+                get attack() {
+                  reads += 1;
+                  return "observed";
+                },
+              }
+            : new Proxy(
+                { attack: "observed" },
+                {
+                  ownKeys(target) {
+                    reads += 1;
+                    return Reflect.ownKeys(target);
+                  },
+                  get(target, key, receiver) {
+                    reads += 1;
+                    return Reflect.get(target, key, receiver);
+                  },
+                },
+              );
+        let failure: unknown;
+        try {
+          parseEvidence({ ...evidence, [field]: value });
+        } catch (cause: unknown) {
+          failure = cause;
+        }
+        expect(reads, `${kind} reached Evidence authentication`).toBe(0);
+        expect(failure).toMatchObject({
+          name: "ZodError",
+          issues: [
+            {
+              code: "custom",
+              path: [field],
+              message: expect.stringContaining(
+                kind === "accessor" ? "accessors" : "proxies",
+              ),
+            },
+          ],
+        });
+      }
+    },
+  );
+});
+
+describe("evidence parameter depth bound", () => {
+  it("rejects evidence whose parameters nest past the JSON depth limit", () => {
+    const evidence = createEvidence(TARGET, PROVIDER, {
+      operation: "health",
+      parameters: {},
+      result: true,
+    });
+    let value: unknown = 1;
+    for (let index = 0; index <= MAX_JSON_DEPTH; index += 1)
+      value = { nested: value };
+    const result = evidenceSchema.safeParse({
+      ...evidence,
+      parameters: { attack: value },
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(
+      result.error.issues.some((issue) =>
+        issue.message.includes("maximum nesting depth"),
+      ),
+    ).toBe(true);
+  });
+
+  it("stops semantic authentication when normalized JSON exceeds its depth bound", () => {
+    const evidence = createEvidence(TARGET, PROVIDER, {
+      operation: "health",
+      parameters: {},
+      result: true,
+    });
+    let value: unknown = 1;
+    for (let index = 0; index < 10_000; index += 1) value = { nested: value };
+
+    expect(() =>
+      parseEvidence({ ...evidence, normalized_result: value }),
+    ).toThrow(/maximum nesting depth/u);
+  });
+});
+
+it("preserves prototype-named raw and normalized results with aligned identity", () => {
+  const result = { ["__proto__"]: { preserved: 7 }, constructor: "ordinary" };
+  const evidence = createEvidence(TARGET, PROVIDER, {
+    operation: "health",
+    parameters: {},
+    result,
+    rawResult: result,
+  });
+  const parsed = parseEvidence(evidence);
+  expect(parsed.normalized_result).toEqual(result);
+  expect(parsed.raw_result).toEqual(result);
+  expect(Object.getPrototypeOf(parsed.normalized_result)).toBe(
+    Object.prototype,
+  );
+  expect(Reflect.get(Object.prototype, "preserved")).toBeUndefined();
+  const stripped = createEvidence(TARGET, PROVIDER, {
+    operation: "health",
+    parameters: {},
+    result: { constructor: "ordinary" },
+    rawResult: { constructor: "ordinary" },
+  });
+  expect(stripped.evidence_id).not.toBe(evidence.evidence_id);
 });

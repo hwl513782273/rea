@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parseApplicationGraphEvidence } from "../../../src/application/javascript/JavaScriptApplicationEvidenceGraph.js";
-import { analyzeJavaScriptApplication } from "../../../src/application/javascript/JavaScriptApplicationService.js";
+import { analyzeJavaScriptApplication } from "../../support/javascriptApplicationScope.js";
 import { compareJavaScriptExportShapesEvidence } from "../../../src/application/javascript/JavaScriptApplicationWorkflowService.js";
 import { parseEvidence } from "../../../src/domain/evidence.js";
 import {
@@ -20,40 +20,46 @@ describe("JavaScript export container coverage through authenticated Evidence", 
       before: "",
       after: ", options: {}",
       paths: ["/options"],
+      addedPaths: ["/options"],
     },
     {
       name: "empty array",
       before: "",
       after: ", options: []",
       paths: ["/options"],
+      addedPaths: ["/options"],
     },
     {
       name: "nested object",
       before: ", options: {}",
       after: ", options: { nested: {} }",
       paths: ["/options/nested"],
+      addedPaths: ["/options/nested"],
     },
     {
       name: "nested array",
       before: ", options: []",
       after: ", options: [[]]",
       paths: ["/options/0"],
+      addedPaths: ["/options/0"],
     },
     {
       name: "container subtree",
       before: "",
       after: ", options: { nested: {} }",
       paths: ["/options", "/options/nested"],
+      addedPaths: ["/options"],
     },
     {
       name: "escaped property keys",
       before: ', "a/b~c": {}',
       after: ', "a/b~c": { "d/e~f": [] }',
       paths: ["/a~1b~0c/d~1e~0f"],
+      addedPaths: ["/a~1b~0c/d~1e~0f"],
     },
   ])(
-    "reports absent versus $name as unknown in both directions",
-    async ({ before, after, paths }) => {
+    "reports $name presence independently of unresolved values in both directions",
+    async ({ before, after, paths, addedPaths }) => {
       const [absent, retained] = await analyzeReturns(before, after);
       for (const path of paths) {
         expect(
@@ -71,16 +77,17 @@ describe("JavaScript export container coverage through authenticated Evidence", 
         );
       }
 
-      for (const [left, right, leftAvailability, rightAvailability] of [
-        [absent, retained, "absent", "unknown"],
-        [retained, absent, "unknown", "absent"],
+      for (const [left, right, leftAvailability, rightAvailability, status] of [
+        [absent, retained, "absent", "unknown", "added"],
+        [retained, absent, "unknown", "absent", "removed"],
       ] as const) {
         const result = compareEvidence(left, right);
         expect(result.summary).toEqual({
           added: 0,
           removed: 0,
           changed: 0,
-          unknown: paths.length,
+          unknown: paths.length - addedPaths.length,
+          [status]: addedPaths.length,
         });
         expect(result.changes).toHaveLength(paths.length);
         expect(result.changes).toEqual(
@@ -88,7 +95,7 @@ describe("JavaScript export container coverage through authenticated Evidence", 
             paths.map((path) =>
               expect.objectContaining({
                 path,
-                status: "unknown",
+                status: addedPaths.includes(path) ? status : "unknown",
                 discriminant: { path: "/type", value: "item" },
                 left: expect.objectContaining({
                   availability: leftAvailability,
@@ -102,15 +109,20 @@ describe("JavaScript export container coverage through authenticated Evidence", 
                   left.evidence.evidence_id,
                   right.evidence.evidence_id,
                 ],
-                limitations: [
-                  "The static value or relevant parent-property coverage is incomplete.",
-                ],
+                limitations: addedPaths.includes(path)
+                  ? []
+                  : [
+                      "The static value or relevant parent-property coverage is incomplete.",
+                    ],
               }),
             ),
           ),
         );
         expect(result.coverage).toMatchObject({
-          status: "partial",
+          status:
+            addedPaths.length === paths.length
+              ? "complete-within-inputs"
+              : "partial",
           paired_variants: 1,
           unpaired_left_variants: 0,
           unpaired_right_variants: 0,
@@ -220,7 +232,9 @@ const analyzeReturn = async (root: string, properties: string) => {
   await writeFixtureFiles(root, { "parser.mjs": `${prefix}${expression});\n` });
   const analyzed = await analyzeJavaScriptApplication({ input_path: root });
   if (!analyzed.ok) throw analyzed.error;
-  const source = parseApplicationGraphEvidence(analyzed.value);
+  const parsed = parseApplicationGraphEvidence(analyzed.value);
+  if (!parsed.ok) throw new Error("Analysis Evidence must parse");
+  const source = parsed.value;
   const observation = source.graph.nodes
     .flatMap(({ observations }) => observations)
     .find(

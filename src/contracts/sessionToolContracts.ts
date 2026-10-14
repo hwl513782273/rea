@@ -1,37 +1,43 @@
 import { z } from "zod";
 
-import { isAbsoluteLocalPath } from "../domain/localPath.js";
+import { isAbsolute } from "node:path";
+import { localPathStringSchema } from "../domain/localPath.js";
+import { artifactComparisonInputSchema } from "../domain/artifactComparison.js";
+import { bundleComparisonInputSchema } from "../domain/bundleComparison.js";
+import { callPathInputSchema } from "../domain/callPathSchemas.js";
+import { changedBehaviorInputSchema } from "../domain/changedBehavior.js";
+import { functionComparisonInputSchema } from "../domain/functionComparisonSchemas.js";
+import { processScenarioSchema } from "../domain/process/processScenario.js";
 import {
-  sessionOutputSchemas,
-  requireOutputSchema,
-} from "./toolOutputSchemas.js";
+  recordUnknownInputSchema,
+  updateUnknownInputSchema,
+} from "../domain/residualUnknown.js";
+import { reconstructionVerificationInputSchema } from "../domain/reconstructionVerificationSchemas.js";
+import { staticRuntimeCorrelationInputSchema } from "../domain/staticRuntimeCorrelation.js";
+import { sessionOutputSchemas } from "./toolOutputSchemaGroups.js";
+import { requireOutputSchema } from "./toolOutputSchemaPrimitives.js";
+import {
+  closeBinaryInputSchema,
+  openBinaryInputSchema,
+} from "./sessionLifecycleInputs.js";
+import { binarySessionInputSchema } from "./sessionStatusContract.js";
 import {
   addressContextInputSchema,
-  artifactComparisonInputSchema,
-  binarySessionInputSchema,
-  bundleComparisonInputSchema,
-  callPathInputSchema,
-  changedBehaviorInputSchema,
-  closeBinaryInputSchema,
-  functionComparisonInputSchema,
   importEvidenceBundleInputSchema,
   listUnknownsInputSchema,
   navigationContextInputSchema,
-  openBinaryInputSchema,
   processComparisonInputSchema,
-  processScenarioSchema,
-  reconstructionVerificationInputSchema,
-  recordUnknownInputSchema,
   getEvidenceBundleInputSchema,
-  staticRuntimeCorrelationInputSchema,
-  updateUnknownInputSchema,
   verifyUnknownResolutionInputSchema,
 } from "./sessionToolSchemas.js";
 import { examplesFor } from "./toolContractHelpers.js";
 import type { ToolContract } from "./toolContractTypes.js";
 import { toolContractMetadata } from "./toolEffects.js";
 
-const session = <Name extends string, Schema extends z.ZodObject>(
+const session = <
+  Name extends keyof typeof sessionOutputSchemas,
+  Schema extends z.ZodObject,
+>(
   name: Name,
   description: string,
   inputSchema: Schema,
@@ -48,10 +54,8 @@ const session = <Name extends string, Schema extends z.ZodObject>(
 
 /** Session-owned Evidence bundle export options. */
 export const exportEvidenceBundleInputSchema = z.strictObject({
-  path: z
-    .string()
-    .min(1)
-    .refine(isAbsoluteLocalPath, {
+  path: localPathStringSchema
+    .refine(isAbsolute, {
       message:
         "path must be an absolute local filesystem path (for example /tmp/rea/evidence.json or C:\\rea\\evidence.json)",
     })
@@ -65,12 +69,12 @@ export const exportEvidenceBundleInputSchema = z.strictObject({
 export const SESSION_TOOL_CONTRACTS = [
   session(
     "open_binary",
-    "Open a local executable, application bundle, archive, JavaScript, source map, plist, or analysis database after validation. format=dos-com explicitly interprets 1..65280 headerless bytes as a DOS COM analysis image; omission preserves header-based detection. provider_id selects one deep provider or deterministic auto selection; the binding remains stable until close or an explicit switch, with no failure fallback. An optional analysis snapshot is imported atomically and must match the binary identity, concrete provider, and canonical analysis profile exactly.",
+    "Open a local executable, application bundle, archive, JavaScript, source map, plist, or analysis database after validation. format=dos-com explicitly interprets 1..65280 headerless bytes as a DOS COM analysis image. format=raw-binary interprets headerless bytes with a required architecture and entry_point; file offset 0 maps at that address. Omission preserves header-based detection. provider_id selects one deep provider or deterministic auto selection; the binding remains stable until close or an explicit switch, with no failure fallback. Reopening the same target and profile retains its active database and metadata edits. An optional analysis snapshot is imported atomically and must match the binary identity, concrete provider, and canonical analysis profile exactly; importing into a session with metadata mutations requires closing and reopening it first.",
     openBinaryInputSchema,
   ),
   session(
     "close_binary",
-    "Optionally write a provider-neutral analysis snapshot atomically to the caller-supplied path, then close the active target and every provider resource started for it. Existing files require explicit overwrite; a failed save leaves the session open so cached analysis is not lost.",
+    "Drain earlier provider requests, optionally write a provider-neutral analysis snapshot atomically to the caller-supplied path, then close the active target and every provider resource started for it. Later provider requests wait until this lifecycle operation finishes. Existing files require explicit overwrite; a failed save leaves the session open so cached analysis is not lost. Metadata edits prevent immutable snapshot saves until the session is recreated; export_evidence_bundle preserves mutable observations before closing without a snapshot.",
     closeBinaryInputSchema,
   ),
   session(
@@ -90,7 +94,7 @@ export const SESSION_TOOL_CONTRACTS = [
   ),
   session(
     "capture_process_scenario",
-    "Run one caller-selected command under a PTY and return process capture Evidence with residual unknowns. A command name resolves through the inherited PATH; the working directory defaults to the caller's current directory; host environment variables are inherited with scenario overrides. Environment keys cannot contain '=' or NUL, and REA_PROCESS_RUN_ID is reserved for process ownership. Filesystem snapshots are opt-in through filesystem_observation_paths. The target runs with the current user's permissions; this is not a security sandbox.",
+    "Run one caller-selected command under a PTY and return process capture Evidence with residual unknowns. The renderer admits at most 1,000,000 combined terminal cells, computed as columns × (rows + scrollback); every resize uses the selected scrollback and must fit the same budget. Supply a smaller terminal shape when that product is too large; dimensions are never clamped. A command name resolves through the inherited PATH; the working directory defaults to the caller's current directory; host environment variables are inherited with scenario overrides. Environment keys cannot contain '=' or NUL, and REA_PROCESS_RUN_ID is reserved for process ownership. Filesystem snapshots are opt-in through filesystem_observation_paths. A positive finalization_ms makes a timeout or idle deadline send SIGTERM to the captured root through its start identity, keep observing, and send SIGKILL once after the interval; exit.finalization records each attempt with its delivery result and the observed exit, and cancellation still ends the run at once. The target runs with the current user's permissions; this is not a security sandbox.",
     processScenarioSchema,
   ),
   session(
@@ -135,7 +139,7 @@ export const SESSION_TOOL_CONTRACTS = [
   ),
   session(
     "list_unknowns",
-    "List every current residual-unknown head in deterministic ID order, with optional exact status, severity, and domain filters. Results are complete and inline. This is read-only; unresolved, contradicted, and non-truth dispositions remain distinct.",
+    "List current residual-unknown heads in deterministic ID order, with optional exact status, severity, and domain filters. Results are complete inline by default; supply offset and limit to page the filtered order. total is the matching-head count and next_offset is null when the page exhausts the result. This is read-only; unresolved, contradicted, and non-truth dispositions remain distinct.",
     listUnknownsInputSchema,
   ),
   session(
@@ -155,7 +159,7 @@ export const SESSION_TOOL_CONTRACTS = [
   ),
   session(
     "get_evidence_bundle",
-    "Return every Evidence record and residual unknown currently retained by this session as one inline bundle for direct inspection or follow-up workflows.",
+    "Return every retained Evidence record and residual unknown as a complete canonical bundle by default. detail=summary discovers retained records without copying or transferring their payloads; optionally filter by exact Evidence ID, operation, target SHA-256, analysis-profile digest or canonical native procedure address. Metadata distinguishes complete record retention from native value-flow truncation or unavailable/unknown coverage. Use a discovered evidence_id with inspect_analysis_view without restarting a provider. Filters apply only to summary delivery.",
     getEvidenceBundleInputSchema,
   ),
   session(

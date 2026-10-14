@@ -10,7 +10,11 @@ export const NATIVE_MACOS_PROVIDER_IDENTITY: ProviderIdentity = Object.freeze({
   name: "macOS native inspection utilities",
   version: null,
 });
-const IDENTITY = NATIVE_MACOS_PROVIDER_IDENTITY;
+/** Operations whose target process can show UI, use the network and write files. */
+const OWNED_PROCESS_OPERATIONS: ReadonlySet<string> = new Set([
+  "capture_native_ui_scenario",
+  "observe_native_calls",
+]);
 
 /** Declare native host coverage without creating a command runner. */
 export const nativeMacOSCapabilities = (
@@ -30,16 +34,16 @@ export const nativeMacOSCapabilities = (
             reason: "Native macOS utilities require macOS.",
           } as const);
       return Object.freeze({
-        provider: IDENTITY,
+        provider: NATIVE_MACOS_PROVIDER_IDENTITY,
         operation: contract.name,
         ...availability,
         effects: Object.freeze({
           mutatesArtifact: false,
           launchesProcess: contract.name !== "inspect_native_dispatch_metadata",
-          mayShowUi: contract.name === "capture_native_ui_scenario",
-          mayAccessNetwork: contract.name === "capture_native_ui_scenario",
+          mayShowUi: OWNED_PROCESS_OPERATIONS.has(contract.name),
+          mayAccessNetwork: OWNED_PROCESS_OPERATIONS.has(contract.name),
           mayWriteFilesystem:
-            contract.name === "capture_native_ui_scenario" ||
+            OWNED_PROCESS_OPERATIONS.has(contract.name) ||
             contract.name === "observe_native_ui",
           changesPermissions: false,
           requiresRoot: false,

@@ -7,11 +7,13 @@ import {
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import type {
-  BrowserTargetList,
   InspectWebPageInput,
   ListBrowserTargetsInput,
-  WebPageInspection,
 } from "../domain/browserObservation.js";
+import type {
+  BrowserTargetList,
+  WebPageInspection,
+} from "../domain/browserObservationSchemas.js";
 import type {
   AnalyzeWebBundleInput,
   WebBundleAnalysis,
@@ -100,11 +102,7 @@ const browserParameters = (
   result: BrowserEvidenceResult,
 ): EvidenceObservation["parameters"] => {
   if (!("cdp_endpoint" in input)) {
-    if (
-      "before_scenario" in input &&
-      input.before_scenario !== undefined &&
-      input.after_scenario !== undefined
-    )
+    if ("before_scenario" in input)
       return {
         comparison_kind: "browser_scenario",
         before_browser: input.before_scenario.browser,
@@ -112,15 +110,10 @@ const browserParameters = (
         before_start_origin: input.before_scenario.scenario.start_origin,
         after_start_origin: input.after_scenario.scenario.start_origin,
         normalization_sha256: commitBrowserScenarioNormalization(
-          input.normalization ?? { rules: [] },
+          input.normalization,
         ).sha256,
       };
-    if (
-      input.before !== undefined &&
-      input.after !== undefined &&
-      "inspection" in input.before &&
-      "inspection" in input.after
-    )
+    if ("inspection" in input.before && "inspection" in input.after)
       return {
         before_target_id: input.before.inspection.target.target_id,
         before_capture_ended_at:
@@ -138,7 +131,7 @@ const browserParameters = (
   }
   const observedOrigin = browserResultTargetOrigin(result);
   const scope = {
-    cdp_endpoint: input.cdp_endpoint,
+    cdp_endpoint: input.cdp_endpoint.recorded,
     allowed_origins:
       input.allowed_origins.length > 0
         ? input.allowed_origins

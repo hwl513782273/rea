@@ -1,4 +1,11 @@
 import { z } from "zod";
+import { providerSchema } from "../evidence.js";
+import { isSwiftMangledSymbolName } from "../swiftSymbolClassification.js";
+
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "../unicodeCodePointOrder.js";
 
 /** Objective-C method type. */
 export const objcMethodTypeSchema = z.enum([
@@ -7,16 +14,11 @@ export const objcMethodTypeSchema = z.enum([
   "ivar_getter",
   "ivar_setter",
 ]);
-export type ObjcMethodType = z.infer<typeof objcMethodTypeSchema>;
 
 /** Objective-C property attribute. */
 export const objcPropertyAttributeSchema = z.strictObject({
   name: z.string().min(1),
   value: z.string(),
-  is_weak: z.boolean().default(false),
-  is_atomic: z.boolean().default(false),
-  is_copy: z.boolean().default(false),
-  is_strong: z.boolean().default(false),
 });
 
 /** Objective-C method metadata. */
@@ -24,17 +26,18 @@ export const objcMethodSchema = z.strictObject({
   selector: z.string().min(1),
   method_type: objcMethodTypeSchema,
   address: z.number().int().nullable(),
-  is_required: z.boolean().default(false),
-  is_optional: z.boolean().default(false),
+  is_required: z.boolean().nullable(),
+  is_optional: z.boolean().nullable(),
 });
-export type ObjcMethod = z.infer<typeof objcMethodSchema>;
+type ObjcMethod = z.infer<typeof objcMethodSchema>;
 
 /** Objective-C property metadata. */
 export const objcPropertySchema = z.strictObject({
   name: z.string().min(1),
   type_encoding: z.string().nullable(),
-  attributes: z.array(objcPropertyAttributeSchema).default([]),
-  is_readonly: z.boolean().default(false),
+  attributes: z.array(objcPropertyAttributeSchema),
+  atomicity: z.enum(["atomic", "nonatomic"]).nullable(),
+  is_readonly: z.boolean().nullable(),
   getter: z.string().nullable(),
   setter: z.string().nullable(),
 });
@@ -51,12 +54,12 @@ export const objcProtocolSchema = z.strictObject({
 export const objcClassSchema = z.strictObject({
   name: z.string().min(1),
   super_class: z.string().nullable(),
-  is_meta_class: z.boolean().default(false),
-  is_root_class: z.boolean().default(false),
+  is_meta_class: z.boolean().nullable(),
+  is_root_class: z.boolean().nullable(),
   methods: z.array(objcMethodSchema).default([]),
   properties: z.array(objcPropertySchema).default([]),
   protocols: z.array(z.string()).default([]),
-  ivar_count: z.number().int().nonnegative().default(0),
+  ivar_count: z.number().int().nonnegative().nullable(),
   instance_size: z.number().int().nonnegative().nullable(),
   location: z
     .object({
@@ -87,7 +90,7 @@ export const objcClassSchema = z.strictObject({
     )
     .optional(),
 });
-export type ObjcClass = z.infer<typeof objcClassSchema>;
+type ObjcClass = z.infer<typeof objcClassSchema>;
 
 /** Exact location of a decoded native metadata value when the provider knows it. */
 export const nativeMetadataLocationSchema = z.strictObject({
@@ -114,6 +117,7 @@ export const nativeMetadataEvidenceSchema = z.strictObject({
     "decompiler",
   ]),
   description: z.string().min(1),
+  provider: providerSchema.optional(),
   location: nativeMetadataLocationSchema,
   artifact_path: z.string().min(1).nullable().default(null),
   artifact_sha256: z
@@ -162,7 +166,7 @@ export const objcDispatchImplementationSchema = z.strictObject({
   decode: nativeMetadataDecodeSchema,
   evidence: z.array(nativeMetadataEvidenceSchema).min(1),
 });
-export type ObjcDispatchImplementation = z.infer<
+type ObjcDispatchImplementation = z.infer<
   typeof objcDispatchImplementationSchema
 >;
 
@@ -224,7 +228,7 @@ export const swiftSymbolSchema = z.strictObject({
   decode: nativeMetadataDecodeSchema,
   evidence: z.array(nativeMetadataEvidenceSchema).min(1),
 });
-export type SwiftSymbol = z.infer<typeof swiftSymbolSchema>;
+type SwiftSymbol = z.infer<typeof swiftSymbolSchema>;
 
 /** Per-facet coverage; empty arrays are meaningful only with this record. */
 export const nativeMetadataCoverageSchema = z.strictObject({
@@ -246,7 +250,6 @@ export const swiftDeclKindSchema = z.enum([
   "global_var",
   "global_func",
 ]);
-export type SwiftDeclKind = z.infer<typeof swiftDeclKindSchema>;
 
 /** Swift access level. */
 export const swiftAccessLevelSchema = z.enum([
@@ -269,7 +272,6 @@ export const swiftDeclSchema = z.strictObject({
   is_convenience_init: z.boolean().default(false),
   is_override: z.boolean().default(false),
 });
-export type SwiftDecl = z.infer<typeof swiftDeclSchema>;
 
 /** Database save/read operation type. */
 export const dbOperationSchema = z.enum([
@@ -290,7 +292,6 @@ export const dbSaveResultSchema = z.strictObject({
   database_path: z.string().nullable(),
   error: z.string().nullable(),
 });
-export type DbSaveResult = z.infer<typeof dbSaveResultSchema>;
 
 /** Result of deeper ObjC/Swift metadata extraction. */
 export const objcSwiftMetadataSchema = z.strictObject({
@@ -368,7 +369,7 @@ export const inspectNativeDispatchMetadata = (
       classNames.add(methodMatch[2]);
     }
 
-    if (/^(?:_?\$s|_Tt)/u.test(entry.name))
+    if (isSwiftMangledSymbolName(entry.name) || entry.name.startsWith("_Tt"))
       swiftSymbols.push({
         mangled_name: entry.name,
         address: entry.address,
@@ -384,26 +385,27 @@ export const inspectNativeDispatchMetadata = (
       selector: implementation.selector,
       method_type: implementation.method_type,
       address: parseMetadataAddress(implementation.implementation_address),
-      is_required: false,
-      is_optional: false,
+      is_required: null,
+      is_optional: null,
     });
     methodsByClass.set(implementation.class_name, methods);
   }
   const classes: ObjcClass[] = [...classNames].sort().map((name) => ({
     name,
     super_class: null,
-    is_meta_class: false,
-    is_root_class: false,
+    is_meta_class: null,
+    is_root_class: null,
     methods: methodsByClass.get(name) ?? [],
     properties: [],
     protocols: [],
-    ivar_count: 0,
+    ivar_count: null,
     instance_size: null,
   }));
   const decodedImplementations = [...implementations.values()].sort(
     (left, right) =>
-      `${left.class_name}:${left.selector}`.localeCompare(
-        `${right.class_name}:${right.selector}`,
+      compareUnicodeCodePoints(
+        compositeKey([left.class_name, left.selector]),
+        compositeKey([right.class_name, right.selector]),
       ),
   );
   const swift = swiftSymbols.length > 0;
@@ -479,60 +481,3 @@ const parseMetadataAddress = (address: string | null): number | null => {
   const value = Number.parseInt(match[1], 16);
   return Number.isSafeInteger(value) ? value : null;
 };
-
-/** Check if a selector name looks like a getter. */
-export function isGetterSelector(selector: string): boolean {
-  return /^[a-z][a-zA-Z0-9_]*$/u.test(selector) && !selector.includes(":");
-}
-
-/** Check if a selector name looks like a setter. */
-export function isSetterSelector(selector: string): boolean {
-  return selector.startsWith("set") && selector.endsWith(":");
-}
-
-/** Extract property name from a getter/setter selector. */
-export function propertyNameFromSelector(selector: string): string | null {
-  if (isSetterSelector(selector)) {
-    const inner = selector.slice(3, -1);
-    return inner.charAt(0).toLowerCase() + inner.slice(1);
-  }
-  if (isGetterSelector(selector)) {
-    return selector;
-  }
-  return null;
-}
-
-/** Count ObjC methods by type. */
-export function countMethodsByType(
-  methods: readonly ObjcMethod[],
-): Record<ObjcMethodType, number> {
-  return {
-    instance: methods.filter((m) => m.method_type === "instance").length,
-    class: methods.filter((m) => m.method_type === "class").length,
-    ivar_getter: methods.filter((m) => m.method_type === "ivar_getter").length,
-    ivar_setter: methods.filter((m) => m.method_type === "ivar_setter").length,
-  };
-}
-
-/** Get all Swift declarations of a specific kind. */
-export function swiftDeclsByKind(
-  decls: readonly SwiftDecl[],
-  kind: SwiftDeclKind,
-): SwiftDecl[] {
-  return decls.filter((d) => d.kind === kind);
-}
-
-/** Check if a database save preserved all expected items. */
-export function isDbSaveComplete(
-  result: DbSaveResult,
-  expectedNames: number,
-  expectedComments: number,
-  expectedBookmarks: number,
-): boolean {
-  return (
-    result.succeeded &&
-    result.preserved_names >= expectedNames &&
-    result.preserved_comments >= expectedComments &&
-    result.preserved_bookmarks >= expectedBookmarks
-  );
-}

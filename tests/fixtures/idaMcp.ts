@@ -2,24 +2,32 @@ import { createHash } from "node:crypto";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BinaryTarget } from "../../src/domain/binaryTarget.js";
+import type { BinaryTarget } from "../../src/domain/binaryTargetTypes.js";
 import type { JsonValue } from "../../src/domain/jsonValue.js";
 import type { IdaMcpConnection } from "../../src/ida/IdaMcpConnection.js";
 import { elf } from "../../src/domain/binaryTarget.fixture.js";
 
+/** ELF machine numbers for the architectures a fixture target can declare. */
+const ELF_MACHINE = { x86_64: 62, arm64: 183 } as const;
+
 /** Create a test-owned executable and workspace parent without invoking an engine. */
-export const createIdaTarget = async () => {
+export const createIdaTarget = async (
+  architecture: keyof typeof ELF_MACHINE = "x86_64",
+  availableArchitectures: readonly (keyof typeof ELF_MACHINE)[] = [
+    architecture,
+  ],
+) => {
   const root = await mkdtemp(join(tmpdir(), "rea-ida-test-"));
   const path = join(root, "target.elf");
-  const bytes = elf(2, 1, 62);
+  const bytes = elf(2, 1, ELF_MACHINE[architecture]);
   await writeFile(path, bytes);
   const target: BinaryTarget = {
     path,
     sha256: createHash("sha256").update(bytes).digest("hex"),
     kind: "executable",
     format: "elf",
-    architecture: "x86_64",
-    availableArchitectures: ["x86_64"],
+    architecture,
+    availableArchitectures: [...availableArchitectures],
   };
   return { root, target };
 };
@@ -48,6 +56,8 @@ const modernNames = [
   "disasm",
   "callees",
   "xrefs_to",
+  "callgraph",
+  "survey_binary",
 ];
 
 /** Stateful producer fixture at the real connection seam; no module mocking. */
@@ -58,6 +68,7 @@ export class RecordingIdaMcp implements IdaMcpConnection {
   }[] = [];
   connects = 0;
   closes = 0;
+  detaches = 0;
   inputSha256: string;
   inputPath: string;
   imageBase = "0x1000";
@@ -82,15 +93,20 @@ export class RecordingIdaMcp implements IdaMcpConnection {
     this.inputSha256 = target.sha256;
     this.inputPath = target.path;
   }
+  /** Tool names the fake server advertises; defaults to the profile's full set. */
+  tools?: readonly string[];
   async connect() {
     this.connects += 1;
-    return this.mode === "attached" ? legacyNames : modernNames;
+    return this.tools ?? (this.mode === "attached" ? legacyNames : modernNames);
   }
   serverInfo() {
     return { name: "upstream-fixture", version: "sdk-version-is-not-ida" };
   }
   async close() {
     this.closes += 1;
+  }
+  detach() {
+    this.detaches += 1;
   }
   async call(
     name: string,
@@ -102,10 +118,13 @@ export class RecordingIdaMcp implements IdaMcpConnection {
     if (overridden !== undefined) return overridden;
     if (["idb_open", "idb_list", "idb_close", "server_health"].includes(name))
       return this.lifecycle(name, args);
-    return this.read(name);
+    return this.read(name, args);
   }
 
-  private read(name: string): JsonValue {
+  private read(
+    name: string,
+    args: Readonly<Record<string, JsonValue>>,
+  ): JsonValue {
     const fn = { address: "0x1000", name: "main", size: "0x20" };
     const asm = {
       name: "main",
@@ -142,13 +161,13 @@ export class RecordingIdaMcp implements IdaMcpConnection {
       case "get_function_by_name":
         return fn;
       case "lookup_funcs":
-        return [
-          {
-            query: "main",
-            fn: { addr: fn.address, name: fn.name, size: fn.size },
-            error: null,
-          },
-        ];
+        if (!Array.isArray(args.queries))
+          throw new Error("Invalid fixture lookup queries");
+        return args.queries.map((query) => ({
+          query,
+          fn: { addr: fn.address, name: fn.name, size: fn.size },
+          error: null,
+        }));
       case "decompile_function":
         return this.pseudocode;
       case "decompile":

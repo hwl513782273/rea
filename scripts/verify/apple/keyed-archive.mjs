@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,12 +11,17 @@ import {
   artifactMcpResult,
   withArtifactMcp,
 } from "../../lib/artifact-e2e.mjs";
+import {
+  assertKeyedArchiveIntegerResult,
+  verifyKeyedArchiveIntegerArchives,
+} from "./keyed-archive-integers.mjs";
 
 if (process.platform !== "darwin")
   throw new Error(
     "Real Foundation keyed archive verification requires macOS and Xcode Swift tools",
   );
 const root = await mkdtemp(join(tmpdir(), "rea-keyed-fixture-"));
+let report;
 try {
   const archive = join(root, "model.plist");
   await promisify(execFile)("/usr/bin/xcrun", [
@@ -147,12 +152,77 @@ try {
         target,
         status,
       })),
-      [{ source: null, path: ["UID"], target: 1, status: "resolved" }],
+      [
+        { source: null, path: ["CF$UID"], target: 1, status: "resolved" },
+        { source: null, path: ["UID"], target: 1, status: "resolved" },
+      ],
     );
+    const selected = await artifactCli("inspect-keyed-archive", path, [
+      "--root",
+      "UID",
+    ]);
+    assert.deepEqual(
+      selected.references,
+      uidGraph.references.filter(({ path }) => path[0] === "UID"),
+    );
+    await withArtifactMcp(path, async (client) => {
+      assert.deepEqual(
+        await artifactMcpResult(client, "inspect_keyed_archive", {
+          root: "UID",
+        }),
+        selected,
+      );
+    });
   }
-  process.stdout.write(
-    `${JSON.stringify({ ok: true, mocked: false, cli: true, stdio_mcp: true, xml_golden: true, uid_named_root: true, format: graph.archive_format, objects: graph.total_objects, references: graph.total_references, shared_identity: true, cyclic_identity: true, target_classes_instantiated_by_reader: false })}\n`,
-  );
+  const integers = join(root, "integers");
+  await mkdir(integers);
+  await promisify(execFile)("/usr/bin/xcrun", [
+    "swift",
+    "-module-cache-path",
+    join(root, "modules"),
+    fileURLToPath(
+      new URL(
+        "../../../tests/conformance/native/keyed-archive-integers.swift",
+        import.meta.url,
+      ),
+    ),
+    integers,
+  ]);
+  for (const fixture of await verifyKeyedArchiveIntegerArchives(integers)) {
+    const cliResult = assertKeyedArchiveIntegerResult(
+      await artifactCli("inspect-keyed-archive", fixture.archivePath),
+      fixture.format,
+      fixture.digest,
+      fixture.archive,
+    );
+    await withArtifactMcp(fixture.archivePath, async (client) => {
+      const mcpResult = assertKeyedArchiveIntegerResult(
+        await artifactMcpResult(client, "inspect_keyed_archive"),
+        fixture.format,
+        fixture.digest,
+        fixture.archive,
+      );
+      assert.deepEqual(mcpResult, cliResult);
+    });
+  }
+  report = {
+    ok: true,
+    mocked: false,
+    cli: true,
+    stdio_mcp: true,
+    xml_golden: true,
+    uid_named_root: true,
+    numeric_formats: ["xml", "binary"],
+    numeric_cli: true,
+    numeric_stdio_mcp: true,
+    format: graph.archive_format,
+    objects: graph.total_objects,
+    references: graph.total_references,
+    shared_identity: true,
+    cyclic_identity: true,
+    target_classes_instantiated_by_reader: false,
+  };
 } finally {
   await rm(root, { recursive: true, force: true });
 }
+process.stdout.write(`${JSON.stringify(report)}\n`);

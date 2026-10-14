@@ -19,19 +19,25 @@ export const enhancedInputSchemas = {
       .default([]),
   }),
   get_call_graph: z.strictObject({
-    address: z.string().describe("A provider-normalized procedure address"),
+    address: z
+      .string()
+      .describe(
+        "A procedure symbol or address to resolve to its canonical entry",
+      ),
     direction: z.enum(["forward", "backward"]).default("forward"),
   }),
   analyze_swift_types: z.strictObject({
     category: z
       .enum(["classes", "structs", "enums", "protocols", "extensions", "other"])
       .optional()
-      .describe("Limit results to one Swift symbol category."),
+      .describe(
+        "Limit categorized results to one Swift category; unresolved category observations remain in unclassified.",
+      ),
     pattern: z
       .string()
       .optional()
       .describe(
-        "Case-sensitive literal filter applied to mangled symbol names.",
+        "Case-sensitive literal filter applied to provider procedure names and their supporting Swift manglings.",
       ),
   }),
   find_xrefs_to_name: z.strictObject({ name: z.string() }),
@@ -44,10 +50,10 @@ export const enhancedInputSchemas = {
   }),
   trace_feature: traceLiteralInputSchema,
   trace_call_path: z.strictObject({
-    start: z.string().describe("A provider-normalized procedure address"),
+    start: z.string().describe("A starting procedure symbol or address"),
     goal: z
       .string()
-      .describe("An optional provider-normalized destination address")
+      .describe("An optional destination procedure symbol or address")
       .optional(),
     direction: z.enum(["forward", "backward"]).default("forward"),
   }),

@@ -1,12 +1,18 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { clearClientLocationEnvironment } from "../../fixtures/clientEnvironment.js";
 
 import { readClientRegistrationStatuses } from "../../../src/application/ClientRegistrationStatus.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
+
+beforeEach(clearClientLocationEnvironment);
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("client registration status", () => {
   it("discovers Claude Code from its config file without a marker directory", async () => {
@@ -106,7 +112,9 @@ describe("client registration status", () => {
       ]);
     },
   );
+});
 
+describe("client registration launcher identity", () => {
   it("reports an unversioned npx registration as stale", async () => {
     const home = await createTestTempDirectory("rea-registrations-");
     await mkdir(join(home, ".codex"));
@@ -124,6 +132,122 @@ describe("client registration status", () => {
         state: "stale",
       }),
     ]);
+  });
+
+  it("reports an unpinned bunx registration as stale rather than aligned", async () => {
+    const home = await createTestTempDirectory("rea-bunx-unpinned-");
+    await writeFile(
+      join(home, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          rea: { command: "bunx", args: ["rea-agents", "mcp"] },
+        },
+      }),
+    );
+
+    const [status] = await readClientRegistrationStatuses(home);
+
+    expect(status).toMatchObject({
+      client: "claude_code",
+      command: ["bunx", "rea-agents", "mcp"],
+      state: "stale",
+    });
+  });
+
+  it("preserves direct command identity as unknown when the current entrypoint is absent", async () => {
+    const home = await createTestTempDirectory("rea-registration-unknown-");
+    await mkdir(join(home, ".cursor"));
+    const command = ["/opt/rea/bin/rea", "mcp"];
+    await writeFile(
+      join(home, ".cursor/mcp.json"),
+      JSON.stringify({
+        mcpServers: { rea: { command: command[0], args: [command[1]] } },
+      }),
+    );
+
+    const [status] = await readClientRegistrationStatuses(home, "");
+
+    expect(status).toMatchObject({
+      client: "cursor",
+      command,
+      state: "unknown",
+      remediation: expect.stringContaining("registration was retained"),
+    });
+  });
+
+  it("does not use the REA process cwd to resolve a client's relative launcher path", async () => {
+    const home = await createTestTempDirectory("rea-registration-relative-");
+    await mkdir(join(home, ".cursor"));
+    const currentEntry = resolve("./rea.mjs");
+    const configPath = join(home, ".cursor/mcp.json");
+    const registration = (
+      scriptPath: string,
+      executable = process.execPath,
+    ) => ({
+      mcpServers: {
+        rea: { command: executable, args: [scriptPath, "mcp"] },
+      },
+    });
+    await writeFile(configPath, JSON.stringify(registration("./rea.mjs")));
+
+    const [relativeStatus] = await readClientRegistrationStatuses(
+      home,
+      currentEntry,
+    );
+    expect(relativeStatus).toMatchObject({
+      command: [process.execPath, "./rea.mjs", "mcp"],
+      state: "unknown",
+    });
+
+    await writeFile(configPath, JSON.stringify(registration(currentEntry)));
+    const [absoluteStatus] = await readClientRegistrationStatuses(
+      home,
+      currentEntry,
+    );
+    expect(absoluteStatus).toMatchObject({
+      command: [process.execPath, currentEntry, "mcp"],
+      state: "aligned",
+    });
+
+    const relativeInterpreter = relative(process.cwd(), process.execPath);
+    await writeFile(
+      configPath,
+      JSON.stringify(registration(currentEntry, relativeInterpreter)),
+    );
+    const [relativeInterpreterStatus] = await readClientRegistrationStatuses(
+      home,
+      currentEntry,
+    );
+    expect(relativeInterpreterStatus).toMatchObject({
+      command: [relativeInterpreter, currentEntry, "mcp"],
+      state: "unknown",
+    });
+  });
+
+  it("reports the exact requested package version when it differs from this CLI", async () => {
+    const home = await createTestTempDirectory(
+      "rea-registration-version-drift-",
+    );
+    await mkdir(join(home, ".codex"));
+    const command = ["npx", "-y", "rea-agents@4.1.0", "mcp"];
+    await writeFile(
+      join(home, ".codex/config.toml"),
+      `[mcp_servers.rea]\ncommand = "${command[0]}"\nargs = ["${command[1]}", "${command[2]}", "${command[3]}"]\n`,
+    );
+
+    const [status] = await readClientRegistrationStatuses(home);
+
+    expect(status).toMatchObject({
+      client: "codex",
+      command,
+      package_reference: "rea-agents@4.1.0",
+      state: "stale",
+      remediation: expect.stringContaining(
+        `current REA CLI package is ${PRODUCT_IDENTITY.packageVersion}`,
+      ),
+    });
+    expect(status?.remediation).toContain("does not resolve package-runner");
+    expect(status?.remediation).toContain("rea setup --client codex");
   });
 });
 
@@ -205,6 +329,43 @@ describe("Node-wrapped registration policy", () => {
       ]);
     },
   );
+
+  it.each([1, 30])(
+    "checks Grok Build startup timeout %d independently of launcher",
+    async (timeout) => {
+      const home = await createTestTempDirectory("rea-grok-registration-");
+      await mkdir(join(home, ".grok"));
+      const entry = resolve("scripts/rea.mjs");
+      await writeFile(
+        join(home, ".grok/config.toml"),
+        `[mcp_servers.rea]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(entry)}, "mcp"]\nstartup_timeout_sec = ${String(timeout)}\n`,
+      );
+      const statuses = await readClientRegistrationStatuses(home, entry, {
+        environment: {},
+      });
+      expect(statuses).toEqual([
+        expect.objectContaining({
+          client: "grok_build",
+          state: timeout === 30 ? "aligned" : "stale",
+        }),
+      ]);
+    },
+  );
+
+  it("reports Grok Build stale when rea is listed in disabled_mcp_servers", async () => {
+    const home = await createTestTempDirectory("rea-grok-disabled-status-");
+    await mkdir(join(home, ".grok"));
+    const entry = resolve("scripts/rea.mjs");
+    await writeFile(
+      join(home, ".grok/config.toml"),
+      `disabled_mcp_servers = ["rea"]\n[mcp_servers.rea]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(entry)}, "mcp"]\nstartup_timeout_sec = 30\n`,
+    );
+    expect(
+      await readClientRegistrationStatuses(home, entry, { environment: {} }),
+    ).toEqual([
+      expect.objectContaining({ client: "grok_build", state: "stale" }),
+    ]);
+  });
 
   it("checks a direct-launcher Codex startup timeout without Node wrapping", async () => {
     const home = await createTestTempDirectory("rea-direct-registration-");

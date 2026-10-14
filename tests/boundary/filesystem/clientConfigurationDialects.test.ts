@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
@@ -9,27 +9,23 @@ import { configureClientConfiguration } from "../../../src/application/SetupClie
 import { systemUninstallHost } from "../../../src/application/Uninstall.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
-import { isOwnedClientRegistrationCommand } from "../../../src/application/ClientRegistrationIdentity.js";
+import {
+  classifyClientRegistrationCommand,
+  isOwnedClientRegistrationCommand,
+} from "../../../src/application/ClientRegistrationIdentity.js";
+import {
+  CURRENT_ENTRYPOINT_PATH,
+  normalizeEntrypointPath,
+} from "../../../src/process/CurrentEntrypointPath.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import {
+  clearClientLocationEnvironment,
+  NPX_REGISTRATION_COMMAND,
+} from "../../fixtures/clientEnvironment.js";
 
-const command = [
-  "npx",
-  "-y",
-  PRODUCT_IDENTITY.registrationPackageSpecifier,
-  "mcp",
-] as const;
+const command = NPX_REGISTRATION_COMMAND;
 
-beforeEach(() => {
-  for (const name of [
-    "APPDATA",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "COPILOT_HOME",
-    "OPENCODE_CONFIG",
-    "XDG_CONFIG_HOME",
-  ])
-    vi.stubEnv(name, undefined);
-});
+beforeEach(clearClientLocationEnvironment);
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -42,10 +38,61 @@ const getClients = (home: string) =>
       "commandcode",
       "vscode",
       "devin",
+      "omp",
+      "pi",
     ].includes(name),
   );
 
 describe("additional client configuration dialects", () => {
+  it("does not uninstall a Node registration whose relative script only matches this process cwd", async () => {
+    if (CURRENT_ENTRYPOINT_PATH === undefined)
+      throw new Error("test runner entrypoint is unavailable");
+    const home = await createTestTempDirectory("rea-relative-uninstall-");
+    const cursor = supportedClients(home).find(({ name }) => name === "cursor");
+    if (cursor === undefined) throw new Error("missing Cursor client");
+    await mkdir(cursor.markerPath ?? home, { recursive: true });
+    const relativeScript = relative(process.cwd(), CURRENT_ENTRYPOINT_PATH);
+    const registration = {
+      command: process.execPath,
+      args: [relativeScript, "mcp"],
+    };
+    await writeFile(
+      cursor.configPath,
+      JSON.stringify({ mcpServers: { rea: registration } }),
+    );
+
+    expect(
+      await readClientRegistrationStatuses(home, CURRENT_ENTRYPOINT_PATH),
+    ).toContainEqual(
+      expect.objectContaining({
+        client: "cursor",
+        command: [process.execPath, relativeScript, "mcp"],
+        state: "unknown",
+      }),
+    );
+    await systemUninstallHost(home).removeClient(cursor);
+    const after = parseJsonc(await readFile(cursor.configPath, "utf8")) as {
+      readonly mcpServers: Readonly<Record<string, unknown>>;
+    };
+    expect(after.mcpServers.rea).toEqual(registration);
+  });
+
+  it("treats an empty XDG config home as unset for OpenCode setup", async () => {
+    const home = await createTestTempDirectory("rea-opencode-empty-xdg-");
+    const client = supportedClients(home, "linux", {
+      XDG_CONFIG_HOME: "",
+    }).find(({ name }) => name === "opencode");
+    const expectedPath = join(home, ".config/opencode/opencode.json");
+    if (client === undefined) throw new Error("missing opencode client");
+
+    expect(client.configPath).toBe(expectedPath);
+    expect(client.configPaths).toContain(expectedPath);
+    expect(
+      await configureClientConfiguration(client, {}, command),
+    ).toMatchObject({ status: "configured" });
+    expect(await readFile(expectedPath, "utf8")).toContain('"mcp"');
+  });
+
   it.each([
     "opencode",
     "antigravity",
@@ -53,12 +100,13 @@ describe("additional client configuration dialects", () => {
     "commandcode",
     "vscode",
     "devin",
+    "omp",
+    "pi",
   ] as const)("registers, reads back, and uninstalls %s", async (name) => {
     const home = await createTestTempDirectory("rea-client-dialect-");
     const client = getClients(home).find(
       (candidate) => candidate.name === name,
     );
-    expect(client).toBeDefined();
     if (client === undefined) throw new Error(`missing ${name} client`);
 
     await mkdir(client.markerPath ?? home, { recursive: true });
@@ -88,7 +136,7 @@ describe("additional client configuration dialects", () => {
         command,
         enabled: true,
       });
-    if (name === "vscode")
+    if (name === "vscode" || name === "omp" || name === "pi")
       expect(registration).toMatchObject({
         type: "stdio",
         command: "npx",
@@ -122,11 +170,12 @@ describe("additional client configuration dialects", () => {
       ],
     ).toBeUndefined();
   });
+});
 
+describe("OpenCode JSONC registration edits", () => {
   it("preserves OpenCode JSONC comments and sibling registrations during update and removal", async () => {
     const home = await createTestTempDirectory("rea-opencode-jsonc-");
     const client = getClients(home).find(({ name }) => name === "opencode");
-    expect(client).toBeDefined();
     if (client === undefined) throw new Error("missing OpenCode client");
     await mkdir(client.markerPath ?? home, { recursive: true });
     const original = `{
@@ -177,7 +226,6 @@ describe("additional client configuration dialects", () => {
   it("rejects malformed OpenCode JSONC without creating a backup or changing bytes", async () => {
     const home = await createTestTempDirectory("rea-opencode-invalid-");
     const client = getClients(home).find(({ name }) => name === "opencode");
-    expect(client).toBeDefined();
     if (client === undefined) throw new Error("missing OpenCode client");
     await mkdir(client.markerPath ?? home, { recursive: true });
     const invalid = '{ "mcp": { /* broken */ "rea": [ }';
@@ -401,6 +449,40 @@ describe("platform-aware client config paths", () => {
     },
   );
 
+  it("honors Grok Build and Grok Bot configuration roots", () => {
+    expect(
+      supportedClients("/home/a", "linux", {
+        GROK_HOME: "/custom/grok",
+        SAND_DATA_ROOT: "/custom/grokbot",
+      }).filter(({ name }) => name === "grok_build" || name === "grok_bot"),
+    ).toEqual([
+      expect.objectContaining({
+        name: "grok_build",
+        displayName: "Grok Build",
+        configPath: "/custom/grok/config.toml",
+        markerPath: "/custom/grok",
+        format: "grok",
+      }),
+      expect.objectContaining({
+        name: "grok_bot",
+        displayName: "Grok Bot",
+        configPath: "/custom/grokbot",
+        markerPath: "/custom/grokbot",
+        format: "unsupported",
+      }),
+    ]);
+    expect(
+      supportedClients("/home/a", "linux", {
+        SAND_DATA_ROOT: "relative/sand",
+      }).find(({ name }) => name === "grok_bot")?.configPath,
+    ).toBe("/home/a/.grokbot");
+    expect(
+      supportedClients("/home/a", "darwin", {}).find(
+        ({ name }) => name === "grok_build",
+      )?.configPath,
+    ).toBe("/home/a/.grok/config.toml");
+  });
+
   it("honors Copilot CLI and Devin platform configuration roots", () => {
     expect(
       supportedClients("/home/a", "linux", {
@@ -449,18 +531,43 @@ describe("platform-aware client config paths", () => {
       ]),
     );
   });
+});
 
+describe("client registration command ownership", () => {
   it("recognizes prior exact REA releases while rejecting foreign package commands", () => {
+    expect(isOwnedClientRegistrationCommand(["rea", "mcp"], undefined)).toBe(
+      true,
+    );
+    const cwdMatchingEntry = resolve("./rea");
     expect(
-      isOwnedClientRegistrationCommand([
-        "npx",
-        "-y",
-        `${PRODUCT_IDENTITY.packageName}@3.2.0`,
-        "mcp",
-      ]),
+      classifyClientRegistrationCommand(["./rea", "mcp"], cwdMatchingEntry),
+    ).toBe("unknown");
+    expect(
+      isOwnedClientRegistrationCommand(["./rea", "mcp"], cwdMatchingEntry),
+    ).toBe(false);
+    expect(
+      isOwnedClientRegistrationCommand(
+        ["npx", "-y", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"],
+        undefined,
+      ),
     ).toBe(true);
     expect(
-      isOwnedClientRegistrationCommand(["npx", "-y", "another-package", "mcp"]),
+      isOwnedClientRegistrationCommand(
+        ["npx", "-y", "another-package", "mcp"],
+        undefined,
+      ),
+    ).toBe(false);
+    expect(
+      isOwnedClientRegistrationCommand(
+        ["bunx", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"],
+        undefined,
+      ),
+    ).toBe(true);
+    expect(
+      isOwnedClientRegistrationCommand(
+        ["bunx", "another-package", "mcp"],
+        undefined,
+      ),
     ).toBe(false);
     expect(
       isOwnedClientRegistrationCommand(
@@ -468,6 +575,12 @@ describe("platform-aware client config paths", () => {
         "/packaged/rea.mjs",
       ),
     ).toBe(true);
+    expect(
+      isOwnedClientRegistrationCommand(
+        [process.execPath, resolve("unknown"), "mcp"],
+        normalizeEntrypointPath(""),
+      ),
+    ).toBe(false);
     expect(
       isOwnedClientRegistrationCommand(
         ["node", "/packaged/other-agent.mjs", "mcp"],

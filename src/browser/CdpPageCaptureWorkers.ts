@@ -1,4 +1,4 @@
-import type { WebPageInspection } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { CdpCaptureEvents } from "./CdpCaptureEvents.js";
 import {
   allowedSanitizedUrl,
@@ -55,12 +55,16 @@ export const captureWorkers = async (
       );
       continue;
     }
+    if (typeof target.attached !== "boolean") {
+      completeness.exclude("workers", "invalid_protocol_value");
+      continue;
+    }
     items.push({
       target_id: cdpStringValue(target.targetId) ?? "",
       type,
       url: url.url,
       origin: url.origin,
-      attached: target.attached === true,
+      attached: target.attached,
       opener_target_id: cdpStringValue(target.openerId) ?? null,
       parent_frame_id: cdpStringValue(target.parentFrameId) ?? null,
     });

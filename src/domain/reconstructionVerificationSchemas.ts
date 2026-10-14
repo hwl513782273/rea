@@ -1,11 +1,13 @@
 import { z } from "zod";
+
+import { IDENTIFIER_PATTERN } from "./stringPatterns.js";
 import { digestSchema } from "./../domain/digests.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
-import { PROCESS_COMPARISON_DIMENSIONS } from "./processComparison.js";
+import { PROCESS_COMPARISON_DIMENSIONS } from "./process/processComparison.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
 const unknownIdSchema = prefixedDigestSchema("unk");
-const claimIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]*$/u);
+const claimIdSchema = z.string().regex(IDENTIFIER_PATTERN);
 const titleSchema = z.string().trim().min(1);
 const verificationStatusSchema = z.enum(["pass", "fail", "unknown"]);
 const commonClaim = {
@@ -89,7 +91,7 @@ export const reconstructionClaimResultSchema = z.object({
   comparison_evidence_id: evidenceIdSchema,
   left_evidence_ids: z.array(evidenceIdSchema).min(1),
   right_evidence_ids: z.array(evidenceIdSchema).min(1),
-  evidence_links: z.array(evidenceIdSchema).min(3),
+  evidence_links: z.array(evidenceIdSchema).min(2),
   unknown_ids: z.array(unknownIdSchema),
   limitations: z.array(z.string()),
 });
@@ -118,7 +120,7 @@ export const reconstructionVerificationResultSchema = z
         unknown_ids: z.array(unknownIdSchema),
       }),
     ),
-    evidence_links: z.array(evidenceIdSchema).min(3),
+    evidence_links: z.array(evidenceIdSchema).min(2),
     limitations: z.array(z.string()),
   })
   .superRefine((result, context) => {

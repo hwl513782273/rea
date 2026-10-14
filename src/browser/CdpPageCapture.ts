@@ -1,10 +1,8 @@
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { stableWebResources } from "../domain/webInventory.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import { CdpConnection } from "./CdpConnection.js";
@@ -12,14 +10,17 @@ import { CdpCaptureEvents } from "./CdpCaptureEvents.js";
 import { authorizedMainFrame } from "./CdpAuthorizedMainFrame.js";
 import { captureStorage } from "./CdpCaptureStorage.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
+import { CdpCommandRejection } from "./CdpCommandRejection.js";
 import {
   captureAccessibility,
   captureDom,
   captureFrames,
   captureResources,
   type CapturedResource,
+  type DomCapture,
   mainFrameUrl,
 } from "./CdpCaptureDocuments.js";
+import { capturedSvgNodeKind } from "./CdpCaptureDomSvg.js";
 import {
   allowedSanitizedUrl,
   delayWithCancellation,
@@ -53,7 +54,7 @@ interface CaptureState {
 interface CapturedSections {
   readonly attachedUrl: string;
   readonly frames: WebPageInspection["frames"];
-  readonly dom: ReturnType<typeof captureDom>;
+  readonly dom: DomCapture;
   readonly accessibility: ReturnType<typeof captureAccessibility>;
   readonly scripts: WebPageInspection["scripts"];
   readonly resources: WebPageInspection["resources"];
@@ -85,6 +86,11 @@ export const capturePage = async (
       "Raw network headers, bodies, cookies, storage values, console objects, and WebSocket payloads are never retained; explicitly requested primitive console text is retained verbatim, while payload captures retain value-free shapes.",
       "Source maps are reported only as declarative URLs and are not fetched.",
       "URL-less scripts and console events without an allowed source URL are excluded because their origin cannot be proven.",
+      ...(context.target.attached === null
+        ? [
+            "CDP discovery omitted the target attachment state; attached is reported as unknown.",
+          ]
+        : []),
     ],
     startedAt: new Date().toISOString(),
   };
@@ -149,6 +155,13 @@ const captureAuthorizedPage = async (
   );
   if (!input.include_storage_keys)
     state.events.completeness.exclude("storage_keys", "not_approved", null);
+  else if (storageCapture.keysExclusion !== undefined)
+    state.events.completeness.exclude(
+      "storage_keys",
+      storageCapture.keysExclusion,
+      null,
+    );
+  await report(context.progress, 3, "Normalizing browser evidence");
   const completedFrameResult = await authorizedMainFrame({
     connection: context.connection,
     sessionId: context.sessionId,
@@ -161,7 +174,11 @@ const captureAuthorizedPage = async (
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   if (state.events.navigationDuringCapture || completedUrl !== attachedUrl)
     throw new BrowserObservationError("inspect_web_page", "target_changed");
-  await report(context.progress, 3, "Normalizing browser evidence");
+  // Body IDs were enumerated before asynchronous CDP reads. Events remain
+  // enabled through the final capture, so account for eligible responses that
+  // arrived while those reads were pending.
+  state.events.settleUnexaminedResponseBodies();
+  state.events.recordScriptMetadataBudgetExclusions();
   return {
     inspection: normalizedInspection(state, {
       attachedUrl,
@@ -180,21 +197,43 @@ const captureAuthorizedPage = async (
 const captureJsonResponseBodies = async (
   state: CaptureState,
 ): Promise<void> => {
-  const requestIds = state.events.responseBodyRequestIds();
-  for (let index = 0; index < requestIds.length; index += 1) {
-    const requestId = requestIds[index];
-    if (requestId === undefined) continue;
-    const result = await optionalCdpCommand(
-      state.context,
-      "Network.getResponseBody",
-      { requestId },
-      state.limitations,
-    );
-    if (result !== undefined) {
-      state.events.ingestResponseBody(requestId, result);
+  const requests = state.events.responseBodyRequests();
+  for (let index = 0; index < requests.length; index += 1) {
+    const candidate = requests[index];
+    if (candidate === undefined) continue;
+    const current = state.events.currentResponseBodyRequest(candidate);
+    if (current === undefined) continue;
+    if (current.encoded_data_length === null) {
+      state.events.responseBodyUnavailable(candidate);
       continue;
     }
-    for (const remaining of requestIds.slice(index))
+    let result: unknown;
+    try {
+      result = await optionalCdpCommand(
+        state.context,
+        "Network.getResponseBody",
+        { requestId: candidate.requestId },
+        state.limitations,
+      );
+    } catch (cause: unknown) {
+      if (
+        !(cause instanceof CdpCommandRejection) ||
+        cause.command !== "Network.getResponseBody" ||
+        cause.code !== -32_000 ||
+        cause.reportedMessage === null
+      )
+        throw cause;
+      state.events.responseBodyUnavailable(candidate);
+      state.limitations.push(
+        `Response body unavailable for request ${candidate.requestId}: ${cause.userMessage}`,
+      );
+      continue;
+    }
+    if (result !== undefined) {
+      state.events.ingestResponseBody(candidate, result);
+      continue;
+    }
+    for (const remaining of requests.slice(index))
       state.events.responseBodyUnavailable(remaining);
     return;
   }
@@ -229,9 +268,7 @@ const authorizeObservationWindow = async (
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
 };
 
-const capturePageDom = async (
-  state: CaptureState,
-): Promise<ReturnType<typeof captureDom>> => {
+const capturePageDom = async (state: CaptureState): Promise<DomCapture> => {
   const { context, allowedOrigins } = state;
   const result = await context.connection.send(
     "DOMSnapshot.captureSnapshot",
@@ -243,12 +280,56 @@ const capturePageDom = async (
     context.sessionId,
     context.signal,
   );
-  return captureDom(
+  const capture = captureDom(
     result,
     allowedOrigins,
     context.input,
     state.events.completeness,
   );
+  let step = capture.next();
+  let descriptionUnavailable = false;
+  const pendingController = new AbortController();
+  const signal =
+    context.signal === undefined
+      ? pendingController.signal
+      : AbortSignal.any([context.signal, pendingController.signal]);
+  while (!step.done) {
+    const pending = step.value.map(async (query) => {
+      if (descriptionUnavailable) return undefined;
+      try {
+        return capturedSvgNodeKind(
+          query,
+          await context.connection.send(
+            "DOM.describeNode",
+            { backendNodeId: query.backendNodeId, depth: 0 },
+            context.sessionId,
+            signal,
+          ),
+        );
+      } catch (cause: unknown) {
+        // A detached node can disappear between snapshot and description.
+        // Preserve partial metadata, but propagate transport/cancellation errors.
+        if (!(cause instanceof CdpCommandRejection)) throw cause;
+        if (cause.code === -32_601) descriptionUnavailable = true;
+        else if (cause.code !== -32_000) throw cause;
+        return undefined;
+      }
+    });
+    try {
+      // Promise.all preserves snapshot order even when CDP replies out of order.
+      step = capture.next(await Promise.all(pending));
+    } catch (cause: unknown) {
+      // Stop and settle this bounded batch before the session can be detached.
+      pendingController.abort();
+      await Promise.allSettled(pending);
+      throw cause;
+    }
+  }
+  if (step.value.unresolvedSvgNodes > 0)
+    state.limitations.push(
+      `SVG identity was unavailable for ${String(step.value.unresolvedSvgNodes)} snapshotted XLink candidate nodes; their URL destinations remain unknown.`,
+    );
+  return step.value;
 };
 
 const normalizedInspection = (
@@ -278,7 +359,7 @@ const normalizedInspection = (
   resources: [...captured.resources],
   network: {
     requests: [...state.events.network.values()],
-    websocket_events: [...state.events.websockets],
+    websocket_connections: [...state.events.webSocketConnectionsById.values()],
     coverage_started_at: state.startedAt,
     prior_activity_available: false,
   },

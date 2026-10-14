@@ -7,7 +7,13 @@ import {
   type WindowsNativeLoadHost,
 } from "./WindowsNativeLoader.js";
 
-const fixture = () => {
+const fixture = (
+  capabilities: {
+    protocolStdin?: boolean;
+    jobMemoryLimit?: unknown;
+    privateBridgeDescriptorAccess?: unknown;
+  } = {},
+) => {
   const bytes = Buffer.alloc(128);
   bytes.write("MZ");
   bytes.writeUInt32LE(64, 0x3c);
@@ -49,8 +55,10 @@ const fixture = () => {
           architecture: "x64",
           filesystem: identity,
           privateDacl: true,
+          privateBridgeDescriptorAccess: true,
           atomicJobAssignment: true,
           killOnOwnerClose: true,
+          ...capabilities,
         }),
       };
     },
@@ -59,6 +67,38 @@ const fixture = () => {
 };
 
 describe("packaged Windows native admission", () => {
+  it.each([true, false])(
+    "preserves protocol stdin capability %s alongside existing job controls",
+    (protocolStdin) => {
+      const value = fixture({ protocolStdin });
+      expect(loadWindowsNativeAuthority(value.host)).toMatchObject({
+        available: true,
+        authority: {
+          inspection: {
+            protocolStdin,
+            atomicJobAssignment: true,
+            killOnOwnerClose: true,
+          },
+        },
+      });
+    },
+  );
+  it("admits the Job Object memory limit control only as an affirmative observation", () => {
+    expect(
+      loadWindowsNativeAuthority(fixture({ jobMemoryLimit: true }).host),
+    ).toMatchObject({
+      available: true,
+      authority: { inspection: { jobMemoryLimit: true } },
+    });
+    // Earlier artifacts omit the control; callers must refuse a limit then.
+    const earlier = loadWindowsNativeAuthority(fixture().host);
+    if (!earlier.available) throw new Error(earlier.reason);
+    expect(earlier.authority.inspection.jobMemoryLimit).toBeUndefined();
+    expect(
+      loadWindowsNativeAuthority(fixture({ jobMemoryLimit: false }).host)
+        .available,
+    ).toBe(false);
+  });
   it("loads only after compatibility and digest checks, preserving producer identity", () => {
     const value = fixture();
     expect(loadWindowsNativeAuthority(value.host)).toMatchObject({
@@ -71,24 +111,28 @@ describe("packaged Windows native admission", () => {
   });
 
   it.each([
-    { platform: "linux" as const },
-    { architecture: "arm64" },
-    { nodeApiVersion: "7" },
-    { nodeApiVersion: undefined },
-    { packageVersion: "2.0.0" },
-  ])("rejects incompatible host metadata before loading: %j", (override) => {
-    const value = fixture();
-    expect(
-      loadWindowsNativeAuthority({ ...value.host, ...override }).available,
-    ).toBe(false);
-    expect(value.loads()).toBe(0);
-  });
+    [{ platform: "linux" as const }, "host"],
+    [{ architecture: "arm64" }, "host"],
+    [{ nodeApiVersion: "7" }, "host"],
+    [{ nodeApiVersion: undefined }, "host"],
+    [{ packageVersion: "2.0.0" }, "artifact"],
+  ] as const)(
+    "rejects incompatible host metadata before loading: %j",
+    (override, failureStage) => {
+      const value = fixture();
+      expect(
+        loadWindowsNativeAuthority({ ...value.host, ...override }),
+      ).toMatchObject({ available: false, failureStage });
+      expect(value.loads()).toBe(0);
+    },
+  );
 
   it("rejects tampering even when the original file was a valid PE image", () => {
     const value = fixture();
     value.bytes[127] = 1;
     expect(loadWindowsNativeAuthority(value.host)).toMatchObject({
       available: false,
+      failureStage: "artifact",
       reason: expect.stringContaining("SHA-256"),
     });
     expect(value.loads()).toBe(0);
@@ -104,6 +148,22 @@ describe("packaged Windows native admission", () => {
           readManifest: () => ({ ...value.manifest, [key]: "invalid" }),
         }).available,
       ).toBe(false);
+      expect(value.loads()).toBe(0);
+    },
+  );
+
+  it.each([
+    { signature: "MZ", offset: 0 },
+    { signature: "PE", offset: 64 },
+  ])(
+    "rejects digest-valid high-bit $signature lookalikes before loading",
+    ({ offset }) => {
+      const value = fixture();
+      value.bytes[offset] = (value.bytes[offset] ?? 0) | 0x80;
+      value.manifest.artifactSha256 = createHash("sha256")
+        .update(value.bytes)
+        .digest("hex");
+      expect(loadWindowsNativeAuthority(value.host).available).toBe(false);
       expect(value.loads()).toBe(0);
     },
   );
@@ -134,17 +194,28 @@ describe("packaged Windows native admission", () => {
       }),
     ).toMatchObject({
       available: false,
+      failureStage: "self-test",
+      retryable: true,
       reason: expect.stringContaining("private DACL: access denied"),
     });
   });
 
   it("requires every inspected native fact", () => {
     const value = fixture();
-    expect(
-      loadWindowsNativeAuthority({
-        ...value.host,
-        loadArtifact: () => ({ call: () => ({ privateDacl: true }) }),
-      }).available,
-    ).toBe(false);
+    const loaded = loadWindowsNativeAuthority({
+      ...value.host,
+      loadArtifact: () => ({ call: () => ({ privateDacl: true }) }),
+    });
+    expect(loaded.available).toBe(false);
+    expect(loaded).toMatchObject({ failureStage: "inspection" });
+    expect(loaded).not.toHaveProperty("retryable");
+  });
+
+  it("rejects Windows controls without handle-bound Cutter descriptor access", () => {
+    const value = fixture({ privateBridgeDescriptorAccess: undefined });
+    expect(loadWindowsNativeAuthority(value.host)).toMatchObject({
+      available: false,
+      reason: expect.stringContaining("privateBridgeDescriptorAccess"),
+    });
   });
 });

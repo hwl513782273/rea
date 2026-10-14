@@ -25,11 +25,18 @@ describe("native module syntax observations", () => {
         item.expression,
       );
   });
-  it("excludes erased TypeScript imports/exports and bundler inference", () => {
+  it("excludes whole type declarations and retains inline type dependency syntax", () => {
     const result = collectWebModuleImports(
       'import type {T} from "types"; import {type X} from "also-types"; export type {T} from "export-types"; export {type Y} from "only-types"; import {type T, value} from "mixed"; __webpack_require__.e(4); __vitePreload(() => 1, ["chunk.js"]);',
     );
-    expect(result.imports.map((item) => item.specifier)).toEqual(["mixed"]);
+    expect(result.imports.map((item) => item.specifier)).toEqual([
+      "also-types",
+      "only-types",
+      "mixed",
+    ]);
+    expect(result.diagnostics).toContain(
+      "Compiler options are unavailable; inline type-only imports or re-exports may preserve a module side-effect dependency.",
+    );
   });
   it("uses UTF-16 source locations after astral characters", () => {
     const source = 'const emoji = "😀";\nimport "./x.js";';
@@ -141,5 +148,21 @@ describe("captured module candidates", () => {
         candidates.map((item) => item.script),
       ),
     ).toEqual([]);
+  });
+  it("retains exact non-URL identities without matching response fragments", () => {
+    const scripts = [
+      script("relative/module.js#part", "page-script"),
+      script("relative/module.js#part", "scenario-response"),
+      script("relative/module.js", "scenario-response"),
+    ];
+    expect(
+      matchCapturedModules("relative/module.js#part", scripts).map((item) => [
+        item.script_index,
+        item.match,
+      ]),
+    ).toEqual([
+      [0, "exact-reported-url"],
+      [1, "exact-reported-url"],
+    ]);
   });
 });

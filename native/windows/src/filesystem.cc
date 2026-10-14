@@ -1,6 +1,7 @@
 #include "authority.hpp"
 #include <sddl.h>
 #include <winternl.h>
+#include <cstddef>
 
 namespace rea {
 
@@ -60,7 +61,8 @@ static Handle openComponent(const std::wstring& path, DWORD access, bool directo
   return handle;
 }
 
-std::unique_ptr<File> openFile(const std::wstring& requested, DWORD access, bool directory) {
+std::unique_ptr<File> openFile(const std::wstring& requested, DWORD access, bool directory,
+                               DWORD finalSharing) {
   auto result = std::make_unique<File>(localPath(requested));
   result->requestedPath = requested;
   const auto& path = result->path;
@@ -76,7 +78,8 @@ std::unique_ptr<File> openFile(const std::wstring& requested, DWORD access, bool
   while (offset < path.size()) {
     auto end = path.find(L'\\', offset);
     const bool final = end == std::wstring::npos;
-    auto child = openComponent(path.substr(0, end), final ? access : 0, !final || directory);
+    auto child = openComponent(path.substr(0, end), final ? access : 0, !final || directory,
+                               final ? finalSharing : FILE_SHARE_READ);
     // Once the next component is pinned against deletion, its parent cannot
     // become empty and NTFS cannot convert that parent into a reparse point.
     // Relax only ancestor write sharing so unrelated child renames can proceed.
@@ -165,7 +168,9 @@ static Handle createRelative(HANDLE parent, const std::wstring& name, DWORD acce
   IO_STATUS_BLOCK observation{};
   HANDLE raw = INVALID_HANDLE_VALUE;
   const auto status = NtCreateFile(&raw, access | SYNCHRONIZE, &attributes, &observation, nullptr,
-                                   FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE,
+                                   FILE_ATTRIBUTE_NORMAL,
+                                   directory ? FILE_SHARE_READ | FILE_SHARE_DELETE : FILE_SHARE_READ,
+                                   FILE_CREATE,
                                    FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT |
                                    (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE), nullptr, 0);
   if (status < 0) throw Failure("Create private object relative to its admitted parent failed", path,
@@ -173,6 +178,30 @@ static Handle createRelative(HANDLE parent, const std::wstring& name, DWORD acce
   Handle result(raw);
   require(result.valid() && observation.Information == FILE_CREATED,
           "Private creation did not return a new object handle", path, ERROR_ACCESS_DENIED);
+  return result;
+}
+
+// Lookup relative to an already-owned directory; path is diagnostic only.
+static Handle openRelative(HANDLE parent, const std::wstring& name, DWORD access,
+                           DWORD sharing, ULONG kind, const std::wstring& path) {
+  require(!name.empty() && name.find_first_of(L"\\/:\"<>|?*") == std::wstring::npos && name.size() < 32768,
+          "Private lookup requires one filename component", path, ERROR_INVALID_PARAMETER);
+  UNICODE_STRING coordinate{};
+  coordinate.Buffer = const_cast<wchar_t*>(name.data());
+  coordinate.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+  coordinate.MaximumLength = coordinate.Length;
+  OBJECT_ATTRIBUTES attributes;
+  InitializeObjectAttributes(&attributes, &coordinate, OBJ_CASE_INSENSITIVE, parent, nullptr);
+  IO_STATUS_BLOCK observation{};
+  HANDLE raw = INVALID_HANDLE_VALUE;
+  const auto status = NtCreateFile(&raw, access | SYNCHRONIZE, &attributes, &observation,
+                                   nullptr, FILE_ATTRIBUTE_NORMAL, sharing, FILE_OPEN,
+                                   FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT | kind, nullptr, 0);
+  if (status < 0)
+    throw Failure("Open private object relative to its directory handle failed", path,
+                  RtlNtStatusToDosError(status));
+  Handle result(raw);
+  require(result.valid(), "Private lookup returned an invalid handle", path);
   return result;
 }
 
@@ -211,17 +240,117 @@ static void verifyPrivate(HANDLE handle, const std::wstring& path, bool root) {
   require(user && system, "Private DACL must allow only current user and SYSTEM", path, ERROR_ACCESS_DENIED);
 }
 
+static std::unique_ptr<File> openPrivateBridgeDirectory(const std::wstring& path) {
+  // The retained runtime root handle carries DELETE authority for owned
+  // cleanup. Windows checks sharing in both directions, so this read-only
+  // inspection handle must share DELETE even though it requests no such right.
+  auto directory = openFile(path, FILE_LIST_DIRECTORY, true,
+                            FILE_SHARE_READ | FILE_SHARE_DELETE);
+  verifyPrivate(directory->get(), path, true);
+  return directory;
+}
+
+static Handle openPrivateBridgeDescriptor(HANDLE parent, const std::wstring& name,
+                                          const std::wstring& path) {
+  require(!name.empty() && name.find_first_of(L"\\/:\"<>|?*") == std::wstring::npos &&
+          name != L"." && name != L".." && name.size() <= 255,
+          "Private descriptor requires one filename component", path, ERROR_INVALID_PARAMETER);
+  UNICODE_STRING coordinate{};
+  coordinate.Buffer = const_cast<wchar_t*>(name.data());
+  coordinate.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+  coordinate.MaximumLength = coordinate.Length;
+  OBJECT_ATTRIBUTES attributes;
+  InitializeObjectAttributes(&attributes, &coordinate, OBJ_CASE_INSENSITIVE, parent, nullptr);
+  IO_STATUS_BLOCK observation{};
+  HANDLE raw = INVALID_HANDLE_VALUE;
+  // Immutable runtime files retain their original writer handle so later
+  // opens cannot acquire write or delete access. This read-only handle must
+  // share those granted rights for Windows' symmetric share check to pass.
+  const auto status = NtCreateFile(&raw, GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                   &attributes, &observation, nullptr, FILE_ATTRIBUTE_NORMAL,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+                                   FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT |
+                                       FILE_NON_DIRECTORY_FILE,
+                                   nullptr, 0);
+  if (status < 0)
+    throw Failure("Open Cutter bridge descriptor relative to its verified directory failed", path,
+                  RtlNtStatusToDosError(status));
+  Handle descriptor(raw);
+  require(descriptor.valid() && observation.Information == FILE_OPENED,
+          "Cutter bridge descriptor was not opened as an existing file", path, ERROR_ACCESS_DENIED);
+  FILE_STANDARD_INFO standard{};
+  require(GetFileInformationByHandleEx(descriptor.get(), FileStandardInfo, &standard, sizeof(standard)),
+          "Read Cutter bridge descriptor metadata failed", path);
+  require(!standard.Directory && standard.EndOfFile.QuadPart >= 0 &&
+              standard.EndOfFile.QuadPart <= 64 * 1024,
+          "Cutter bridge descriptor exceeds its byte limit or is not a file", path, ERROR_FILE_TOO_LARGE);
+  FILE_ATTRIBUTE_TAG_INFO fileAttributes{};
+  require(GetFileInformationByHandleEx(descriptor.get(), FileAttributeTagInfo, &fileAttributes, sizeof(fileAttributes)),
+          "Read Cutter bridge descriptor attributes failed", path);
+  require((fileAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+          "Cutter bridge descriptor cannot be a reparse point", path, ERROR_REPARSE_TAG_INVALID);
+  verifyPrivate(descriptor.get(), path, false);
+  return descriptor;
+}
+
+static napi_value verifyCutterBridgeDirectory(napi_env env, const std::vector<napi_value>& args) {
+  require(args.size() == 1, "Cutter bridge directory verification requires one path", L"",
+          ERROR_INVALID_PARAMETER);
+  const auto path = wide(env, args[0]);
+  const auto directory = openPrivateBridgeDirectory(path);
+  auto result = object(env);
+  set(env, result, "privateDacl", boolean(env, true));
+  set(env, result, "identity", identity(env, directory->get(), path));
+  return result;
+}
+
+static napi_value readCutterBridgeDescriptor(napi_env env, const std::vector<napi_value>& args) {
+  require(args.size() == 3, "Cutter bridge descriptor read requires directory, name, and byte limit", L"",
+          ERROR_INVALID_PARAMETER);
+  const auto path = wide(env, args[0]);
+  const auto name = wide(env, args[1]);
+  const double maximum = numeric(env, args[2]);
+  require(maximum >= 1 && maximum <= 64 * 1024 && maximum == static_cast<size_t>(maximum),
+          "Cutter bridge descriptor limit is outside the supported range", path, ERROR_INVALID_PARAMETER);
+  auto directory = openPrivateBridgeDirectory(path);
+  auto descriptor = openPrivateBridgeDescriptor(directory->get(), name, path + L"\\" + name);
+  FILE_STANDARD_INFO standard{};
+  require(GetFileInformationByHandleEx(descriptor.get(), FileStandardInfo, &standard, sizeof(standard)),
+          "Read Cutter bridge descriptor size failed", path);
+  require(standard.EndOfFile.QuadPart <= maximum,
+          "Cutter bridge descriptor exceeds the requested byte limit", path, ERROR_FILE_TOO_LARGE);
+  std::vector<unsigned char> bytes(static_cast<size_t>(standard.EndOfFile.QuadPart));
+  size_t offset = 0;
+  while (offset < bytes.size()) {
+    DWORD count = 0;
+    const DWORD requested = static_cast<DWORD>(std::min<size_t>(bytes.size() - offset, MAXDWORD));
+    require(ReadFile(descriptor.get(), bytes.data() + offset, requested, &count, nullptr) && count > 0,
+            "Read Cutter bridge descriptor through its verified handle failed", path);
+    offset += count;
+  }
+  napi_value result;
+  const void* source = bytes.empty() ? static_cast<const void*>("") : bytes.data();
+  check(napi_create_buffer_copy(env, bytes.size(), source, nullptr, &result));
+  return result;
+}
+
 std::unique_ptr<Runtime> createRuntime(const std::wstring& parentPath, const std::wstring& prefix) {
-  auto parent = openFile(parentPath, 0, true);
+  std::unique_ptr<File> parent;
+  try { parent = openFile(parentPath, 0, true); }
+  catch (Failure& failure) {
+    failure.runtimeDirectoryUnallocated = true;
+    throw;
+  }
   require(!prefix.empty() && prefix.find_first_of(L"\\/:\"<>|?*") == std::wstring::npos,
           "Runtime prefix must be one filename component", parentPath, ERROR_INVALID_PARAMETER);
   std::array<unsigned char, 16> random;
   require(BCryptGenRandom(nullptr, random.data(), random.size(), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0,
           "Generate runtime identity failed", parentPath, ERROR_GEN_FAILURE);
   auto result = std::make_unique<Runtime>();
-  result->path = parent->path + L"\\" + prefix + hex(random.data(), random.size());
+  const auto name = prefix + hex(random.data(), random.size());
+  result->path = parent->path + (parent->path.back() == L'\\' ? L"" : L"\\") + name;
   Security security;
-  result->directory = createRelative(parent->get(), prefix + hex(random.data(), random.size()),
+  result->directory = createRelative(parent->get(), name,
                                      DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
                                      true, security, result->path);
   try {
@@ -252,7 +381,16 @@ static std::unique_ptr<File> runtimeDirectory(Runtime& root, const std::wstring&
   size_t offset = root.path.size() + 1;
   while (offset < path.size()) {
     const auto end = path.find(L'\\', offset);
-    result->handles.push_back(openComponent(path.substr(0, end), 0, true));
+    const auto name = path.substr(offset, end == std::wstring::npos ? end : end - offset);
+    auto child = openRelative(result->get(), name,
+                              FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                              FILE_SHARE_READ, FILE_DIRECTORY_FILE, path.substr(0, end));
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    require(GetFileInformationByHandleEx(child.get(), FileAttributeTagInfo, &info, sizeof(info)),
+            "Read private directory tag failed", path);
+    require((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+            "Reparse private directory is unsupported", path, ERROR_NOT_SUPPORTED);
+    result->handles.push_back(std::move(child));
     if (end == std::wstring::npos) break;
     offset = end + 1;
   }
@@ -277,14 +415,15 @@ static void directory(Runtime& root, const std::wstring& relative) {
   }
 }
 
-static Handle createPrivateFile(Runtime& root, const std::wstring& relative) {
+static Handle createPrivateFile(Runtime& root, const std::wstring& relative,
+                                DWORD access = DELETE | GENERIC_WRITE | GENERIC_READ | READ_CONTROL) {
   const auto path = relativePath(root, relative);
   const auto parentPath = path.substr(0, path.find_last_of(L'\\'));
   auto parent = runtimeDirectory(root, parentPath);
   verifyPrivate(parent->get(), parentPath, parentPath == root.path);
   Security security;
   auto file = createRelative(parent->get(), path.substr(path.find_last_of(L'\\') + 1),
-                             DELETE | GENERIC_WRITE | GENERIC_READ | READ_CONTROL, false, security, path);
+                              access, false, security, path);
   verifyPrivate(file.get(), path, false);
   return file;
 }
@@ -305,31 +444,80 @@ static void dispose(HANDLE handle, const std::wstring& path) {
   require(SetFileInformationByHandle(handle, FileDispositionInfo, &deletion, sizeof(deletion)), "Delete owned object by handle failed", path);
 }
 
+static void disposeSnapshot(Runtime& root, Handle& file, const std::wstring& path) {
+  // Snapshot readers do not share DELETE access. Release the writer only for
+  // failed-copy cleanup, with its parent pinned and its identity recorded.
+  auto parent = runtimeDirectory(root, path.substr(0, path.find_last_of(L'\\')));
+  FILE_ID_INFO expected{};
+  require(GetFileInformationByHandleEx(file.get(), FileIdInfo, &expected, sizeof(expected)),
+          "Read incomplete snapshot identity failed", path);
+  file.reset();
+  auto cleanup = openRelative(parent->get(), path.substr(path.find_last_of(L'\\') + 1),
+                              DELETE | GENERIC_READ | FILE_WRITE_ATTRIBUTES,
+                              FILE_SHARE_READ, FILE_NON_DIRECTORY_FILE, path);
+  FILE_ID_INFO observed{};
+  require(GetFileInformationByHandleEx(cleanup.get(), FileIdInfo, &observed, sizeof(observed)),
+          "Read snapshot cleanup identity failed", path);
+  require(expected.VolumeSerialNumber == observed.VolumeSerialNumber &&
+          std::equal(std::begin(expected.FileId.Identifier), std::end(expected.FileId.Identifier),
+                     std::begin(observed.FileId.Identifier)),
+          "Incomplete snapshot identity changed before cleanup", path, ERROR_ACCESS_DENIED);
+  verifyPrivate(cleanup.get(), path, false);
+  dispose(cleanup.get(), path);
+}
+
 void closeRuntime(Runtime& root) {
   if (root.closed) return;
+  root.closing = true;
   // Windows keeps the bearer descriptor and snapshot leases until this owner
   // cleanup. POSIX removes its consumed descriptor earlier. Abrupt owner death
   // closes process jobs but cannot run this walk, so private files can remain.
   root.immutableFiles.clear();
-  struct ReleaseRuntime {
-    Runtime& root;
-    ~ReleaseRuntime() { root.directory.reset(); root.parents.clear(); root.closed = true; }
-  } release{root};
-  // Each traversed directory stays locked against replacement. Reparse entries
-  // are unlinked as objects; their targets are never enumerated or deleted.
+  // Enumerate and open children through the retained directory handles. Paths
+  // below are diagnostic labels only: renames and ancestor junction replacement
+  // cannot redirect cleanup into an unrelated tree.
   struct Frame {
     Handle directory;
-    HANDLE search = INVALID_HANDLE_VALUE;
     std::wstring path;
-    WIN32_FIND_DATAW next{};
-    bool pending = false;
-    Frame(Handle handle, std::wstring path) : directory(std::move(handle)), path(std::move(path)) {
-      search = FindFirstFileExW((L"\\\\?\\" + this->path + L"\\*").c_str(), FindExInfoBasic, &next,
-                               FindExSearchNameMatch, nullptr, 0);
-      pending = search != INVALID_HANDLE_VALUE;
-      require(pending || GetLastError() == ERROR_FILE_NOT_FOUND, "Enumerate runtime cleanup failed", this->path);
+    // One NTFS component is at most 255 UTF-16 units; 1 KiB fits a record
+    // without retaining a large batch at every directory depth.
+    alignas(FILE_ID_BOTH_DIR_INFO) std::array<unsigned char, 1024> entries{};
+    size_t offset = 0;
+    bool buffered = false;
+    bool restart = true;
+    Frame(Handle handle, std::wstring path) : directory(std::move(handle)), path(std::move(path)) {}
+    bool next(std::wstring& name) {
+      for (;;) {
+        if (!buffered) {
+          const auto kind = restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
+          restart = false;
+          if (!GetFileInformationByHandleEx(directory.get(), kind, entries.data(),
+                                            static_cast<DWORD>(entries.size()))) {
+            const auto code = GetLastError();
+            if (code == ERROR_NO_MORE_FILES) return false;
+            throw Failure("Enumerate runtime cleanup by handle failed", path, code);
+          }
+          offset = 0;
+          buffered = true;
+        }
+        require(offset <= entries.size() - offsetof(FILE_ID_BOTH_DIR_INFO, FileName),
+                "Cleanup directory record is truncated", path, ERROR_INVALID_DATA);
+        const auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(entries.data() + offset);
+        require(entry->FileNameLength % sizeof(wchar_t) == 0 &&
+                entry->FileNameLength <= entries.size() - offset - offsetof(FILE_ID_BOTH_DIR_INFO, FileName),
+                "Cleanup directory filename is truncated", path, ERROR_INVALID_DATA);
+        name.assign(entry->FileName, entry->FileNameLength / sizeof(wchar_t));
+        if (entry->NextEntryOffset == 0) buffered = false;
+        else {
+          require(entry->NextEntryOffset % alignof(FILE_ID_BOTH_DIR_INFO) == 0 &&
+                  entry->NextEntryOffset >= offsetof(FILE_ID_BOTH_DIR_INFO, FileName) + entry->FileNameLength &&
+                  entry->NextEntryOffset <= entries.size() - offset - offsetof(FILE_ID_BOTH_DIR_INFO, FileName),
+                  "Cleanup directory record offset is invalid", path, ERROR_INVALID_DATA);
+          offset += entry->NextEntryOffset;
+        }
+        if (name != L"." && name != L"..") return true;
+      }
     }
-    ~Frame() { if (search != INVALID_HANDLE_VALUE) FindClose(search); }
   };
   std::vector<std::unique_ptr<Frame>> frames;
   HANDLE duplicate;
@@ -338,27 +526,26 @@ void closeRuntime(Runtime& root) {
   frames.push_back(std::make_unique<Frame>(Handle(duplicate), root.path));
   while (!frames.empty()) {
     auto& frame = *frames.back();
-    if (!frame.pending) {
-      if (frame.search != INVALID_HANDLE_VALUE) { FindClose(frame.search); frame.search = INVALID_HANDLE_VALUE; }
+    std::wstring name;
+    if (!frame.next(name)) {
       dispose(frame.directory.get(), frame.path);
       frames.pop_back();
       continue;
     }
-    const auto name = std::wstring(frame.next.cFileName);
-    frame.pending = FindNextFileW(frame.search, &frame.next) != FALSE;
-    require(frame.pending || GetLastError() == ERROR_NO_MORE_FILES, "Continue runtime cleanup enumeration failed", frame.path);
-    if (name == L"." || name == L"..") continue;
     const auto path = frame.path + L"\\" + name;
-    Handle child(CreateFileW((L"\\\\?\\" + path).c_str(), DELETE | GENERIC_READ | FILE_WRITE_ATTRIBUTES,
-                            FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-    require(child.valid(), "Open owned cleanup object failed", path);
+    auto child = openRelative(frame.directory.get(), name,
+                              DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, 0, path);
     FILE_ATTRIBUTE_TAG_INFO info{};
     require(GetFileInformationByHandleEx(child.get(), FileAttributeTagInfo, &info, sizeof(info)), "Read cleanup object tag failed", path);
     if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 && (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0)
       frames.push_back(std::make_unique<Frame>(std::move(child), path));
     else dispose(child.get(), path);
   }
+  // Failed walks retain the root's identity leases for a later cleanup retry.
+  root.directory.reset();
+  root.parents.clear();
+  root.closed = true;
 }
 
 struct SnapshotWork {
@@ -414,8 +601,7 @@ static void completeSnapshot(napi_env env, napi_status status, void* pointer) {
   work->root->snapshotPending = false;
   const auto reject = [&](const Failure& failure) {
     try {
-      dispose(work->destination.get(), work->path);
-      work->destination.reset();
+      disposeSnapshot(*work->root, work->destination, work->path);
       napi_reject_deferred(env, work->deferred, failureValue(env, failure));
     } catch (const Failure& cleanupFailure) {
       const Failure combined(
@@ -447,7 +633,9 @@ static napi_value snapshot(napi_env env, napi_value rootValue, Runtime& root,
   auto work = std::make_unique<SnapshotWork>(env, root);
   work->source = openFile(sourcePath);
   work->path = relativePath(root, relative);
-  work->destination = createPrivateFile(root, relative);
+  // Retain the write lease with read-only sharing, but omit DELETE authority:
+  // Java's RandomAccessFile reader shares read/write, not delete access.
+  work->destination = createPrivateFile(root, relative, GENERIC_WRITE | GENERIC_READ | READ_CONTROL);
   napi_value promise;
   check(napi_create_promise(env, &work->deferred, &promise));
   check(napi_create_reference(env, rootValue, 1, &work->rootReference));
@@ -467,6 +655,8 @@ static napi_value snapshot(napi_env env, napi_value rootValue, Runtime& root,
 }
 
 napi_value filesystemCall(napi_env env, const std::wstring& operation, const std::vector<napi_value>& args) {
+  if (operation == L"cutter_bridge_verify_directory") return verifyCutterBridgeDirectory(env, args);
+  if (operation == L"cutter_bridge_read_descriptor") return readCutterBridgeDescriptor(env, args);
   const auto expected = operation == L"open" || operation == L"close" || operation == L"runtime_close" || operation == L"runtime_snapshot_cancel" ? 1
                       : operation == L"runtime_create" || operation == L"runtime_mkdir" || operation == L"runtime_open" ? 2 : 3;
   require(args.size() == static_cast<size_t>(expected), "Wrong native filesystem argument count", L"", ERROR_INVALID_PARAMETER);
@@ -506,6 +696,7 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation, const std
     return result;
   }
   auto& root = static_cast<Runtime&>(resource(env, args[0], Kind::Runtime));
+  require(!root.closing || operation == L"runtime_close", "Runtime cleanup is pending", root.path, ERROR_BUSY);
   if (operation == L"runtime_snapshot_cancel") { root.snapshotCancelled.store(true); return null(env); }
   require(!root.snapshotPending, "Runtime snapshot is still pending", root.path, ERROR_BUSY);
   // Reject overlapping operations before snapshot() resets cancellation. The
@@ -521,9 +712,16 @@ napi_value filesystemCall(napi_env env, const std::wstring& operation, const std
     // must share both to pass Windows' symmetric share check. Those retained
     // handles still omit FILE_SHARE_WRITE and FILE_SHARE_DELETE, blocking
     // competing writes and delete opens.
-    file->handles.push_back(openComponent(path, GENERIC_READ, false,
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                              FILE_SHARE_DELETE));
+    auto child = openRelative(file->get(), path.substr(path.find_last_of(L'\\') + 1),
+                              GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              FILE_NON_DIRECTORY_FILE, path);
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    require(GetFileInformationByHandleEx(child.get(), FileAttributeTagInfo, &info, sizeof(info)),
+            "Read private file tag failed", path);
+    require((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+            "Reparse private file is unsupported", path, ERROR_NOT_SUPPORTED);
+    file->handles.push_back(std::move(child));
     verifyPrivate(file->get(), path, false);
     auto result = identity(env, file->get(), path);
     set(env, result, "handle", wrap(env, std::move(file)));

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
@@ -8,10 +11,15 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { parseEvidence } from "../../dist/domain/evidence.js";
 import { analysisProfileSchema } from "../../dist/domain/analysisProfile.js";
 import { nativeValueTraceSchema } from "../../dist/domain/native/nativeValueTrace.js";
+import { requireMcpLifecycleResult } from "./mcp-verifier-results.mjs";
+import { verifyGhidraBoundaries } from "./real-ghidra-boundaries.mjs";
 
 const defaultEntrypoint = fileURLToPath(new URL("../rea.mjs", import.meta.url));
 const environment = () => ({
   PATH: process.env.PATH ?? "/usr/bin:/bin",
+  ...(process.env.NODE_OPTIONS === undefined
+    ? {}
+    : { NODE_OPTIONS: process.env.NODE_OPTIONS }),
   REA_LOG_LEVEL: "silent",
   REA_ANALYSIS_PROVIDER: "ghidra",
   HOPPER_LAUNCHER_PATH: "/rea-unconfigured-deep-provider/hopper",
@@ -21,6 +29,15 @@ const environment = () => ({
   ...(process.env.JAVA_HOME === undefined
     ? {}
     : { JAVA_HOME: process.env.JAVA_HOME }),
+  ...(process.env.GHIDRA_HEADLESS_MAXMEM === undefined
+    ? {}
+    : { GHIDRA_HEADLESS_MAXMEM: process.env.GHIDRA_HEADLESS_MAXMEM }),
+  ...(process.env.GHIDRA_MAXMEM === undefined
+    ? {}
+    : { GHIDRA_MAXMEM: process.env.GHIDRA_MAXMEM }),
+  ...(process.env._JAVA_OPTIONS === undefined
+    ? {}
+    : { _JAVA_OPTIONS: process.env._JAVA_OPTIONS }),
 });
 
 const verifyGraph = (input, target, procedure, globalAddress) => {
@@ -73,6 +90,33 @@ export async function verifyNativeValueE2e(
   globalAddress,
   { entrypoint = defaultEntrypoint } = {},
 ) {
+  const workspace = await mkdtemp(join(tmpdir(), "rea-native-values-e2e-"));
+  const runtime = join(
+    workspace,
+    `runtime${process.platform === "win32" ? "" : " with spaces"}-${"x".repeat(100)}`,
+  );
+  await mkdir(runtime);
+  const env = { ...environment(), TMPDIR: runtime };
+  try {
+    return await verifyNativeValueAdapters(
+      target,
+      procedure,
+      globalAddress,
+      entrypoint,
+      env,
+    );
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
+async function verifyNativeValueAdapters(
+  target,
+  procedure,
+  globalAddress,
+  entrypoint,
+  env,
+) {
   const { stdout } = await promisify(execFile)(
     process.execPath,
     [
@@ -90,7 +134,7 @@ export async function verifyNativeValueE2e(
       "5000",
       "--json",
     ],
-    { env: environment(), timeout: 240000, maxBuffer: 72 * 1024 * 1024 },
+    { env, timeout: 240000, maxBuffer: 72 * 1024 * 1024 },
   );
   const evidence = parseEvidence(JSON.parse(stdout));
   assert.equal(evidence.operation, "trace_native_values");
@@ -114,27 +158,31 @@ export async function verifyNativeValueE2e(
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [entrypoint, "mcp"],
-    env: environment(),
+    env,
     stderr: "pipe",
   });
   const client = new Client({ name: "native-values-real-e2e", version: "1" });
+  let boundaries;
   try {
     await client.connect(transport);
     const opened = await client.callTool(
       {
         name: "open_binary",
-        arguments: { path: target.path, provider: "ghidra" },
+        arguments: { path: target.path, provider_id: "ghidra" },
       },
       { timeout: 180000 },
     );
     assert.notEqual(opened.isError, true, JSON.stringify(opened));
-    const inventory = await client.callTool({
+    const inventoryReply = await client.callTool({
       name: "binary_session",
       arguments: {},
     });
-    assert.notEqual(inventory.isError, true, JSON.stringify(inventory));
+    const inventory = requireMcpLifecycleResult(
+      inventoryReply,
+      "binary_session",
+    );
     assert.ok(
-      inventory.structuredContent?.result?.tool_availability.some(
+      inventory.tool_availability.some(
         (tool) => tool.name === "trace_native_values" && tool.available,
       ),
       "Native value tracing is unavailable in real provider discovery",
@@ -147,12 +195,12 @@ export async function verifyNativeValueE2e(
       { timeout: 180000 },
     );
     assert.notEqual(result.isError, true, JSON.stringify(result));
-    const mcpEvidence = parseEvidence(result.structuredContent?.evidence);
+    const mcpEvidence = parseEvidence(result.structuredContent);
     assert.equal(mcpEvidence.operation, "trace_native_values");
     assert.equal(mcpEvidence.provider.id, "rea-workflow");
     assert.deepEqual(mcpEvidence.analysis_profile, workflowProfile);
     const mcpGraph = verifyGraph(
-      result.structuredContent?.result,
+      result.structuredContent?.normalized_result,
       target,
       procedure,
       globalAddress,
@@ -164,44 +212,63 @@ export async function verifyNativeValueE2e(
       { timeout: 180000 },
     );
     assert.notEqual(analyzed.isError, true, JSON.stringify(analyzed));
-    const functionEvidence = parseEvidence(
-      analyzed.structuredContent?.evidence,
-    );
+    const functionEvidence = parseEvidence(analyzed.structuredContent);
     assert.equal(functionEvidence.operation, "analyze_function");
-    assert.equal(functionEvidence.provider.id, "rea-workflow");
+    assert.equal(functionEvidence.provider.id, "ghidra");
+    assert.deepEqual(
+      functionEvidence.normalized_result.facet_availability,
+      Object.fromEntries(
+        [
+          "pseudocode",
+          "assembly",
+          "comments",
+          "callers",
+          "callees",
+          "references",
+          "strings_names",
+          "cfg",
+        ].map((facet) => [facet, { available: true }]),
+      ),
+    );
+    assert.equal(functionEvidence.relationship_coverage?.status, "complete");
+    assert.ok(
+      functionEvidence.relationship_coverage.diagnostics.some((diagnostic) =>
+        diagnostic.includes("indirect calls remain unknown"),
+      ),
+    );
     const functionProfile = analysisProfileSchema.parse(
       functionEvidence.analysis_profile,
     );
-    assert.deepEqual(
-      functionProfile.parameters.upstream_analysis_profile,
-      upstreamProfile,
-    );
+    assert.deepEqual(functionProfile, upstreamProfile);
     assert.deepEqual(
       functionEvidence.normalized_result,
-      analyzed.structuredContent?.result,
+      analyzed.structuredContent?.normalized_result,
     );
     const comparison = await client.callTool(
       {
         name: "compare_functions",
         arguments: {
-          left: analyzed.structuredContent.evidence,
-          right: analyzed.structuredContent.evidence,
+          left: analyzed.structuredContent,
+          right: analyzed.structuredContent,
         },
       },
       { timeout: 180000 },
     );
     assert.notEqual(comparison.isError, true, JSON.stringify(comparison));
-    const comparisonEvidence = parseEvidence(
-      comparison.structuredContent?.evidence,
+    const comparisonEvidence = parseEvidence(comparison.structuredContent);
+    assert.equal(
+      comparisonEvidence.normalized_result.status,
+      "unchanged",
+      JSON.stringify(comparisonEvidence.normalized_result.dimensions),
     );
-    assert.equal(comparisonEvidence.normalized_result.status, "unchanged");
     assert.deepEqual(
       comparisonEvidence.normalized_result,
-      comparison.structuredContent?.result,
+      comparison.structuredContent?.normalized_result,
     );
     assert.ok(
       comparisonEvidence.evidence_links.includes(functionEvidence.evidence_id),
     );
+    await verifyUnresolvedCallEvidence(client);
     const bundle = await client.callTool({
       name: "get_evidence_bundle",
       arguments: {},
@@ -219,16 +286,32 @@ export async function verifyNativeValueE2e(
         evidence,
       );
     }
+    boundaries = await verifyGhidraBoundaries(client, {
+      target,
+      procedure,
+      entrypoint,
+      env,
+    });
     const closed = await client.callTool({
       name: "close_binary",
       arguments: {},
     });
     assert.notEqual(closed.isError, true, JSON.stringify(closed));
-    const status = await client.callTool({
+    const statusReply = await client.callTool({
       name: "binary_session",
       arguments: {},
     });
-    assert.equal(status.structuredContent?.result?.open, false);
+    assert.equal(
+      requireMcpLifecycleResult(statusReply, "binary_session").open,
+      false,
+    );
+    assert.deepEqual(
+      (await readdir(env.TMPDIR)).filter((name) =>
+        name.startsWith("rea-ghidra-"),
+      ),
+      [],
+      "Ghidra left runtime files after close",
+    );
   } finally {
     await client.close();
     await transport.close();
@@ -239,9 +322,70 @@ export async function verifyNativeValueE2e(
     stdio_mcp: true,
     inline_evidence: true,
     direct_function_comparison: true,
+    boundaries,
     nodes: cliGraph.total_nodes,
     edges: cliGraph.total_edges,
     decompilations: cliGraph.decompilations,
     unknowns: cliGraph.unknowns.length,
   };
+}
+
+async function verifyUnresolvedCallEvidence(client) {
+  const inventory = await client.callTool({
+    name: "list_procedures",
+    arguments: {},
+  });
+  assert.notEqual(inventory.isError, true, JSON.stringify(inventory));
+  const procedures = parseEvidence(
+    inventory.structuredContent,
+  ).normalized_result;
+  const indirect = procedures.find((item) =>
+    item.value.endsWith("rea_ghidra_inventory_indirect"),
+  );
+  const leaf = procedures.find((item) =>
+    item.value.endsWith("rea_ghidra_inventory_leaf"),
+  );
+  assert.ok(
+    indirect && leaf,
+    "Source fixture lacks the unresolved callback and its possible target",
+  );
+  const analyzed = await client.callTool(
+    { name: "analyze_function", arguments: { procedure: indirect.address } },
+    { timeout: 180000 },
+  );
+  assert.notEqual(analyzed.isError, true, JSON.stringify(analyzed));
+  const evidence = parseEvidence(analyzed.structuredContent);
+  assert.equal(evidence.relationship_coverage?.status, "partial");
+  assert.ok(evidence.normalized_result.unresolved_calls.length > 0);
+  const traced = await client.callTool(
+    {
+      name: "trace_call_path",
+      arguments: {
+        start: indirect.address,
+        goal: leaf.address,
+        direction: "forward",
+      },
+    },
+    { timeout: 180000 },
+  );
+  assert.notEqual(traced.isError, true, JSON.stringify(traced));
+  const trace = parseEvidence(traced.structuredContent).normalized_result;
+  assert.equal(trace.goal_status, "unknown");
+  assert.equal(trace.truncated, true);
+  assert.ok(trace.residual_unknowns.length > 0);
+  const compared = await client.callTool(
+    {
+      name: "compare_functions",
+      arguments: {
+        left: analyzed.structuredContent,
+        right: analyzed.structuredContent,
+      },
+    },
+    { timeout: 180000 },
+  );
+  assert.notEqual(compared.isError, true, JSON.stringify(compared));
+  assert.equal(
+    parseEvidence(compared.structuredContent).normalized_result.status,
+    "unknown",
+  );
 }

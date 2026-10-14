@@ -1,19 +1,12 @@
-import { canonicalDigest } from "../../domain/comparisonSemantics.js";
+import { digestCanonicalValue } from "../../domain/canonicalDigest.js";
 import type { ProviderIdentity } from "../AnalysisProvider.js";
+import type { CanonicalElectronActiveObservationInput } from "./ElectronActiveObservationPort.js";
 import type { Evidence, EvidenceObservation } from "../../domain/evidence.js";
 import { createEvidence } from "../../domain/evidence.js";
-import type {
-  ElectronActiveObservationInput,
-  ElectronActiveObservationResult,
-} from "../../domain/javascript/electronActiveObservation.js";
-import { jsonValueSchema } from "../../domain/jsonValue.js";
+import type { ElectronActiveObservationResult } from "../../domain/javascript/electronActiveObservation.js";
+import { jsonObjectSchema, jsonValueSchema } from "../../domain/jsonValue.js";
 
-type CanonicalElectronActiveObservationInput =
-  ElectronActiveObservationInput & {
-    readonly application_root: string;
-  };
-
-/** Create Evidence without retaining arbitrary runtime argument values. */
+/** Commit the selected Electron experiment and its observed result. */
 export const createElectronActiveEvidence = (
   input: CanonicalElectronActiveObservationInput,
   result: ElectronActiveObservationResult,
@@ -38,22 +31,12 @@ export const createElectronActiveEvidence = (
     ],
   });
 
-const scenarioProjection = (
-  input: CanonicalElectronActiveObservationInput,
-): EvidenceObservation["parameters"] => ({
-  executable_path: input.executable_path,
-  application_path: input.application_path,
-  application_root: input.application_root,
-  args: [...input.args],
-  actions: input.actions.map(({ step_id, kind }) => ({ step_id, kind })),
-});
-
 const parameters = (
   input: CanonicalElectronActiveObservationInput,
-): EvidenceObservation["parameters"] => ({
-  ...scenarioProjection(input),
-  scenario_sha256: canonicalDigest(
-    scenarioProjection(input),
-    "Browser scenario",
-  ),
-});
+): EvidenceObservation["parameters"] => {
+  const scenario = jsonObjectSchema.parse(input);
+  return {
+    ...scenario,
+    scenario_sha256: digestCanonicalValue(scenario, "Electron scenario"),
+  };
+};

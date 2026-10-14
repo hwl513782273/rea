@@ -1,9 +1,17 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it } from "vitest";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { withArtifactResourceScope } from "../../fixtures/artifactInventory.js";
 import { execFileOutput } from "../../../src/process/ExecFileOutput.js";
 import { readReferenceSourceVcs } from "../../../src/application/ReferenceSourceVcsAdapter.js";
+
+const readVcs = (root: string, signal?: AbortSignal) =>
+  withArtifactResourceScope(async (resources) => {
+    const result = await readReferenceSourceVcs(root, resources, signal);
+    if (!result.ok) throw result.error;
+    return result.value;
+  });
 
 it("reads a linked worktree's own branch and detached HEAD through shared Git refs", async () => {
   const root = await createTestTempDirectory("rea-reference-worktree-");
@@ -49,18 +57,18 @@ it("reads a linked worktree's own branch and detached HEAD through shared Git re
     await execFileOutput("git", ["rev-parse", "HEAD"], { cwd: linked })
   ).stdout.trim();
   expect(linkedHead).not.toBe(mainHead);
-  expect(await readReferenceSourceVcs(repository)).toEqual({
+  expect(await readVcs(repository)).toEqual({
     kind: "git",
     head: mainHead,
     dirty: null,
   });
-  expect(await readReferenceSourceVcs(linked)).toEqual({
+  expect(await readVcs(linked)).toEqual({
     kind: "git",
     head: linkedHead,
     dirty: null,
   });
   await git("pack-refs", "--all", "--prune");
-  expect(await readReferenceSourceVcs(linked)).toEqual({
+  expect(await readVcs(linked)).toEqual({
     kind: "git",
     head: linkedHead,
     dirty: null,
@@ -68,7 +76,7 @@ it("reads a linked worktree's own branch and detached HEAD through shared Git re
   await execFileOutput("git", ["checkout", "--detach", mainHead], {
     cwd: linked,
   });
-  expect(await readReferenceSourceVcs(linked)).toEqual({
+  expect(await readVcs(linked)).toEqual({
     kind: "git",
     head: mainHead,
     dirty: null,
@@ -79,16 +87,48 @@ it("reads a linked worktree's own branch and detached HEAD through shared Git re
     join(relativePointer, ".git"),
     "gitdir: ../repository/.git\r\n",
   );
-  expect(await readReferenceSourceVcs(relativePointer)).toEqual({
+  expect(await readVcs(relativePointer)).toEqual({
     kind: "git",
     head: mainHead,
     dirty: null,
   });
+  // A non-regular loose ref must remain unknown even when packed-refs has
+  // a readable value. The library's promise-API probe is not a source failure.
+  await mkdir(join(repository, ".git", "refs", "heads", "main"));
+  expect(await readVcs(repository)).toEqual({
+    kind: "unknown",
+    head: null,
+    dirty: null,
+  });
   const controller = new AbortController();
   controller.abort();
-  expect(await readReferenceSourceVcs(linked, controller.signal)).toEqual({
+  expect(await readVcs(linked, controller.signal)).toEqual({
     kind: "unknown",
     head: null,
     dirty: null,
   });
 });
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "keeps unreadable loose refs unknown instead of falling back to packed refs",
+  async () => {
+    const root = await createTestTempDirectory("rea-reference-loose-ref-");
+    const gitdir = join(root, ".git");
+    const looseRef = join(gitdir, "refs", "heads", "main");
+    await mkdir(join(gitdir, "refs", "heads"), { recursive: true });
+    const head = "1234567890abcdef1234567890abcdef12345678";
+    await writeFile(join(gitdir, "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(join(gitdir, "packed-refs"), `${head} refs/heads/main\n`);
+    await writeFile(looseRef, `${head}\n`);
+    await chmod(looseRef, 0);
+    try {
+      expect(await readVcs(root)).toEqual({
+        kind: "unknown",
+        head: null,
+        dirty: null,
+      });
+    } finally {
+      await chmod(looseRef, 0o600);
+    }
+  },
+);

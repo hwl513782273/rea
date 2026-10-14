@@ -1,12 +1,21 @@
-import type { AppConfig } from "../config.js";
-import type { Logger } from "../logger.js";
+import type { AppConfig } from "../config/types.js";
+import type { parseConfig } from "../config/parseConfig.js";
+import type { Logger } from "pino";
 import type { BinarySession } from "./binary/BinarySession.js";
 
-/** Existing one-shot session factories supplied by the production boundary. */
+/** Configuration and one-shot session factories supplied by the production boundary. */
 export interface DirectAnalysisDependencies {
+  /** Read the caller-selected configuration without consulting ambient state. */
+  readonly readConfiguration: () => ReturnType<typeof parseConfig>;
   readonly createBinarySession: (
     config: AppConfig,
     logger: Logger,
-  ) => BinarySession;
-  readonly createManagedBinarySession: () => BinarySession;
+  ) => BinarySession | Promise<BinarySession>;
+  /** Create an artifact-only session without selecting native analysis engines. */
+  readonly createArtifactBinarySession: () =>
+    | BinarySession
+    | Promise<BinarySession>;
+  readonly createManagedBinarySession: () =>
+    | BinarySession
+    | Promise<BinarySession>;
 }

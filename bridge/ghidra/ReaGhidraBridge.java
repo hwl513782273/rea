@@ -5,14 +5,18 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.Channels;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -22,11 +26,15 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -51,7 +59,11 @@ import ghidra.app.decompiler.DecompiledFunction;
 import ghidra.app.decompiler.ClangCaseToken;
 import ghidra.app.decompiler.ClangNode;
 import ghidra.framework.Application;
+import ghidra.app.util.bin.format.pdb.PdbParserConstants;
+import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
@@ -71,6 +83,7 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
+import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Variable;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.MemoryBlockSourceInfo;
@@ -78,12 +91,15 @@ import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.SegmentedAddress;
 import ghidra.program.model.reloc.Relocation;
 import java.io.ByteArrayOutputStream;
+import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.FlowType;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.model.symbol.SymbolTable;
 import ghidra.program.model.pcode.FunctionPrototype;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighParam;
@@ -95,12 +111,19 @@ import ghidra.program.model.pcode.PcodeBlock;
 import ghidra.program.model.pcode.PcodeBlockBasic;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.pcode.VarnodeAST;
+import ghidra.program.util.ContextEvaluatorAdapter;
+import ghidra.program.util.SymbolicPropogator;
+import ghidra.program.util.VarnodeContext;
 
 public final class ReaGhidraBridge extends HeadlessScript {
+    // At most 24 KiB after worst-case JSON escaping (six bytes per UTF-16 unit).
+    private static final int PDB_ATTRIBUTE_UTF16_BUDGET = 4096;
     private static final int MAX_HIGH_PCODE_OPS = 3000;
     private static final int MAX_HIGH_PCODE_INPUTS_PER_OP = 64;
     private static final int MAX_HIGH_PCODE_DEF_USE_EDGES = 12000;
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
+    private final Map<FileBytes, Boolean> targetSourceIdentity = new IdentityHashMap<>();
+    private String admittedTargetSha256;
     private static final Set<String> DESCRIPTOR_KEYS = Set.of(
         "transport",
         "endpoint_path",
@@ -118,8 +141,11 @@ public final class ReaGhidraBridge extends HeadlessScript {
     );
     private static final String[] CAPABILITIES = {
         "annotate_native_function",
+        "set_address_name",
+        "set_addresses_names",
         "inspect_native_load_image",
         "read_bytes",
+        "search_bytes",
         "address_to_file_offset",
         "ping",
         "shutdown",
@@ -175,10 +201,17 @@ public final class ReaGhidraBridge extends HeadlessScript {
         }
         sessionDefaultAddressSpace =
             currentProgram.getAddressFactory().getDefaultAddressSpace();
-        if (currentProgram.getExecutableFormat().equals("Raw Binary") &&
-            !currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
-                .getBoolean("REA DOS COM prepared", false)) {
-            throw new IllegalStateException("REA DOS COM entry/context preparation failed");
+        if (currentProgram.getExecutableFormat().equals("Raw Binary")) {
+            boolean dosCom = currentProgram.getLanguageID().getIdAsString()
+                .equals("x86:LE:16:Real Mode");
+            String preparation = dosCom ? "REA DOS COM prepared" : "REA raw binary prepared";
+            if (!currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+                .getBoolean(preparation, false)) {
+                throw new IllegalStateException(
+                    dosCom ? "REA DOS COM entry/context preparation failed" :
+                        "REA raw binary entry preparation failed"
+                );
+            }
         }
         if (!Application.getApplicationVersion().equals(descriptor.providerVersion)) {
             throw new IllegalStateException("Ghidra provider version does not match the session");
@@ -193,6 +226,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 "Ghidra imported-byte digest does not match the admitted target"
             );
         }
+        admittedTargetSha256 = descriptor.targetSha256;
         // GhidraScript wraps run() in a transaction. End it before serving so
         // each edit owns a real outer transaction and can roll back immediately.
         end(true);
@@ -266,7 +300,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
                     Files.move(pendingPath, endpointPath);
                 }
             }
-            acceptClient(server, descriptor);
+            acceptAuthenticatedLoopbackClient(server, descriptor);
         }
         finally {
             Files.deleteIfExists(pendingPath);
@@ -276,6 +310,50 @@ public final class ReaGhidraBridge extends HeadlessScript {
 
     private static boolean isWindowsHost() {
         return System.getProperty("os.name", "").startsWith("Windows");
+    }
+
+    private static String readLoopbackHandshake(
+            SocketChannel client, int maxBytes, long timeoutMillis) throws IOException {
+        long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
+        InputStream input = client.socket().getInputStream();
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        while (true) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw new SocketTimeoutException("Bridge authentication timed out");
+            client.socket().setSoTimeout((int) Math.max(1,
+                Math.min(Integer.MAX_VALUE, (remaining + 999_999L) / 1_000_000L)));
+            int value = input.read();
+            if (value == -1) return null;
+            if (value == '\n') return bytes.toString(StandardCharsets.UTF_8);
+            if (bytes.size() == maxBytes) throw new IOException("Bridge authentication frame is too large");
+            bytes.write(value);
+        }
+    }
+
+    private void acceptAuthenticatedLoopbackClient(
+            ServerSocketChannel server, SessionDescriptor descriptor) throws Exception {
+        while (true) {
+            try (SocketChannel client = server.accept()) {
+                Request first;
+                try {
+                    String line = readLoopbackHandshake(client, 64 * 1024, 1_000);
+                    if (line == null) continue;
+                    first = parseRequest(line, descriptor.token);
+                }
+                catch (IOException | RuntimeException rejected) {
+                    // A rejected unauthenticated peer cannot consume the bridge session.
+                    continue;
+                }
+                client.socket().setSoTimeout(0);
+                try (BufferedReader reader = new BufferedReader(
+                         Channels.newReader(client, StandardCharsets.UTF_8));
+                     BufferedWriter writer = new BufferedWriter(
+                         Channels.newWriter(client, StandardCharsets.UTF_8))) {
+                    serveClient(descriptor, reader, writer, first);
+                }
+                return;
+            }
+        }
     }
 
     private void acceptClient(
@@ -288,26 +366,28 @@ public final class ReaGhidraBridge extends HeadlessScript {
              BufferedWriter writer = new BufferedWriter(
                  Channels.newWriter(client, StandardCharsets.UTF_8)
              )) {
-            serveClient(descriptor, reader, writer);
+            serveClient(descriptor, reader, writer, null);
         }
     }
 
     private void serveClient(
             SessionDescriptor descriptor,
             BufferedReader reader,
-            BufferedWriter writer) throws Exception {
+            BufferedWriter writer,
+            Request first) throws Exception {
         while (true) {
-            String line = reader.readLine();
-            if (line == null) {
-                return;
-            }
-            Request request;
-            try {
-                request = parseRequest(line, descriptor.token);
-            }
-            catch (RuntimeException exception) {
-                writeFailure(writer, 1, "invalid_request", "Bridge request is invalid");
-                return;
+            Request request = first;
+            first = null;
+            if (request == null) {
+                String line = reader.readLine();
+                if (line == null) return;
+                try {
+                    request = parseRequest(line, descriptor.token);
+                }
+                catch (RuntimeException exception) {
+                    writeFailure(writer, 1, "invalid_request", "Bridge request is invalid");
+                    return;
+                }
             }
             try {
                 if (request.method.equals("shutdown")) {
@@ -349,6 +429,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return switch (request.method) {
             case "inspect_native_load_image" -> inspectNativeLoadImage(request.params);
             case "read_bytes" -> readMemoryBytes(request.params);
+            case "search_bytes" -> searchMemoryBytes(request.params, descriptor);
             case "address_to_file_offset" -> addressToFileOffset(request.params);
             case "address_name" -> addressName(request.params);
             case "list_documents" -> listDocuments(request.params);
@@ -368,10 +449,21 @@ public final class ReaGhidraBridge extends HeadlessScript {
             case "search_procedures" -> search(request.params, true);
             case "search_strings" -> search(request.params, false);
             case "inspect_native_data_type" -> inspectNativeDataType(request.params);
-            case "inspect_native_instruction" -> inspectNativeInstruction(request.params);
+            case "inspect_native_instruction" -> inspectNativeInstruction(request.params, true);
             case "resolve_native_call_targets" -> resolveNativeCallTargets(request.params);
             case "xrefs" -> xrefs(request.params);
-            case "analyze_function" -> analyzeFunction(request.params);
+            case "analyze_function" -> {
+                FunctionAnalysisObservation observation = analyzeFunctionObservation(request.params);
+                JsonObject result = functionObservation(observation.dossier(), observation.limitations());
+                result.add("relationship_coverage", observation.relationshipCoverage());
+                yield result;
+            }
+            case "set_address_name", "set_addresses_names" -> {
+                if (!descriptor.transport.equals("unix-socket"))
+                    throw new RequestFailure("method_unavailable", "Windows P0 does not admit database mutation");
+                yield request.method.equals("set_address_name")
+                    ? setAddressName(request.params) : setAddressesNames(request.params);
+            }
             case "annotate_native_function" -> {
                 if (!descriptor.transport.equals("unix-socket"))
                     throw new RequestFailure("method_unavailable", "Windows P0 does not admit database mutation");
@@ -415,13 +507,60 @@ public final class ReaGhidraBridge extends HeadlessScript {
         result.addProperty("analysis_timed_out", timedOut);
         result.add("capabilities", GSON.toJsonTree(
             java.util.Arrays.stream(CAPABILITIES)
-                .filter(value -> !readOnly || !value.equals("annotate_native_function"))
+                .filter(value -> !readOnly || !(value.equals("annotate_native_function")
+                    || value.equals("set_address_name") || value.equals("set_addresses_names")))
                 .toArray(String[]::new)
         ));
         result.add("target", target);
+        result.add("pdb", pdbObservation());
         JsonArray extensions = analysisExtensions.reports();
         if (extensions.size() > 0) result.add("analysis_extensions", extensions);
+        // Written by ReaGhidraApplySeeds before auto-analysis; REA checks it
+        // against the committed profile.
+        String seeds = currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+            .getString("REA analysis seeds", null);
+        if (seeds != null) result.add("analysis_seeds", JsonParser.parseString(seeds));
+        // Written by ReaGhidraMipsSoftFloat after analysis; REA requires it
+        // exactly when the committed profile declares soft-float storage.
+        String softFloat = currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+            .getString("REA MIPS soft-float storage", null);
+        if (softFloat != null) result.add("mips_soft_float_storage", JsonParser.parseString(softFloat));
         return result;
+    }
+
+    /** Read loader/analyzer-owned facts without searching for or applying companions. */
+    private JsonObject pdbObservation() {
+        Options info = currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO);
+        JsonObject pdb = new JsonObject();
+        String[] names = {"file", "guid", "age", "signature", "version"};
+        String[] attributes = {
+            PdbParserConstants.PDB_FILE, PdbParserConstants.PDB_GUID,
+            PdbParserConstants.PDB_AGE, PdbParserConstants.PDB_SIGNATURE,
+            PdbParserConstants.PDB_VERSION
+        };
+        int remaining = PDB_ATTRIBUTE_UTF16_BUDGET;
+        JsonArray omitted = new JsonArray();
+        for (int index = 0; index < names.length; index++) {
+            String value = info.getString(attributes[index], null);
+            if (value != null && value.length() > remaining) {
+                omitted.add(names[index]);
+                pdb.add(names[index], JsonNull.INSTANCE);
+            } else {
+                pdb.addProperty(names[index], value);
+                if (value != null) remaining -= value.length();
+            }
+        }
+        if (omitted.size() > 0) {
+            JsonObject limit = new JsonObject();
+            limit.addProperty("utf16_budget", PDB_ATTRIBUTE_UTF16_BUDGET);
+            limit.add("omitted_attributes", omitted);
+            pdb.add("resource_limit", limit);
+        }
+        if (info.contains(PdbParserConstants.PDB_LOADED))
+            pdb.addProperty("loaded", info.getBoolean(PdbParserConstants.PDB_LOADED, false));
+        else
+            pdb.add("loaded", JsonNull.INSTANCE);
+        return pdb;
     }
 
     private static String bytesHex(byte[] bytes) {
@@ -599,24 +738,173 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return result;
     }
 
-    private JsonObject addressToFileOffset(JsonObject params) {
+    private JsonObject searchMemoryBytes(JsonObject params, SessionDescriptor descriptor) throws Exception {
+        // mask, start, end, and cursor are omitted when absent; JSON encoding drops those keys.
+        Set<String> keys = params.keySet();
+        if (!keys.containsAll(Set.of("document", "pattern", "limit")) ||
+            !Set.of("document", "pattern", "mask", "start", "end", "limit", "cursor").containsAll(keys))
+            throw new RequestFailure("invalid_request", "Bridge request fields are invalid");
+        requireDocument(params);
+        // Public input validation owns the grammar; validate again at the socket boundary.
+        String pattern = requireString(params, "pattern").replaceAll("[\\s\\p{Z}\\uFEFF]", "");
+        String mask = params.has("mask") ? requireString(params, "mask") : null;
+        if (mask != null) mask = mask.replaceAll("[\\s\\p{Z}\\uFEFF]", "");
+        if (pattern.isEmpty() || pattern.length() % 2 != 0 ||
+            (mask != null && mask.length() != pattern.length()))
+            throw new RequestFailure("invalid_request", "Mask length must equal a nonempty byte pattern length");
+        byte[] bytes = new byte[pattern.length() / 2];
+        byte[] masks = new byte[bytes.length];
+        boolean constrained = false;
+        for (int index = 0; index < bytes.length; index++) {
+            monitor.checkCancelled();
+            String pair = pattern.substring(index * 2, index * 2 + 2);
+            if ((!pair.equals("??") && !isHexadecimal(pair, 0, 2)) ||
+                (mask != null && !isHexadecimal(mask, index * 2, index * 2 + 2)))
+                throw new RequestFailure("invalid_request", "Use hexadecimal byte pairs or ?? wildcards");
+            int selected = mask == null ? 255 : Integer.parseInt(mask.substring(index * 2, index * 2 + 2), 16);
+            bytes[index] = (byte) (pair.equals("??") ? 0 : Integer.parseInt(pair, 16));
+            masks[index] = (byte) (pair.equals("??") ? 0 : selected);
+            constrained |= masks[index] != 0;
+        }
+        if (!constrained) throw new RequestFailure("invalid_request", "Pattern must constrain at least one bit");
+        int limit = requireBoundedInteger(params, "limit", 1, 1000);
+        Address start = params.has("start") ? requireAddress(params, "start") : null;
+        Address end = params.has("end") ? requireAddress(params, "end") : null;
+        if (start != null && end != null &&
+            (!start.getAddressSpace().equals(end.getAddressSpace()) || start.compareTo(end) > 0))
+            throw new RequestFailure("invalid_request", "Search bounds must be ordered in one address space");
+        JsonArray identity = new JsonArray();
+        for (String value : new String[] { descriptor.targetSha256, descriptor.profileDigest,
+                bytesHex(bytes), bytesHex(masks), start == null ? "" : canonicalAddress(start),
+                end == null ? "" : canonicalAddress(end), optionalString(params, "document") }) identity.add(value);
+        String binding = bytesHex(MessageDigest.getInstance("SHA-256").digest(identity.toString().getBytes(StandardCharsets.UTF_8)));
+        String cursor = params.has("cursor") ? requireString(params, "cursor") : null;
+        Address resume = null;
+        if (cursor != null) {
+            if (!cursor.startsWith(binding + ":"))
+                throw new RequestFailure("invalid_request", "Byte search cursor does not match the target and query");
+            resume = parseReaAddress(cursor.substring(binding.length() + 1));
+            MemoryBlock resumedBlock = currentProgram.getMemory().getBlock(resume);
+            Address bound = start == null ? end : start;
+            if (resumedBlock == null || !resumedBlock.isInitialized() ||
+                (bound != null && !bound.getAddressSpace().equals(resume.getAddressSpace())) ||
+                (start != null && resume.compareTo(start) < 0) ||
+                (end != null && resume.compareTo(end) > 0))
+                throw new RequestFailure("invalid_request", "Byte search cursor lies outside initialized query memory");
+        }
+        List<MemoryBlock> ordered = new ArrayList<>(List.of(currentProgram.getMemory().getBlocks()));
+        ordered.sort(Comparator.comparing(MemoryBlock::getStart));
+        JsonArray matches = new JsonArray();
+        JsonArray blocks = new JsonArray();
+        JsonArray skipped = new JsonArray();
+        JsonArray notLoaded = new JsonArray();
+        long covered = 0;
+        String next = null;
+        for (MemoryBlock block : ordered) {
+            monitor.checkCancelled();
+            Address low = block.getStart();
+            Address high = block.getEnd();
+            Address bound = start == null ? end : start;
+            if (bound != null && !bound.getAddressSpace().equals(low.getAddressSpace())) continue;
+            // Without bounds, search loaded memory only. Non-loaded file parts
+            // (such as .symtab) and overlays stay reachable through explicit bounds.
+            if (bound == null && (!block.isLoaded() || block.isOverlay())) {
+                notLoaded.add(byteSearchCoverage(block, low, high));
+                continue;
+            }
+            if (start != null && low.compareTo(start) < 0) low = start;
+            if (end != null && high.compareTo(end) > 0) high = end;
+            if (low.compareTo(high) > 0) continue;
+            if (!block.isInitialized()) {
+                skipped.add(byteSearchCoverage(block, low, high));
+                continue;
+            }
+            if (next != null) continue;
+            if (resume != null && low.compareTo(resume) < 0) low = resume;
+            if (low.compareTo(high) > 0 || !low.getAddressSpace().equals(high.getAddressSpace())) continue;
+            Address at = low;
+            Address examinedEnd = high;
+            while (at != null && at.compareTo(high) <= 0 && high.subtract(at) >= bytes.length - 1L) {
+                monitor.checkCancelled();
+                // Ghidra's end address bounds candidate starts, not the final matched byte.
+                Address found = currentProgram.getMemory().findBytes(at, high.subtract(bytes.length - 1L), bytes, masks, true, monitor);
+                monitor.checkCancelled();
+                if (found == null || high.subtract(found) < bytes.length - 1L) break;
+                if (matches.size() == limit) {
+                    next = binding + ":" + canonicalAddress(found);
+                    examinedEnd = found.addNoWrap(bytes.length - 1L);
+                    break;
+                }
+                JsonObject match = new JsonObject();
+                match.addProperty("address", canonicalAddress(found));
+                match.addProperty("segment", block.getName());
+                Long offset = targetFileOffset(block, found).offset();
+                match.add("file_offset", offset == null ? JsonNull.INSTANCE : GSON.toJsonTree(offset));
+                Function function = currentProgram.getFunctionManager().getFunctionContaining(found);
+                JsonObject procedure = new JsonObject();
+                if (function != null) {
+                    procedure.addProperty("address", canonicalAddress(function.getEntryPoint()));
+                    procedure.addProperty("name", function.getName(true));
+                }
+                match.add("procedure", function == null ? JsonNull.INSTANCE : procedure);
+                matches.add(match);
+                at = found.next();
+            }
+            JsonObject coverage = byteSearchCoverage(block, low, examinedEnd);
+            covered = Math.addExact(covered, coverage.get("bytes").getAsLong());
+            blocks.add(coverage);
+        }
+        JsonObject searched = new JsonObject();
+        searched.add("blocks", blocks);
+        searched.addProperty("bytes", covered);
+        searched.add("skipped_uninitialized", skipped);
+        searched.add("skipped_not_loaded", notLoaded);
+        JsonObject result = new JsonObject();
+        result.add("matches", matches);
+        result.add("searched", searched);
+        result.addProperty("complete", next == null);
+        result.add("next_cursor", next == null ? JsonNull.INSTANCE : GSON.toJsonTree(next));
+        return result;
+    }
+
+    private static JsonObject byteSearchCoverage(MemoryBlock block, Address low, Address high) {
+        JsonObject result = new JsonObject();
+        result.addProperty("segment", block.getName());
+        result.addProperty("start", canonicalAddress(low));
+        result.addProperty("end", canonicalAddress(high));
+        result.addProperty("bytes", high.subtract(low) + 1);
+        return result;
+    }
+
+    private record TargetFileOffset(Long offset, int mappings) {}
+
+    private TargetFileOffset targetFileOffset(MemoryBlock block, Address address) throws Exception {
+        Long offset = null;
+        int mappings = 0;
+        for (MemoryBlockSourceInfo source : block.getSourceInfos()) {
+            if (!source.contains(address) || source.getFileBytes().isEmpty() ||
+                !isTargetSource(source.getFileBytes().get())) continue;
+            long candidate = source.getFileBytesOffset(address);
+            if (candidate < 0) continue;
+            offset = candidate;
+            mappings++;
+        }
+        return new TargetFileOffset(mappings == 1 && offset <= 9007199254740991L ? offset : null, mappings);
+    }
+
+    private JsonObject addressToFileOffset(JsonObject params) throws Exception {
         requireKeys(params, Set.of("document", "address"));
         requireDocument(params);
         Address address = requireAddress(params, "address");
         MemoryBlock block = currentProgram.getMemory().getBlock(address);
         if (block == null || !block.isInitialized())
             throw new RequestFailure("invalid_request", "Address has no initialized file-backed memory: " + canonicalAddress(address));
-        Long fileOffset = null;
-        int mappings = 0;
-        for (MemoryBlockSourceInfo source : block.getSourceInfos()) {
-            if (!source.contains(address) || source.getFileBytes().isEmpty()) continue;
-            long offset = source.getFileBytesOffset(address);
-            if (offset < 0) continue;
-            fileOffset = offset;
-            mappings++;
-        }
-        if (mappings != 1)
-            throw new RequestFailure("invalid_request", "Address has " + mappings + " authoritative source mappings: " + canonicalAddress(address));
+        TargetFileOffset mapping = targetFileOffset(block, address);
+        if (mapping.mappings() != 1)
+            throw new RequestFailure("invalid_request", "Address has " + mapping.mappings() + " authoritative target-file mappings: " + canonicalAddress(address));
+        Long fileOffset = mapping.offset();
+        if (fileOffset == null)
+            throw new RequestFailure("invalid_request", "Address lacks a safe file offset: " + canonicalAddress(address));
         JsonObject result = new JsonObject();
         result.addProperty("address", canonicalAddress(address));
         result.addProperty("file_offset", fileOffset);
@@ -639,10 +927,97 @@ public final class ReaGhidraBridge extends HeadlessScript {
     private JsonElement procedurePseudocode(JsonObject params) throws Exception {
         requireKeys(params, Set.of("document", "procedure"));
         requireDocument(params);
-        String value = decompiledText(
-            decompile(resolveProcedure(requireString(params, "procedure")))
-        );
-        return value == null ? JsonNull.INSTANCE : GSON.toJsonTree(value);
+        String selector = requireString(params, "procedure");
+        JsonObject selection = new JsonObject();
+        Function function = resolveDecompileProcedure(selector, selection);
+        try {
+            String value = decompiledText(decompile(function));
+            JsonObject result = functionObservation(
+                value == null ? JsonNull.INSTANCE : GSON.toJsonTree(value),
+                noReturnCallLimitations(
+                    function,
+                    currentProgram.getListing().getInstructions(function.getBody(), true)
+                )
+            );
+            if (selection.size() > 0) result.add("selection", selection);
+            return result;
+        } catch (RequestFailure failure) {
+            if (selection.size() == 0) throw failure;
+            // Preserve completed resolution facts without changing the backend's
+            // failure code or suggesting that the successful mapping was invalid.
+            throw new RequestFailure(failure.code, "Selector " + selector +
+                " mapped to analysis address " + selection.get("mapped_address").getAsString() +
+                " and procedure " + canonicalAddress(function.getEntryPoint()) +
+                "; " + failure.getMessage());
+        }
+    }
+
+    private Function resolveDecompileProcedure(String selector, JsonObject selection) throws Exception {
+        String prefix = "file-offset:";
+        boolean explicitOffset = selector.startsWith(prefix);
+        if (!explicitOffset) {
+            try {
+                return resolveProcedure(selector);
+            } catch (RequestFailure failure) {
+                // Existing names/addresses win. Only an unresolved numeric input
+                // can fall back to source coordinates; ambiguity never falls back.
+                if (!failure.code.equals("not_found") || !selector.matches("0x[0-9a-fA-F]+"))
+                    throw failure;
+            }
+        }
+        String coordinate = explicitOffset ? selector.substring(prefix.length()) : selector;
+        if (!coordinate.matches("0x[0-9a-fA-F]+"))
+            throw new RequestFailure("invalid_request", "File offsets require hexadecimal file-offset:0x... syntax");
+        BigInteger parsed = new BigInteger(coordinate.substring(2), 16);
+        if (parsed.compareTo(BigInteger.valueOf(9007199254740991L)) > 0)
+            throw new RequestFailure("invalid_request", "File offset exceeds the exact JSON integer range");
+        long offset = parsed.longValueExact();
+        monitor.checkCancelled();
+        // Ghidra's convenience lookup spans every FileBytes and uses coordinates
+        // local to each object. Only a complete, digest-matched target source
+        // establishes that the caller's offset belongs to the admitted file.
+        Set<Address> mappedAddresses = new java.util.LinkedHashSet<>();
+        for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+            for (MemoryBlockSourceInfo source : block.getSourceInfos()) {
+                monitor.checkCancelled();
+                FileBytes backing = source.getFileBytes().orElse(null);
+                if (backing == null || !isTargetSource(backing)) continue;
+                Address mapped = source.locateAddressForFileOffset(offset);
+                if (mapped != null) mappedAddresses.add(mapped);
+            }
+        }
+        List<Address> candidates = new ArrayList<>(mappedAddresses);
+        if (candidates.size() > 1)
+            throw new RequestFailure("ambiguous", "File offset " + coordinate +
+                " has multiple loaded mappings: " + candidates.stream().map(ReaGhidraBridge::canonicalAddress).toList() +
+                "; select an explicit analysis address");
+        if (candidates.isEmpty())
+            throw new RequestFailure("not_found", "File offset " + coordinate +
+                " has no loaded source mapping for the admitted target file; Ghidra image base: " + canonicalAddress(currentProgram.getImageBase()) +
+                ". Inspect mappings with rea inspect-native-load-image <path> --provider ghidra --json or MCP inspect_native_load_image.");
+        Address mapped = candidates.get(0);
+        Function function = functionAtOrContaining(mapped);
+        if (function == null)
+            throw new RequestFailure("not_found", "File offset " + coordinate +
+                " maps to analysis address " + canonicalAddress(mapped) +
+                ", but no procedure starts at or contains that address in the current Ghidra analysis. " +
+                "Choose an observed procedure with CLI rea search <path> . --kind procedures --mode regex --provider ghidra --json or MCP list_procedures.");
+        selection.addProperty("file_offset", offset);
+        selection.addProperty("mapped_address", canonicalAddress(mapped));
+        selection.addProperty("procedure_address", canonicalAddress(function.getEntryPoint()));
+        return function;
+    }
+
+    private boolean isTargetSource(FileBytes source) throws Exception {
+        Boolean observed = targetSourceIdentity.get(source);
+        if (observed != null) return observed;
+        // Original FileBytes are immutable even when analysis memory is edited.
+        // Partial/auxiliary sources remain inspectable but cannot establish an
+        // original-target offset from their object-local coordinates alone.
+        boolean matched = source.getFileOffset() == 0 &&
+            constantTimeEquals(hashFileBytes(source, false), admittedTargetSha256);
+        targetSourceIdentity.put(source, matched);
+        return matched;
     }
 
     private JsonElement procedureAssembly(JsonObject params) throws Exception {
@@ -650,7 +1025,10 @@ public final class ReaGhidraBridge extends HeadlessScript {
         requireDocument(params);
         Function function = resolveProcedure(requireString(params, "procedure"));
         InstructionScan scan = scanInstructions(function, Integer.MAX_VALUE);
-        return GSON.toJsonTree(renderAssembly(scan.instructions));
+        return functionObservation(
+            GSON.toJsonTree(renderAssembly(scan.instructions)),
+            noReturnCallLimitations(function, scan.instructions)
+        );
     }
 
     private JsonObject readFunctionInstructions(JsonObject params) throws Exception {
@@ -668,14 +1046,16 @@ public final class ReaGhidraBridge extends HeadlessScript {
         limitations.add(
             "The fast path does not invoke the decompiler or scan whole-program names and strings."
         );
+        List<String> boundaryLimitations = noReturnCallLimitations(function, scan.instructions);
+        for (String limitation : boundaryLimitations) limitations.add(limitation);
         JsonObject result = new JsonObject();
         result.add("procedure", procedureIdentity(function));
         result.add("instructions", items);
         result.add("limitations", limitations);
-        return result;
+        return functionObservation(result, boundaryLimitations);
     }
 
-    private JsonArray procedureCalls(JsonObject params, boolean callers) throws Exception {
+    private JsonObject procedureCalls(JsonObject params, boolean callers) throws Exception {
         requireKeys(params, Set.of("document", "procedure"));
         requireDocument(params);
         Function function = resolveProcedure(requireString(params, "procedure"));
@@ -688,7 +1068,19 @@ public final class ReaGhidraBridge extends HeadlessScript {
         for (Function item : ordered) {
             result.add(canonicalAddress(item.getEntryPoint()));
         }
-        return result;
+        if (callers) {
+            JsonObject observation = functionObservation(result, noReturnCallLimitations(function,
+                currentProgram.getListing().getInstructions(function.getBody(), true)
+            ));
+            observation.add("relationship_coverage", callRelationshipCoverage(null,
+                unrepresentedIncomingCalls(function, observed)));
+            monitor.checkCancelled();
+            return observation;
+        }
+        CallBoundaryObservation calls = callBoundaryObservation(
+            function, currentProgram.getListing().getInstructions(function.getBody(), true), observed, false, null
+        );
+        return callRelationshipObservation(result, calls);
     }
 
     private JsonObject procedureInfo(JsonObject params) throws Exception {
@@ -705,7 +1097,13 @@ public final class ReaGhidraBridge extends HeadlessScript {
         result.addProperty("signature", function.getPrototypeString(false, true));
         result.add("locals", functionLocals(function));
         result.add("classification", functionClassification(function));
-        return result;
+        return functionObservation(
+            result,
+            noReturnCallLimitations(
+                function,
+                currentProgram.getListing().getInstructions(function.getBody(), true)
+            )
+        );
     }
 
     private JsonObject procedureReferences(JsonObject params) throws Exception {
@@ -723,8 +1121,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
         if (!direction.equals("incoming") && !direction.equals("outgoing")) {
             throw new RequestFailure("invalid_request", "direction must be incoming or outgoing");
         }
-        InstructionScan scan = scanInstructions(function, Integer.MAX_VALUE);
-        List<Reference> references = collectReferences(scan.instructions, direction);
+        List<Reference> references = collectReferences(function, direction);
         JsonArray edges = new JsonArray();
         for (Reference reference : references) {
             edges.add(referenceEdge(reference));
@@ -734,18 +1131,10 @@ public final class ReaGhidraBridge extends HeadlessScript {
         result.addProperty("direction", direction);
         result.add("references", edges);
         result.addProperty("reference_kinds_available", true);
-        JsonArray unresolvedCalls = new JsonArray();
-        if (direction.equals("outgoing")) for (Instruction instruction : scan.instructions) {
-            if (!instruction.getFlowType().isCall()) continue;
-            boolean resolved = false;
-            for (Reference reference : instruction.getReferencesFrom()) if (reference.getReferenceType().isCall()) resolved = true;
-            if (!resolved) {
-                JsonObject site = new JsonObject();
-                site.addProperty("address", canonicalAddress(instruction.getAddress()));
-                site.addProperty("reason", "Instruction decoder identifies a call but ReferenceManager supplies no call destination");
-                unresolvedCalls.add(site);
-            }
-        }
+        JsonArray unresolvedCalls = direction.equals("outgoing")
+            ? callBoundaryObservation(
+                function, currentProgram.getListing().getInstructions(function.getBody(), true), null, true, references
+            ).unresolvedCalls() : new JsonArray();
         result.add("unresolved_calls", unresolvedCalls);
         return result;
     }
@@ -840,18 +1229,17 @@ public final class ReaGhidraBridge extends HeadlessScript {
 
     private JsonObject instructionReference(Reference reference) {
         JsonObject item = new JsonObject();
-        RefType type = reference.getReferenceType();
+        JsonObject kind = referenceKind(reference);
+        item.addProperty("source_address", canonicalAddress(reference.getFromAddress()));
         item.addProperty("target_address", canonicalAddress(reference.getToAddress()));
-        item.addProperty("type", type.getName());
-        item.addProperty("call", type.isCall());
-        item.addProperty("jump", type.isJump());
-        item.addProperty("indirect", type.isIndirect());
-        item.addProperty("computed", type.isComputed());
-        item.addProperty("operand_index", reference.getOperandIndex());
+        for (String field : List.of("type", "call", "jump", "indirect", "computed",
+                "operand_index", "data", "read", "write", "primary", "provenance"))
+            item.add(field, kind.get(field));
+        item.addProperty("source", normalizedSource(reference.getSource()));
         return item;
     }
 
-    private JsonObject inspectNativeInstruction(JsonObject params) throws Exception {
+    private JsonObject inspectNativeInstruction(JsonObject params, boolean includeIncoming) throws Exception {
         requireKeys(params, Set.of("document", "address"));
         requireDocument(params);
         Address address = requireAddress(params, "address");
@@ -862,9 +1250,23 @@ public final class ReaGhidraBridge extends HeadlessScript {
         result.add("procedure", function == null ? JsonNull.INSTANCE : GSON.toJsonTree(canonicalAddress(function.getEntryPoint())));
         result.addProperty("architecture", currentProgram.getLanguageID().getIdAsString());
         result.addProperty("mode", currentProgram.getLanguage().getLanguageDescription().getVariant());
+        if (currentProgram.getLanguageID().getIdAsString().startsWith("MIPS:")) {
+            JsonArray decoderContext = new JsonArray();
+            var modeRegister = currentProgram.getRegister("ISA_MODE");
+            if (modeRegister != null) {
+                var modeValue = currentProgram.getProgramContext().getValue(modeRegister, address, false);
+                JsonObject context = new JsonObject();
+                context.addProperty("register", modeRegister.getName());
+                context.add("value", modeValue == null ? JsonNull.INSTANCE : GSON.toJsonTree(modeValue.toString()));
+                context.addProperty("source", "ghidra-program-context");
+                decoderContext.add(context);
+            }
+            result.add("decoder_context", decoderContext);
+        }
         JsonArray operands = new JsonArray();
         JsonArray references = new JsonArray();
         JsonArray destinations = new JsonArray();
+        JsonArray flowEvidence = new JsonArray();
         JsonObject flow = new JsonObject();
         flow.addProperty("kind", "unavailable");
         flow.addProperty("conditional", false);
@@ -880,7 +1282,20 @@ public final class ReaGhidraBridge extends HeadlessScript {
             result.addProperty("mnemonic", instruction.getMnemonicString());
             result.addProperty("raw_disassembly", instruction.toString());
             RefType type = instruction.getFlowType();
-            flow.addProperty("kind", type.isCall() ? "call" : type.isJump() ? "jump" : type.isTerminal() ? "terminal" : "fallthrough");
+            JsonObject listingFlow = new JsonObject();
+            listingFlow.addProperty("source", "ghidra-listing-flow-type");
+            listingFlow.addProperty("value", type.getName());
+            flowEvidence.add(listingFlow);
+            boolean decodedReturn = false;
+            for (PcodeOp operation : instruction.getPcode()) {
+                if (operation.getOpcode() != PcodeOp.RETURN) continue;
+                decodedReturn = true;
+                JsonObject returnEvidence = new JsonObject();
+                returnEvidence.addProperty("source", "ghidra-instruction-pcode");
+                returnEvidence.addProperty("value", operation.getMnemonic());
+                flowEvidence.add(returnEvidence);
+            }
+            flow.addProperty("kind", type.isCall() ? "call" : type.isJump() ? "jump" : decodedReturn ? "return" : type.isTerminal() ? "terminal" : "fallthrough");
             flow.addProperty("conditional", type.isConditional());
             flow.addProperty("computed", type.isComputed());
             if (!type.isComputed()) for (Address target : instruction.getFlows()) destinations.add(canonicalAddress(target));
@@ -916,15 +1331,31 @@ public final class ReaGhidraBridge extends HeadlessScript {
             }
         }
         flow.add("direct_destinations", destinations);
+        flow.add("classification_evidence", flowEvidence);
         result.add("operands", operands);
         result.add("flow", flow);
         result.add("references", references);
-        result.add("limitations", GSON.toJsonTree(List.of("Operand components are Ghidra Listing decoder tokens; effective memory base/index/displacement roles and per-instruction context mode are unavailable. The mode field is the program language variant.", "Terminal flow is not classified as a return without provider evidence.")));
+        if (includeIncoming) {
+            TreeMap<String, Reference> incoming = new TreeMap<>();
+            ReferenceIterator incomingIterator = currentProgram.getReferenceManager().getReferencesTo(address);
+            while (incomingIterator.hasNext()) {
+                monitor.checkCancelled();
+                addReference(incoming, incomingIterator.next());
+            }
+            List<Reference> orderedIncoming = new ArrayList<>(incoming.values());
+            orderedIncoming.sort(REFERENCE_ORDER);
+            JsonArray incomingReferences = new JsonArray();
+            for (Reference reference : orderedIncoming) incomingReferences.add(instructionReference(reference));
+            result.add("incoming_references", incomingReferences);
+        }
+        List<String> limitations = new ArrayList<>(List.of("Operand components are Ghidra Listing decoder tokens; effective memory base/index/displacement roles and per-instruction context mode are unavailable. The mode field is the program language variant."));
+        if (flow.get("kind").getAsString().equals("terminal")) limitations.add("No RETURN operation was observed in the provider's instruction p-code; terminal classification remains generic.");
+        result.add("limitations", GSON.toJsonTree(limitations));
         return result;
     }
 
     private JsonObject resolveNativeCallTargets(JsonObject params) throws Exception {
-        JsonObject instruction = inspectNativeInstruction(params);
+        JsonObject instruction = inspectNativeInstruction(params, false);
         JsonObject result = new JsonObject();
         result.add("call_site", instruction.get("address"));
         result.add("procedure", instruction.get("procedure"));
@@ -1007,9 +1438,14 @@ public final class ReaGhidraBridge extends HeadlessScript {
         Address entry = function.getEntryPoint();
         if (function.isExternal() || !currentProgram.getMemory().contains(entry))
             throw new RequestFailure("invalid_request", "Annotations require a local function entry: " + canonicalAddress(entry));
+        for (String field : List.of("name", "comment", "inline_comment")) {
+            if (params.has(field)) validateAnnotationText(requireText(params, field), field);
+        }
         int transaction = currentProgram.startTransaction("REA function annotations");
         boolean commit = false;
         try {
+            String leafName = params.has("name")
+                ? symbolLeafName(function.getSymbol(), requireString(params, "name")) : null;
             // Validate edits through Ghidra's own setters, including name rules.
             // A later invalid name must roll back earlier comment writes.
             for (String field : List.of("comment", "inline_comment")) {
@@ -1020,7 +1456,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 }
             }
             if (params.has("name"))
-                function.setName(requireString(params, "name"), SourceType.USER_DEFINED);
+                function.setName(leafName, SourceType.USER_DEFINED);
             monitor.checkCancelled();
             invalidateAnalysisCaches();
             JsonObject readback = annotationReadback(function);
@@ -1028,7 +1464,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 if (!params.has(field)) continue;
                 String requested = requireText(params, field);
                 JsonElement measured = readback.get(field);
-                String expected = !field.equals("name") && requested.isEmpty() ? null : requested;
+                String expected = field.equals("name") ? leafName : requested.isEmpty() ? null : requested;
                 String observed = field.equals("name") ? function.getName() :
                     (measured.isJsonNull() ? null : measured.getAsString());
                 if (!java.util.Objects.equals(expected, observed))
@@ -1058,6 +1494,22 @@ public final class ReaGhidraBridge extends HeadlessScript {
         }
     }
 
+    private String symbolLeafName(Symbol symbol, String requested) throws ghidra.util.exception.InvalidInputException {
+        // Fully qualified readback must be usable as an idempotent rename input.
+        if (requested.equals(symbol.getName(true))) return symbol.getName();
+        String namespace = symbol.getParentNamespace().isGlobal()
+            ? "" : symbol.getParentNamespace().getName(true);
+        String prefix = namespace + "::";
+        if (!namespace.isEmpty() && requested.startsWith(prefix)) {
+            String leaf = requested.substring(prefix.length());
+            if (!leaf.isEmpty()) return leaf;
+            throw new ghidra.util.exception.InvalidInputException(
+                "Symbol name has an empty leaf within namespace " + namespace + " at " +
+                canonicalAddress(symbol.getAddress()) + ": " + requested);
+        }
+        return requested;
+    }
+
     private static String requireText(JsonObject params, String field) {
         JsonElement value = params.get(field);
         if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString())
@@ -1065,25 +1517,53 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return value.getAsString();
     }
 
+    private static void validateAnnotationText(String text, String field) {
+        for (int index = 0; index < text.length(); index++) {
+            char character = text.charAt(index);
+            if (character == 0)
+                throw new RequestFailure("invalid_request", "Annotation " + field + " contains NUL at UTF-16 index " + index + "; Ghidra's decompiler cannot marshal NUL text");
+            if (Character.isHighSurrogate(character) && index + 1 < text.length() &&
+                Character.isLowSurrogate(text.charAt(index + 1))) {
+                index++;
+                continue;
+            }
+            if (Character.isSurrogate(character))
+                throw new RequestFailure("invalid_request", "Annotation " + field + " contains an unpaired Unicode surrogate at UTF-16 index " + index + "; Ghidra cannot preserve it as annotation text");
+        }
+    }
+
     private JsonObject analyzeFunction(JsonObject params) throws Exception {
+        return analyzeFunctionObservation(params).dossier();
+    }
+
+    private FunctionAnalysisObservation analyzeFunctionObservation(JsonObject params) throws Exception {
         requireKeys(params, Set.of("procedure"));
         Function function = resolveProcedure(requireString(params, "procedure"));
         InstructionScan scan = scanInstructions(function, Integer.MAX_VALUE);
         DecompileResults decompilation = decompile(function);
         String pseudocode = decompiledText(decompilation);
+        JsonObject availability = new JsonObject();
+        availability.add("pseudocode", facetAvailability(
+            pseudocode != null,
+            function.isExternal() ? "Ghidra does not decompile external functions."
+                : function.getBody().isEmpty() ? "Ghidra has no function body to decompile."
+                : "Ghidra completed decompilation without returning pseudocode."
+        ));
         if (pseudocode == null) {
             pseudocode = "";
         }
-        List<Reference> incomingReferences = collectReferences(scan.instructions, "incoming")
-            .stream()
+        List<Reference> bodyIncoming = collectReferences(function, "incoming");
+        List<Reference> incomingReferences = bodyIncoming.stream()
             .filter(reference -> !function.getBody().contains(reference.getFromAddress()))
             .toList();
-        List<Reference> outgoingReferences = collectReferences(scan.instructions, "outgoing");
+        List<Reference> outgoingReferences = collectReferences(function, "outgoing");
         JsonArray incoming = referenceEdges(incomingReferences);
         JsonArray outgoing = referenceEdges(outgoingReferences);
-        JsonArray comments = comments(scan.instructions);
-        JsonArray callers = procedureIdentities(function.getCallingFunctions(monitor));
-        JsonArray callees = procedureIdentities(function.getCalledFunctions(monitor));
+        JsonArray comments = comments(function);
+        Set<Function> callerFunctions = function.getCallingFunctions(monitor);
+        JsonArray callers = procedureIdentities(callerFunctions);
+        Set<Function> calleeFunctions = function.getCalledFunctions(monitor);
+        JsonArray callees = procedureIdentities(calleeFunctions);
         JsonArray referencedStrings = referencedStrings(outgoingReferences);
         JsonArray referencedNames = referencedNames(outgoingReferences);
         JsonArray blocks = basicBlockValues(function);
@@ -1104,12 +1584,28 @@ public final class ReaGhidraBridge extends HeadlessScript {
         result.add("outgoing_references", outgoing);
         result.add("referenced_strings", referencedStrings);
         result.add("referenced_names", referencedNames);
+        boolean swift = swiftProgram();
+        boolean aarch64 = currentProgram.getLanguageID().getIdAsString().startsWith("AARCH64:");
+        SwiftStringLiteralDecode swiftLiterals = swift && aarch64 ? swiftStringLiterals(function) : null;
+        if (swiftLiterals != null) {
+            result.add("swift_string_literals", swiftLiterals.literals());
+            result.add("swift_string_literal_omissions", swiftLiterals.omissions());
+        }
         result.add("basic_blocks", blocks);
         result.add(
             "native_api",
             nativeApiBoundary(function, decompilation)
         );
         result.add("native_value_flow", nativeValueFlow(decompilation));
+        // Successful full queries distinguish collected empty sets from missing facts.
+        // Availability does not claim that Ghidra resolved every runtime relationship.
+        for (String facet : List.of("comments", "callers", "callees", "references", "strings_names", "cfg")) {
+            availability.add(facet, facetAvailability(true, null));
+        }
+        availability.add("assembly", facetAvailability(
+            !scan.truncated(), "The function instruction scan was truncated."
+        ));
+        result.add("facet_availability", availability);
         JsonArray limitations = new JsonArray();
         limitations.add(
             "Unresolved computed or indirect flows without target addresses are not represented as reference edges."
@@ -1123,12 +1619,39 @@ public final class ReaGhidraBridge extends HeadlessScript {
         limitations.add(
             "Synthetic Ghidra entry-point references without actionable memory sources are omitted."
         );
+        if (swift && aarch64) {
+            limitations.add(
+                "Swift String literals are decoded from constant register pairs at calls, returns and paired stores. Literals stored one word at a time, chosen by conditional selects, or built at runtime are not reported; candidate pairs at unresolved jumps are retained as unknown omissions."
+            );
+            if (swiftLiterals.omissions().size() > 0) {
+                limitations.add(
+                    "Swift String literal records listed in swift_string_literal_omissions could not be retained or decoded within this dossier's remaining heap budget; later symbolic flows remain unexamined."
+                );
+            }
+        } else if (swift) {
+            limitations.add(
+                "Swift String literal decoding is implemented for AArch64 register pairs only; no Swift literals were decoded for this architecture."
+            );
+        }
+        CallBoundaryObservation calls = callBoundaryObservation(
+            function, scan.instructions, calleeFunctions, true, outgoingReferences);
+        result.add("unresolved_calls", calls.unresolvedCalls());
+        for (String limitation : calls.limitations()) {
+            limitations.add(limitation);
+        }
         if (decompilation != null && decompilation.getErrorMessage() != null &&
             !decompilation.getErrorMessage().isBlank()) {
             limitations.add("Ghidra decompiler diagnostic: " + decompilation.getErrorMessage());
         }
         result.add("limitations", limitations);
-        return result;
+        monitor.checkCancelled();
+        int missingCallers = 0;
+        for (Reference reference : bodyIncoming) {
+            monitor.checkCancelled();
+            if (unrepresentedCaller(reference, callerFunctions)) missingCallers++;
+        }
+        return new FunctionAnalysisObservation(result, calls.limitations(),
+            callRelationshipCoverage(calls, missingCallers));
     }
 
     private JsonObject nativeValueFlow(DecompileResults decompilation) throws Exception {
@@ -1363,6 +1886,89 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return symbol == null ? JsonNull.INSTANCE : GSON.toJsonTree(symbol.getName(true));
     }
 
+    // Analyst naming: a function entry renames the function, other addresses get a primary label.
+    private boolean applyAddressName(Address address, String name) throws Exception {
+        if (!currentProgram.getMemory().contains(address))
+            throw new RequestFailure("invalid_request", "Address is not mapped: " + canonicalAddress(address));
+        validateAnnotationText(name, "name");
+        int transaction = currentProgram.startTransaction("REA address name");
+        boolean commit = false;
+        try {
+            Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+            SymbolTable table = currentProgram.getSymbolTable();
+            Symbol primary = function == null ? table.getPrimarySymbol(address) : function.getSymbol();
+            Namespace namespace = primary == null
+                ? currentProgram.getGlobalNamespace()
+                : primary.getParentNamespace();
+            String expected = primary == null ? name : symbolLeafName(primary, name);
+            for (Symbol symbol : table.getLabelOrFunctionSymbols(expected, namespace)) {
+                if (!address.equals(symbol.getAddress())) return false;
+            }
+            if (function != null) {
+                function.setName(expected, SourceType.USER_DEFINED);
+            } else {
+                if (primary != null && !primary.isDynamic()) {
+                    primary.setName(expected, SourceType.USER_DEFINED);
+                } else {
+                    Symbol created = table.createLabel(address, expected, SourceType.USER_DEFINED);
+                    created.setPrimary();
+                }
+            }
+            invalidateAnalysisCaches();
+            Symbol readback = currentProgram.getSymbolTable().getPrimarySymbol(address);
+            commit = readback != null && expected.equals(readback.getName());
+            return commit;
+        }
+        catch (ghidra.util.exception.InvalidInputException | ghidra.util.exception.DuplicateNameException exception) {
+            return false;
+        }
+        finally {
+            currentProgram.endTransaction(transaction, commit);
+        }
+    }
+
+    private JsonElement setAddressName(JsonObject params) throws Exception {
+        requireKeys(params, Set.of("document", "address", "name"));
+        requireDocument(params);
+        return GSON.toJsonTree(applyAddressName(requireAddress(params, "address"), requireString(params, "name")));
+    }
+
+    private JsonElement setAddressesNames(JsonObject params) throws Exception {
+        requireKeys(params, Set.of("document", "names"));
+        requireDocument(params);
+        if (!params.has("names") || !params.get("names").isJsonObject())
+            throw new RequestFailure("invalid_request", "names must be an object of address -> name");
+        Map<Address, List<AddressNameRequest>> requestsByAddress = new LinkedHashMap<>();
+        JsonObject result = new JsonObject();
+        for (Map.Entry<String, JsonElement> entry : params.getAsJsonObject("names").entrySet()) {
+            try {
+                Address address = parseReaAddress(entry.getKey());
+                requestsByAddress.computeIfAbsent(address, ignored -> new ArrayList<>())
+                    .add(new AddressNameRequest(entry.getKey(), address, entry.getValue().getAsString()));
+            }
+            catch (RequestFailure failure) {
+                result.addProperty(entry.getKey(), false);
+            }
+        }
+        for (List<AddressNameRequest> requests : requestsByAddress.values()) {
+            String name = requests.get(0).name;
+            boolean conflictingAliasNames = requests.stream()
+                .anyMatch(request -> !request.name.equals(name));
+            boolean success = false;
+            if (!conflictingAliasNames) {
+                try {
+                    success = applyAddressName(requests.get(0).address, name);
+                }
+                catch (RequestFailure failure) {
+                    // Keep per-address failures in the existing batch result shape.
+                }
+            }
+            for (AddressNameRequest request : requests)
+                result.addProperty(request.inputAddress, success);
+        }
+        return result;
+    }
+
     private JsonArray listDocuments(JsonObject params) {
         requireKeys(params, Set.of());
         JsonArray result = new JsonArray();
@@ -1471,6 +2077,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
             : regexMatcher(expression, caseSensitive);
         JsonArray items = new JsonArray();
         for (InventoryItem item : inventory) {
+            monitor.checkCancelled();
             if (!matcher.matches(item.value)) {
                 continue;
             }
@@ -1581,33 +2188,58 @@ public final class ReaGhidraBridge extends HeadlessScript {
     }
 
     private Function resolveProcedure(String value) throws Exception {
-        Address address = tryParseAddress(value);
-        if (address != null) {
-            Function function = currentProgram.getFunctionManager().getFunctionAt(address);
-            if (function == null && address.isMemoryAddress()) {
-                function = currentProgram.getFunctionManager().getFunctionContaining(address);
+        // Explicit address syntax wins; an unprefixed identifier is first an
+        // exact symbol name, even when every character is a hexadecimal digit.
+        boolean explicitAddress = isExplicitReaAddress(value);
+        if (!explicitAddress) {
+            List<Function> matches = new ArrayList<>();
+            for (FunctionEntry entry : procedures()) {
+                monitor.checkCancelled();
+                Function function = entry.function;
+                Symbol symbol = function.getSymbol();
+                String qualified = symbol == null ? function.getName() : symbol.getName(true);
+                boolean matchesName = function.getName().equals(value) || qualified.equals(value);
+                if (!matchesName) {
+                    // Imported labels (for example Mach-O _main) can share a
+                    // function entry without becoming its primary symbol. Only
+                    // exact entries qualify; an interior label is not a selector.
+                    for (Symbol entrySymbol : currentProgram.getSymbolTable().getSymbols(function.getEntryPoint())) {
+                        monitor.checkCancelled();
+                        if (entrySymbol.getName().equals(value) || entrySymbol.getName(true).equals(value)) {
+                            matchesName = true;
+                            break;
+                        }
+                    }
+                }
+                if (matchesName) matches.add(function);
             }
-            if (function == null) {
-                throw new RequestFailure("not_found", "No procedure exists at the requested address");
-            }
-            return function;
+            if (matches.size() > 1)
+                throw new RequestFailure("ambiguous", "Ghidra procedure name is ambiguous: " + value +
+                    "; select an exact entry address from " + matches.stream()
+                        .map(function -> canonicalAddress(function.getEntryPoint())).toList());
+            if (matches.size() == 1) return matches.get(0);
         }
-        List<Function> matches = new ArrayList<>();
-        for (FunctionEntry entry : procedures()) {
-            Function function = entry.function;
-            Symbol symbol = function.getSymbol();
-            String qualified = symbol == null ? function.getName() : symbol.getName(true);
-            if (function.getName().equals(value) || qualified.equals(value)) {
-                matches.add(function);
-            }
-        }
-        if (matches.isEmpty()) {
-            throw new RequestFailure("not_found", "Unknown Ghidra procedure name");
-        }
-        if (matches.size() != 1) {
-            throw new RequestFailure("ambiguous", "Ghidra procedure name is ambiguous");
-        }
-        return matches.get(0);
+        // Retain legacy bare-hex address input only when no symbol matches.
+        Address address = explicitAddress ? parseReaAddress(value) : tryParseAddress(value);
+        if (address == null)
+            throw new RequestFailure("not_found", "Unknown Ghidra procedure name or address: " + value);
+        Function function = functionAtOrContaining(address);
+        if (function == null)
+            // Other procedure operations retain their analysis-address semantics.
+            throw new RequestFailure("not_found", "No procedure exists at the requested address: " + value +
+                "; Ghidra image base: " + canonicalAddress(currentProgram.getImageBase()) +
+                ". Choose an observed analysis address. CLI: rea search <path> . --kind procedures --mode regex --provider ghidra --json; " +
+                "MCP: list_procedures. Inspect the loaded base and source mappings with CLI rea analyze <path> --provider ghidra --json " +
+                "and rea inspect-native-load-image <path> --provider ghidra --json, or MCP binary_overview and inspect_native_load_image. " +
+                "Repeat the original target options. For decompile, select source coordinates explicitly with --file-offset=0x... or MCP procedure file-offset:0x....");
+        return function;
+    }
+
+    private Function functionAtOrContaining(Address address) {
+        Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+        return function == null && address.isMemoryAddress()
+            ? currentProgram.getFunctionManager().getFunctionContaining(address)
+            : function;
     }
 
     private JsonObject nativeApiBoundary(
@@ -1811,9 +2443,20 @@ public final class ReaGhidraBridge extends HeadlessScript {
         );
         JumpTable.LoadTable[] loadTables = jumpTable.getLoadTables();
         RecoveredAArch64RelativeTable recoveredAArch64 =
-            loadTables.length == 0
-                ? recoverAArch64RelativeTable(jumpTable)
-                : null;
+            recoverAArch64RelativeTable(jumpTable);
+        if (recoveredAArch64 != null && loadTables.length > 0) {
+            // A decoded table only adds evidence when Ghidra's own load table
+            // describes the same bytes; any disagreement keeps Ghidra's view.
+            boolean agrees = false;
+            for (JumpTable.LoadTable loadTable : loadTables) {
+                if (loadTable.getAddress().equals(recoveredAArch64.tableAddress) &&
+                    loadTable.getSize() == recoveredAArch64.entrySize &&
+                    loadTable.getNum() == recoveredAArch64.mappings.size()) {
+                    agrees = true;
+                }
+            }
+            if (!agrees) recoveredAArch64 = null;
+        }
         List<Address> referencedDataAddresses = loadTables.length == 0
             ? dispatchPathDataReferences(jumpTable)
             : List.of();
@@ -1847,7 +2490,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
             source.add("evidence", evidence);
             dataSources.add(source);
         }
-        if (recoveredAArch64 != null) {
+        if (recoveredAArch64 != null && loadTables.length == 0) {
             JsonObject source = new JsonObject();
             source.addProperty(
                 "address",
@@ -1862,9 +2505,16 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 inferenceEvidence(
                     "jump-table",
                     "ghidra-instruction-and-memory",
-                    "Decoded " + recoveredAArch64.mappings.size() +
+                    "Decoded " + recoveredAArch64.mappings.size() + " " +
+                    (recoveredAArch64.signedEntries ? "signed" : "unsigned") +
                     " entries of size " + recoveredAArch64.entrySize + " bytes from " + canonicalAddress(recoveredAArch64.tableAddress) +
-                    "; the AArch64 LDRB-or-LDRH/ADR/ADD/BR chain uses a selector guarded by an unsigned upper-bound branch."
+                    "; the AArch64 ADRP/ADD table, indexed load, ADR base, ADD" +
+                    (recoveredAArch64.offsetShift == 0 ? "" : " LSL #" + recoveredAArch64.offsetShift) +
+                    "/BR chain uses a selector bounded by CMP #" + recoveredAArch64.compareImmediate +
+                    " and " + recoveredAArch64.guardMnemonic + " on one straight-line path" +
+                    (recoveredAArch64.nullTarget == null
+                        ? "."
+                        : "; zero entries are routed by CBZ to " + canonicalAddress(recoveredAArch64.nullTarget) + ".")
                 )
             );
             source.add("evidence", evidence);
@@ -1903,6 +2553,33 @@ public final class ReaGhidraBridge extends HeadlessScript {
         result.add("data_sources", dataSources);
         Address[] targets = jumpTable.getCases();
         TypedJumpTableCases typedCases = typedJumpTableCases(jumpTable, caseTokens);
+        // Table indices identify the register bounded by CMP. Typed labels may
+        // instead identify a selector before normalization (for example, SUB
+        // index, selector, #10). Do not merge those distinct value identities.
+        if (recoveredAArch64 != null && recoveredAArch64.priorSelectorDefinition != null) {
+            typedCases.limitations.add(
+                "REA decoded the relative table, but the compared selector has an earlier register definition at " +
+                canonicalAddress(recoveredAArch64.priorSelectorDefinition) + "; its table indices are not proven to use the typed switch selector's case values. Ghidra's typed labels are retained and additional case labels remain unknown."
+            );
+            recoveredAArch64 = null;
+        }
+        if (recoveredAArch64 != null) {
+            for (Map.Entry<Long, Address> typed : typedCases.cases.entrySet()) {
+                long value = typed.getKey();
+                if (value < 0 || value >= recoveredAArch64.mappings.size()) {
+                    typedCases.limitations.add("Typed case labels and decoded table indices do not use a verified common selector; Ghidra's typed labels are retained.");
+                    recoveredAArch64 = null;
+                    break;
+                }
+                RecoveredAArch64Mapping decoded = recoveredAArch64.mappings.get((int) value);
+                boolean divertedZero = decoded.nullEntry && typed.getValue().equals(recoveredAArch64.unreachableZeroTarget);
+                if (!typed.getValue().equals(decoded.targetAddress) && !divertedZero) {
+                    typedCases.limitations.add("Typed case evidence and the decoded relative table disagree on a destination; Ghidra's typed labels are retained.");
+                    recoveredAArch64 = null;
+                    break;
+                }
+            }
+        }
         JsonArray mappings = new JsonArray();
         JsonArray defaultTargets = new JsonArray();
         for (Address target : typedCases.defaults) {
@@ -1910,27 +2587,30 @@ public final class ReaGhidraBridge extends HeadlessScript {
         }
         Set<Address> coveredTargets = new HashSet<>(typedCases.cases.values());
         coveredTargets.addAll(typedCases.defaults);
+        if (recoveredAArch64 != null && recoveredAArch64.unreachableZeroTarget != null) {
+            Address unreachable = recoveredAArch64.unreachableZeroTarget;
+            coveredTargets.add(unreachable);
+            for (RecoveredAArch64Mapping recovered : recoveredAArch64.mappings) {
+                if (recovered.nullEntry && unreachable.equals(typedCases.cases.get((long) recovered.tableIndex))) {
+                    typedCases.cases.remove((long) recovered.tableIndex);
+                }
+            }
+            typedCases.limitations.add(
+                "Ghidra recovered destination " + canonicalAddress(unreachable) +
+                " as the zero-offset decode of the relative table, but the CBZ before the dispatch diverts zero entries to " +
+                canonicalAddress(recoveredAArch64.nullTarget) + ", so the indirect branch never reaches it for an in-range case."
+            );
+        }
         if (recoveredAArch64 != null) {
             for (int index = 0; index < recoveredAArch64.mappings.size(); index += 1) {
                 monitor.checkCancelled();
                 RecoveredAArch64Mapping recovered = recoveredAArch64.mappings.get(index);
                 if (
                     typedCases.unknownTargets.contains(recovered.targetAddress) ||
-                    typedCases.ambiguousValues.contains((long) recovered.caseValue)
+                    typedCases.ambiguousValues.contains((long) recovered.tableIndex)
                 ) continue;
-                Address typedTarget = typedCases.cases.get((long) recovered.caseValue);
-                if (typedTarget != null && !typedTarget.equals(recovered.targetAddress)) {
-                    typedCases.cases.remove((long) recovered.caseValue);
-                    typedCases.ambiguousValues.add((long) recovered.caseValue);
-                    typedCases.unknownTargets.add(typedTarget);
-                    typedCases.unknownTargets.add(recovered.targetAddress);
-                    typedCases.limitations.add(
-                        "Typed case evidence and the verified relative table disagree on a destination; both destinations remain unknown for that case."
-                    );
-                    continue;
-                }
                 JsonObject mapping = new JsonObject();
-                mapping.addProperty("case_value", recovered.caseValue);
+                mapping.addProperty("case_value", recovered.tableIndex);
                 String targetAddress = canonicalAddress(recovered.targetAddress);
                 mapping.addProperty("target_address", targetAddress);
                 mapping.addProperty("confidence", "high");
@@ -1939,14 +2619,18 @@ public final class ReaGhidraBridge extends HeadlessScript {
                     inferenceEvidence(
                         "jump-table",
                         "ghidra-instruction-and-memory",
-                        "Case value " + recovered.caseValue + (recoveredAArch64.entrySize == 1 ? " indexes byte " : " indexes halfword at byte offset ") +
-                        (recovered.caseValue * recoveredAArch64.entrySize) + " at " + canonicalAddress(recoveredAArch64.tableAddress) +
-                        "; the loaded unsigned entry selects a four-byte instruction offset from " +
-                        canonicalAddress(recoveredAArch64.branchBase) + ", reaching " + targetAddress + "."
+                        "Case value " + recovered.tableIndex + (recoveredAArch64.entrySize == 1 ? " indexes byte " : " indexes halfword at byte offset ") +
+                        (recovered.tableIndex * recoveredAArch64.entrySize) + " at " + canonicalAddress(recoveredAArch64.tableAddress) +
+                        (recovered.nullEntry
+                            ? "; the entry is zero, so the CBZ before the dispatch branches to " + targetAddress + "."
+                            : "; the loaded " + (recoveredAArch64.signedEntries ? "signed" : "unsigned") +
+                              " entry " + recovered.encodedEntry + " selects a " +
+                              (recoveredAArch64.offsetShift == 2 ? "four-byte instruction" : "byte") +
+                              " offset from " + canonicalAddress(recoveredAArch64.branchBase) + ", reaching " + targetAddress + ".")
                     )
                 );
                 mapping.add("evidence", evidence);
-                if (!typedCases.cases.containsKey((long) recovered.caseValue)) {
+                if (!typedCases.cases.containsKey((long) recovered.tableIndex)) {
                     mappings.add(mapping);
                 }
                 coveredTargets.add(recovered.targetAddress);
@@ -2020,7 +2704,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
             );
         }
         if (recoveredAArch64 == null && loadTables.length == 0 && currentProgram.getLanguageID().getIdAsString().startsWith("AARCH64:")) {
-            limitations.add("REA did not verify a supported byte/halfword relative dispatch chain with exact unsigned bounds and register definitions; unsupported encodings and ambiguous bounds remain unknown.");
+            limitations.add("REA did not verify a supported signed or unsigned byte/halfword relative dispatch chain with exact unsigned bounds and register definitions; unsupported encodings and ambiguous bounds remain unknown.");
         }
         if (targets.length == 0) {
             limitations.add(
@@ -2150,12 +2834,21 @@ public final class ReaGhidraBridge extends HeadlessScript {
     }
 
     private static final class RecoveredAArch64Mapping {
-        private final int caseValue;
+        private final int tableIndex;
         private final Address targetAddress;
+        private final long encodedEntry;
+        private final boolean nullEntry;
 
-        private RecoveredAArch64Mapping(int caseValue, Address targetAddress) {
-            this.caseValue = caseValue;
+        private RecoveredAArch64Mapping(
+            int tableIndex,
+            Address targetAddress,
+            long encodedEntry,
+            boolean nullEntry
+        ) {
+            this.tableIndex = tableIndex;
             this.targetAddress = targetAddress;
+            this.encodedEntry = encodedEntry;
+            this.nullEntry = nullEntry;
         }
     }
 
@@ -2163,24 +2856,70 @@ public final class ReaGhidraBridge extends HeadlessScript {
         private final Address tableAddress;
         private final Address branchBase;
         private final int entrySize;
+        private final Address priorSelectorDefinition;
+        private final boolean signedEntries;
+        private final int offsetShift;
+        private final String guardMnemonic;
+        private final long compareImmediate;
+        private final Address nullTarget;
+        private final Address unreachableZeroTarget;
         private final List<RecoveredAArch64Mapping> mappings;
 
         private RecoveredAArch64RelativeTable(
             Address tableAddress,
             Address branchBase,
             int entrySize,
+            Address priorSelectorDefinition,
+            boolean signedEntries,
+            int offsetShift,
+            String guardMnemonic,
+            long compareImmediate,
+            Address nullTarget,
+            Address unreachableZeroTarget,
             List<RecoveredAArch64Mapping> mappings
         ) {
             this.tableAddress = tableAddress;
             this.branchBase = branchBase;
             this.entrySize = entrySize;
+            this.priorSelectorDefinition = priorSelectorDefinition;
+            this.signedEntries = signedEntries;
+            this.offsetShift = offsetShift;
+            this.guardMnemonic = guardMnemonic;
+            this.compareImmediate = compareImmediate;
+            this.nullTarget = nullTarget;
+            this.unreachableZeroTarget = unreachableZeroTarget;
             this.mappings = mappings;
         }
     }
 
+    private static final Pattern AARCH64_DISPATCH_ADD = Pattern.compile(
+        "(?i)^([wx]\\d+),\\s*([wx]\\d+),\\s*([wx]\\d+)(?:,\\s*LSL\\s*#(?:0x)?([0-9a-f]+))?$"
+    );
+    private static final Pattern AARCH64_TABLE_LOAD = Pattern.compile(
+        "(?i)^([wx]\\d+),\\s*\\[([wx]\\d+),\\s*([wx]\\d+)(?:,\\s*(LSL|UXTW)\\s*(?:#(?:0x)?([0-9a-f]+))?)?\\s*\\]$"
+    );
+    private static final Pattern AARCH64_REGISTER_AND_ADDRESS = Pattern.compile(
+        "(?i)^([wx]\\d+),\\s*(0x[0-9a-f]+)$"
+    );
+    private static final Pattern AARCH64_ADD_IMMEDIATE = Pattern.compile(
+        "(?i)^([wx]\\d+),\\s*([wx]\\d+),\\s*#?(0x[0-9a-f]+|[0-9]+)$"
+    );
+    private static final Pattern AARCH64_COMPARE_IMMEDIATE = Pattern.compile(
+        "(?i)^([wx]\\d+),\\s*#?(0x[0-9a-f]+|[0-9]+)$"
+    );
+    private static final Pattern AARCH64_MOVE_REGISTER = Pattern.compile(
+        "(?i)^([wx]\\d+),\\s*([wx]\\d+)$"
+    );
+    private static final Set<String> AARCH64_FLAG_PRESERVING =
+        Set.of("MOV", "ADRP", "ADR", "ADD");
+
     /**
-     * Recover only the directly verified AArch64 byte/halfword-indexed relative branch
-     * table form. Other instruction sequences keep their case labels unknown.
+     * Recover only directly verified AArch64 relative branch tables:
+     * ADRP/ADD table base, LDRB/LDRH/LDRSB/LDRSH entry load with an exact
+     * index scale, ADR branch base, optional CBZ on the loaded entry, and
+     * ADD (byte or LSL #2 scale)/BR, with a selector bounded by CMP #imm and an
+     * unsigned B.HI or B.CS/B.HS guard on one straight-line path. Any other
+     * instruction sequence keeps its case labels unknown.
      */
     private RecoveredAArch64RelativeTable recoverAArch64RelativeTable(
         JumpTable jumpTable
@@ -2202,167 +2941,265 @@ public final class ReaGhidraBridge extends HeadlessScript {
             if (instruction.getAddress().equals(jumpTable.getSwitchAddress())) break;
         }
         int branchIndex = instructions.size() - 1;
-        if (branchIndex < 1 ||
-            !instructions.get(branchIndex).getMnemonicString().equalsIgnoreCase("BR")) {
+        if (branchIndex < 1 || !mnemonic(instructions.get(branchIndex)).equals("BR")) {
+            return null;
+        }
+        Set<String> recoveredTargetSet = new HashSet<>();
+        for (Address target : jumpTable.getCases()) recoveredTargetSet.add(canonicalAddress(target));
+        if (recoveredTargetSet.isEmpty()) return null;
+        return matchAArch64RelativeDispatch(
+            instructions,
+            branchIndex,
+            recoveredTargetSet,
+            dispatchPathDataReferences(jumpTable)
+        );
+    }
+
+    private RecoveredAArch64RelativeTable matchAArch64RelativeDispatch(
+        List<Instruction> instructions,
+        int branchIndex,
+        Set<String> recoveredTargetSet,
+        List<Address> dataAddresses
+    ) throws Exception {
+        String branchRegister = normalizedRegister(operands(instructions.get(branchIndex)));
+
+        // ADD Xd, Xn, Xm{, LSL #s}; BR Xd. LSL applies to Xm only.
+        Instruction dispatchAdd = instructions.get(branchIndex - 1);
+        if (!mnemonic(dispatchAdd).equals("ADD")) return null;
+        java.util.regex.Matcher addMatcher = AARCH64_DISPATCH_ADD.matcher(operands(dispatchAdd));
+        if (!addMatcher.matches() || !addMatcher.group(1).toLowerCase(Locale.ROOT).startsWith("x")) return null;
+        if (!normalizedRegister(addMatcher.group(1)).equals(branchRegister)) return null;
+        int offsetShift = addMatcher.group(4) == null ? 0 : Integer.parseInt(addMatcher.group(4), 16);
+        if (offsetShift != 0 && offsetShift != 2) return null;
+        String firstSource = normalizedRegister(addMatcher.group(2));
+        String secondSource = normalizedRegister(addMatcher.group(3));
+        if (firstSource.equals(secondSource)) return null;
+
+        // The entry register is the source whose latest definition is the
+        // table load; the other source must be defined by ADR.
+        int loadIndex = -1;
+        String entryRegister = null;
+        String baseRegister = null;
+        for (String candidate : offsetShift == 0 ? List.of(secondSource, firstSource) : List.of(secondSource)) {
+            int writer = latestWriter(instructions, branchIndex - 1, candidate);
+            if (writer >= 0 && Set.of("LDRB", "LDRH", "LDRSB", "LDRSH").contains(mnemonic(instructions.get(writer)))) {
+                loadIndex = writer;
+                entryRegister = candidate;
+                baseRegister = candidate.equals(firstSource) ? secondSource : firstSource;
+                break;
+            }
+        }
+        if (loadIndex < 0) return null;
+
+        Instruction load = instructions.get(loadIndex);
+        String loadMnemonic = mnemonic(load);
+        int entrySize = loadMnemonic.endsWith("B") ? 1 : 2;
+        boolean signedEntries = loadMnemonic.startsWith("LDRS");
+        java.util.regex.Matcher loadMatcher = AARCH64_TABLE_LOAD.matcher(operands(load));
+        if (!loadMatcher.matches()) return null;
+        // A signed load into a W register sign-extends only to 32 bits; the
+        // 64-bit dispatch ADD would then read a zero-extended value.
+        if (signedEntries && !loadMatcher.group(1).toLowerCase(Locale.ROOT).startsWith("x")) return null;
+        String tableBaseRegister = normalizedRegister(loadMatcher.group(2));
+        String indexRegister = normalizedRegister(loadMatcher.group(3));
+        boolean wordIndex = loadMatcher.group(3).toLowerCase(Locale.ROOT).startsWith("w");
+        String extend = loadMatcher.group(4) == null ? null : loadMatcher.group(4).toUpperCase(Locale.ROOT);
+        int indexShift = loadMatcher.group(5) == null ? 0 : Integer.parseInt(loadMatcher.group(5), 16);
+        if (wordIndex ? !"UXTW".equals(extend) : "UXTW".equals(extend)) return null;
+        if (indexShift != (entrySize == 1 ? 0 : 1)) return null;
+
+        // Only ADR and one CBZ on the entry may sit between load and ADD.
+        Address nullTarget = null;
+        for (int index = loadIndex + 1; index < branchIndex - 1; index += 1) {
+            Instruction instruction = instructions.get(index);
+            String name = mnemonic(instruction);
+            if (name.equals("ADR")) continue;
+            if (name.equals("CBZ") && nullTarget == null) {
+                String[] parts = operands(instruction).split(",");
+                Address[] flows = instruction.getFlows();
+                if (parts.length != 2 || flows.length != 1 ||
+                    !normalizedRegister(parts[0]).equals(entryRegister)) return null;
+                nullTarget = flows[0];
+                continue;
+            }
             return null;
         }
 
-        Address[] recoveredTargets = jumpTable.getCases();
-        Set<String> recoveredTargetSet = new HashSet<>();
-        for (Address target : recoveredTargets) recoveredTargetSet.add(canonicalAddress(target));
-        List<Address> dataAddresses = dispatchPathDataReferences(jumpTable);
+        int baseIndex = latestWriter(instructions, branchIndex - 1, baseRegister);
+        if (baseIndex < 0 || !mnemonic(instructions.get(baseIndex)).equals("ADR")) return null;
+        java.util.regex.Matcher baseMatcher = AARCH64_REGISTER_AND_ADDRESS.matcher(operands(instructions.get(baseIndex)));
+        if (!baseMatcher.matches()) return null;
+        Address branchBase = addressFromOperand(baseMatcher.group(2));
 
-        for (int loadIndex = 0; loadIndex < branchIndex; loadIndex += 1) {
-            Instruction load = instructions.get(loadIndex);
-            int entrySize = load.getMnemonicString().equalsIgnoreCase("LDRB") ? 1 : load.getMnemonicString().equalsIgnoreCase("LDRH") ? 2 : 0;
-            if (entrySize == 0 || branchIndex != loadIndex + 2 || loadIndex < 3 ||
-                !instructions.get(loadIndex - 1).getMnemonicString().equalsIgnoreCase("ADR") ||
-                !instructions.get(loadIndex - 2).getMnemonicString().equalsIgnoreCase("ADD") ||
-                !instructions.get(loadIndex - 3).getMnemonicString().equalsIgnoreCase("ADRP")) continue;
-            String loadOperands = operands(load);
-            java.util.regex.Matcher loadMatcher = java.util.regex.Pattern
-                .compile(entrySize == 1 ? "(?i)^[wx]\\d+,\\s*\\[([wx]\\d+),\\s*([wx]\\d+)\\]$" : "(?i)^[wx]\\d+,\\s*\\[([wx]\\d+),\\s*([wx]\\d+),\\s*LSL\\s*#(?:0x)?1\\]$")
-                .matcher(loadOperands);
-            if (!loadMatcher.matches()) continue;
-            String loadedRegister = normalizedRegister(loadOperands.substring(0, loadOperands.indexOf(',')));
-            String tableBaseRegister = normalizedRegister(loadMatcher.group(1));
-            String indexRegister = normalizedRegister(loadMatcher.group(2));
+        int tableAddIndex = latestWriter(instructions, loadIndex, tableBaseRegister);
+        if (tableAddIndex < 0 || !mnemonic(instructions.get(tableAddIndex)).equals("ADD")) return null;
+        java.util.regex.Matcher tableAddMatcher = AARCH64_ADD_IMMEDIATE.matcher(operands(instructions.get(tableAddIndex)));
+        if (!tableAddMatcher.matches() ||
+            !normalizedRegister(tableAddMatcher.group(1)).equals(tableBaseRegister) ||
+            !normalizedRegister(tableAddMatcher.group(2)).equals(tableBaseRegister)) return null;
+        int tablePageIndex = latestWriter(instructions, tableAddIndex, tableBaseRegister);
+        if (tablePageIndex < 0 || !mnemonic(instructions.get(tablePageIndex)).equals("ADRP")) return null;
+        java.util.regex.Matcher pageMatcher = AARCH64_REGISTER_AND_ADDRESS.matcher(operands(instructions.get(tablePageIndex)));
+        if (!pageMatcher.matches() || !normalizedRegister(pageMatcher.group(1)).equals(tableBaseRegister)) return null;
+        Address tableAddress = addressFromOperand(pageMatcher.group(2)).add(parseInteger(tableAddMatcher.group(3)));
+        if (!currentProgram.getMemory().contains(tableAddress) ||
+            (!dataAddresses.isEmpty() && !dataAddresses.contains(tableAddress))) return null;
 
-            Address resolvedTableAddress = null;
-            for (int index = loadIndex - 3; index < loadIndex - 1; index += 1) {
-                Instruction instruction = instructions.get(index);
-                String mnemonic = instruction.getMnemonicString().toUpperCase(Locale.ROOT);
-                String text = operands(instruction);
-                if (mnemonic.equals("ADRP") &&
-                    text.matches("(?i)^[wx]\\d+,\\s*0x[0-9a-f]+$")) {
-                    String[] parts = text.split(",");
-                    if (normalizedRegister(parts[0]).equals(tableBaseRegister)) {
-                        resolvedTableAddress = addressFromOperand(parts[1]);
-                    }
-                }
-                else if (mnemonic.equals("ADD") && resolvedTableAddress != null &&
-                    text.matches("(?i)^[wx]\\d+,\\s*[wx]\\d+,\\s*#?(?:0x[0-9a-f]+|[0-9]+)$")) {
-                    String[] parts = text.split(",");
-                    if (normalizedRegister(parts[0]).equals(tableBaseRegister) &&
-                        normalizedRegister(parts[1]).equals(tableBaseRegister)) {
-                        resolvedTableAddress = resolvedTableAddress.add(parseInteger(parts[2].trim().replaceFirst("^#", "")));
-                    }
-                }
+        // Unsigned guard: CMP Rs, #imm, then B.HI (imm + 1 entries) or
+        // B.CS/B.HS (imm entries), with only flag-preserving moves and
+        // address arithmetic between the compare and the load.
+        int guardIndex = -1;
+        for (int index = loadIndex - 1; index >= 0; index -= 1) {
+            String name = mnemonic(instructions.get(index));
+            if (name.startsWith("B.")) {
+                guardIndex = index;
+                break;
             }
-            if (resolvedTableAddress == null || !currentProgram.getMemory().contains(resolvedTableAddress) ||
-                (!dataAddresses.isEmpty() && !dataAddresses.contains(resolvedTableAddress))) continue;
-            Address tableAddress = resolvedTableAddress;
-
-            Address branchBase = null;
-            boolean addressChain = false;
-            for (int index = loadIndex - 1; index < branchIndex; index += 1) {
-                Instruction instruction = instructions.get(index);
-                String mnemonic = instruction.getMnemonicString().toUpperCase(Locale.ROOT);
-                String text = operands(instruction);
-                if (index < loadIndex && mnemonic.equals("ADR") && text.matches("(?i)^[wx]\\d+,\\s*0x[0-9a-f]+$")) {
-                    int comma = text.indexOf(',');
-                    String destination = normalizedRegister(text.substring(0, comma));
-                    if (!destination.equals(normalizedRegister(operands(instructions.get(branchIndex))))) continue;
-                    branchBase = addressFromOperand(text.substring(comma + 1));
-                }
-                if (index > loadIndex && mnemonic.equals("ADD") && branchBase != null &&
-                    text.matches("(?i)^[wx]\\d+,\\s*[wx]\\d+,\\s*[wx]\\d+,\\s*LSL\\s*#(?:0x)?2$")) {
-                    String[] parts = text.split(",");
-                    String destination = normalizedRegister(parts[0]);
-                    String base = normalizedRegister(parts[1]);
-                    String offset = normalizedRegister(parts[2]);
-                    if (destination.equals(base) &&
-                        base.equals(normalizedRegister(operands(instructions.get(branchIndex)))) &&
-                        offset.equals(loadedRegister)) {
-                        addressChain = true;
-                    }
-                }
-            }
-            if (!addressChain || branchBase == null) continue;
-
-            int entryCount = -1;
-            Address defaultTarget = null;
-            for (int compareIndex = 0; compareIndex < loadIndex; compareIndex += 1) {
-                Instruction compare = instructions.get(compareIndex);
-                if (!compare.getMnemonicString().equalsIgnoreCase("CMP")) continue;
-                java.util.regex.Matcher compareMatcher = java.util.regex.Pattern
-                    .compile("(?i)^([wx]\\d+),\\s*#?(0x[0-9a-f]+|[0-9]+)$")
-                    .matcher(operands(compare));
-                if (!compareMatcher.matches()) continue;
-                String comparedRegister = normalizedRegister(compareMatcher.group(1));
-                long upperBound = parseInteger(compareMatcher.group(2));
-                if (upperBound < 0 || upperBound >= 4096) continue;
-                for (int guardIndex = compareIndex + 1; guardIndex < loadIndex; guardIndex += 1) {
-                    Instruction guard = instructions.get(guardIndex);
-                    String mnemonic = guard.getMnemonicString().toUpperCase(Locale.ROOT);
-                    if (!mnemonic.equals("B.HI")) continue;
-                    Address[] flows = guard.getFlows();
-                    if (flows.length != 1 || !recoveredTargetSet.contains(canonicalAddress(flows[0]))) continue;
-                    boolean supportedSequence = true;
-                    for (int sequenceIndex = compareIndex + 1; sequenceIndex < loadIndex; sequenceIndex += 1) {
-                        String sequenceMnemonic = instructions.get(sequenceIndex)
-                            .getMnemonicString().toUpperCase(Locale.ROOT);
-                        if (!Set.of("B.HI", "MOV", "ADRP", "ADD", "ADR").contains(sequenceMnemonic)) {
-                            supportedSequence = false;
-                            break;
-                        }
-                    }
-                    Set<String> selectorAliases = new HashSet<>();
-                    selectorAliases.add(comparedRegister);
-                    Set<String> boundedIndexes = new HashSet<>();
-                    if (compareMatcher.group(1).toLowerCase(Locale.ROOT).startsWith("x")) boundedIndexes.add(comparedRegister);
-                    for (int sequenceIndex = compareIndex + 1; sequenceIndex < loadIndex; sequenceIndex++) {
-                        Instruction instruction = instructions.get(sequenceIndex);
-                        String[] parts = operands(instruction).split(",");
-                        if (parts.length == 0) continue;
-                        if (instruction.getMnemonicString().equalsIgnoreCase("MOV")) {
-                            String destination = normalizedRegister(parts[0]);
-                            String source = parts.length == 2 ? normalizedRegister(parts[1]) : "";
-                            boolean aliasesSelector = selectorAliases.contains(source);
-                            boolean fullWidthBounded = boundedIndexes.contains(source) ||
-                                (parts[0].trim().toLowerCase(Locale.ROOT).startsWith("w") && aliasesSelector);
-                            if (aliasesSelector) selectorAliases.add(destination);
-                            else selectorAliases.remove(destination);
-                            if (fullWidthBounded) boundedIndexes.add(destination);
-                            else boundedIndexes.remove(destination);
-                        } else if (Set.of("ADRP", "ADD", "ADR").contains(instruction.getMnemonicString().toUpperCase(Locale.ROOT))) {
-                            selectorAliases.remove(normalizedRegister(parts[0]));
-                            boundedIndexes.remove(normalizedRegister(parts[0]));
-                        }
-                    }
-                    boolean selectorFeedsTable = boundedIndexes.contains(indexRegister);
-                    if (compareIndex < loadIndex - 3 && selectorFeedsTable && supportedSequence) {
-                        entryCount = (int) upperBound + 1;
-                        defaultTarget = flows[0];
-                        break;
-                    }
-                }
-                if (entryCount > 0) break;
-            }
-            if (entryCount <= 0 || entryCount > 4096 || defaultTarget == null) continue;
-
-            List<RecoveredAArch64Mapping> mappings = new ArrayList<>();
-            Set<String> mappedTargets = new HashSet<>();
-            boolean valid = true;
-            for (int caseValue = 0; caseValue < entryCount; caseValue += 1) {
-                Address entry = tableAddress.add((long) caseValue * entrySize);
-                int encodedOffset = entrySize == 1 ? currentProgram.getMemory().getByte(entry) & 0xff : currentProgram.getMemory().getShort(entry) & 0xffff;
-                Address target = branchBase.add((long) encodedOffset * 4L);
-                String canonicalTarget = canonicalAddress(target);
-                if (!recoveredTargetSet.contains(canonicalTarget)) {
-                    valid = false;
-                    break;
-                }
-                mappedTargets.add(canonicalTarget);
-                mappings.add(new RecoveredAArch64Mapping(caseValue, target));
-            }
-            if (!valid || mappedTargets.contains(canonicalAddress(defaultTarget))) continue;
-            Set<String> accountedTargets = new HashSet<>(mappedTargets);
-            accountedTargets.add(canonicalAddress(defaultTarget));
-            if (!accountedTargets.equals(recoveredTargetSet)) continue;
-            return new RecoveredAArch64RelativeTable(tableAddress, branchBase, entrySize, List.copyOf(mappings));
+            if (!AARCH64_FLAG_PRESERVING.contains(name)) return null;
         }
-        return null;
+        if (guardIndex < 1) return null;
+        Instruction guard = instructions.get(guardIndex);
+        String guardMnemonic = mnemonic(guard);
+        if (!Set.of("B.HI", "B.CS", "B.HS").contains(guardMnemonic)) return null;
+        Address[] guardFlows = guard.getFlows();
+        if (guardFlows.length != 1) return null;
+        Address defaultTarget = guardFlows[0];
+        int compareIndex = -1;
+        for (int index = guardIndex - 1; index >= 0; index -= 1) {
+            String name = mnemonic(instructions.get(index));
+            if (name.equals("CMP")) {
+                compareIndex = index;
+                break;
+            }
+            if (!AARCH64_FLAG_PRESERVING.contains(name)) return null;
+        }
+        if (compareIndex < 0) return null;
+        java.util.regex.Matcher compareMatcher = AARCH64_COMPARE_IMMEDIATE.matcher(operands(instructions.get(compareIndex)));
+        if (!compareMatcher.matches()) return null;
+        String comparedRegister = normalizedRegister(compareMatcher.group(1));
+        boolean comparedFullWidth = compareMatcher.group(1).toLowerCase(Locale.ROOT).startsWith("x");
+        long compareImmediate = parseInteger(compareMatcher.group(2));
+        long entryCountLong = guardMnemonic.equals("B.HI") ? compareImmediate + 1 : compareImmediate;
+        if (entryCountLong <= 0 || entryCountLong > 4096) return null;
+        int entryCount = (int) entryCountLong;
+
+        // The loaded index must carry the compared value: either the compared
+        // register itself, unchanged since CMP, or a MOV copy made after CMP.
+        // A W compare bounds only the low 32 bits, so an X index needs a
+        // zero-extending W copy; a W index is zero-extended by UXTW.
+        int indexWriter = latestWriter(instructions, loadIndex, indexRegister);
+        boolean bounded = false;
+        if (indexWriter < compareIndex) {
+            bounded = indexRegister.equals(comparedRegister) && (wordIndex || comparedFullWidth);
+        }
+        else if (mnemonic(instructions.get(indexWriter)).equals("MOV")) {
+            java.util.regex.Matcher moveMatcher = AARCH64_MOVE_REGISTER.matcher(operands(instructions.get(indexWriter)));
+            if (moveMatcher.matches() &&
+                normalizedRegister(moveMatcher.group(2)).equals(comparedRegister) &&
+                latestWriter(instructions, indexWriter, comparedRegister) < compareIndex) {
+                boolean wordCopy = moveMatcher.group(1).toLowerCase(Locale.ROOT).startsWith("w");
+                bounded = wordCopy || comparedFullWidth;
+            }
+        }
+        if (!bounded) return null;
+
+        // Every fact above holds only on one straight-line fall-through path
+        // with no other entry into the window.
+        int windowStart = Math.min(Math.min(tablePageIndex, baseIndex), compareIndex);
+        for (int index = windowStart + 1; index <= branchIndex; index += 1) {
+            monitor.checkCancelled();
+            Instruction previous = instructions.get(index - 1);
+            Instruction current = instructions.get(index);
+            Address fallThrough = previous.getFallThrough();
+            if (fallThrough == null || !fallThrough.equals(current.getAddress())) return null;
+            ReferenceIterator incoming = currentProgram.getReferenceManager().getReferencesTo(current.getAddress());
+            while (incoming.hasNext()) {
+                if (incoming.next().getReferenceType().isFlow()) return null;
+            }
+        }
+
+        List<RecoveredAArch64Mapping> mappings = new ArrayList<>();
+        Set<String> mappedTargets = new HashSet<>();
+        for (int tableIndex = 0; tableIndex < entryCount; tableIndex += 1) {
+            monitor.checkCancelled();
+            Address entry = tableAddress.add((long) tableIndex * entrySize);
+            if (!currentProgram.getMemory().contains(entry)) return null;
+            long encoded;
+            if (entrySize == 1) {
+                byte value = currentProgram.getMemory().getByte(entry);
+                encoded = signedEntries ? value : value & 0xffL;
+            }
+            else {
+                short value = currentProgram.getMemory().getShort(entry);
+                encoded = signedEntries ? value : value & 0xffffL;
+            }
+            if (encoded == 0 && nullTarget != null) {
+                mappings.add(new RecoveredAArch64Mapping(tableIndex, nullTarget, encoded, true));
+                continue;
+            }
+            Address target;
+            try {
+                target = branchBase.addNoWrap(encoded << offsetShift);
+            }
+            catch (ghidra.program.model.address.AddressOverflowException overflow) {
+                return null;
+            }
+            String canonicalTarget = canonicalAddress(target);
+            if (!recoveredTargetSet.contains(canonicalTarget)) return null;
+            mappedTargets.add(canonicalTarget);
+            mappings.add(new RecoveredAArch64Mapping(tableIndex, target, encoded, false));
+        }
+        if (mappedTargets.contains(canonicalAddress(defaultTarget))) return null;
+        // Ghidra's recovered destinations must be fully accounted for by the
+        // decoded entries, the guard default, and the CBZ null path.
+        Set<String> accountedTargets = new HashSet<>(mappedTargets);
+        accountedTargets.add(canonicalAddress(defaultTarget));
+        if (nullTarget != null) accountedTargets.add(canonicalAddress(nullTarget));
+        // Ghidra does not model the CBZ, so it may decode a zero entry as a
+        // branch to the base itself. Only a zero entry encodes offset 0, and
+        // the CBZ diverts every zero entry, so the BR never reaches the base.
+        Address unreachableZeroTarget = null;
+        boolean divertedZeroEntry = mappings.stream().anyMatch(mapping -> mapping.nullEntry);
+        if (divertedZeroEntry &&
+            recoveredTargetSet.contains(canonicalAddress(branchBase)) &&
+            !mappedTargets.contains(canonicalAddress(branchBase)) &&
+            !branchBase.equals(defaultTarget) &&
+            !branchBase.equals(nullTarget)) {
+            unreachableZeroTarget = branchBase;
+            accountedTargets.add(canonicalAddress(branchBase));
+        }
+        if (!accountedTargets.containsAll(recoveredTargetSet)) return null;
+        int selectorWriter = latestWriter(instructions, compareIndex, comparedRegister);
+        return new RecoveredAArch64RelativeTable(
+            tableAddress,
+            branchBase,
+            entrySize,
+            selectorWriter < 0 ? null : instructions.get(selectorWriter).getAddress(),
+            signedEntries,
+            offsetShift,
+            guardMnemonic,
+            compareImmediate,
+            nullTarget,
+            unreachableZeroTarget,
+            List.copyOf(mappings)
+        );
+    }
+
+    private static String mnemonic(Instruction instruction) {
+        return instruction.getMnemonicString().toUpperCase(Locale.ROOT);
+    }
+
+    /** Index of the last instruction before {@code before} that writes {@code register}, or -1. */
+    private static int latestWriter(List<Instruction> instructions, int before, String register) {
+        for (int index = before - 1; index >= 0; index -= 1) {
+            for (Object result : instructions.get(index).getResultObjects()) {
+                if (result instanceof Register written &&
+                    normalizedRegister(written.getBaseRegister().getName()).equals(register)) {
+                    return index;
+                }
+            }
+        }
+        return -1;
     }
 
     private static String operands(Instruction instruction) {
@@ -2509,6 +3346,285 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return new InstructionScan(List.copyOf(instructions), iterator.hasNext());
     }
 
+    private JsonObject functionObservation(
+            JsonElement value,
+            List<String> limitations) {
+        JsonObject result = new JsonObject();
+        result.add("value", value);
+        result.add("limitations", GSON.toJsonTree(limitations));
+        return result;
+    }
+
+    private static JsonObject facetAvailability(boolean available, String reason) {
+        JsonObject result = new JsonObject();
+        result.addProperty("available", available);
+        if (!available) result.addProperty("reason", reason);
+        return result;
+    }
+
+    private JsonObject callRelationshipObservation(JsonElement value, CallBoundaryObservation calls)
+            throws Exception {
+        monitor.checkCancelled();
+        JsonObject result = functionObservation(value, calls.limitations());
+        result.add("relationship_coverage", callRelationshipCoverage(calls, null));
+        return result;
+    }
+
+    private static JsonObject callRelationshipCoverage(
+            CallBoundaryObservation calls, Integer missingCallers) {
+        JsonObject coverage = completeResolvedCallCoverage();
+        Integer omitted = calls == null ? null : calls.unrepresentedCalleeCalls();
+        JsonArray directions = new JsonArray();
+        if (missingCallers != null && missingCallers > 0) directions.add("callers");
+        String callerLimitation = missingCallers != null && missingCallers > 0
+            ? "Ghidra's caller inventory omits sources of " + missingCallers +
+                " call reference(s) into this function's body." : null;
+        if ((calls != null && omitted == null) || (calls == null && missingCallers == null)) {
+            coverage.addProperty("status", "unknown");
+            String reason = calls == null ? "No call inventory was examined."
+                : "The callee inventory was not examined alongside decoded call targets.";
+            coverage.addProperty("reason", reason + (callerLimitation == null ? "" : " " + callerLimitation));
+            if (calls == null && missingCallers == null) directions.add("callers");
+            directions.add("callees");
+            coverage.add("limited_directions", directions);
+            return coverage;
+        }
+        JsonArray limitations = new JsonArray();
+        if (callerLimitation != null) limitations.add(callerLimitation);
+        if (omitted != null && omitted > 0) {
+            limitations.add("Ghidra's callee inventory omits targets of " + omitted +
+                " call reference(s) or decoded call(s) without destinations.");
+            directions.add("callees");
+        }
+        if (!limitations.isEmpty()) {
+            coverage.addProperty("status", "partial");
+            coverage.add("limitations", limitations);
+            coverage.add("limited_directions", directions);
+        }
+        return coverage;
+    }
+
+    private static JsonObject completeResolvedCallCoverage() {
+        JsonObject coverage = new JsonObject();
+        coverage.addProperty("status", "complete");
+        JsonArray diagnostics = new JsonArray();
+        diagnostics.add(
+            "Only resolved Ghidra call references are returned; unresolved computed or indirect calls remain unknown, while function classifications distinguish thunks and externals."
+        );
+        coverage.add("diagnostics", diagnostics);
+        return coverage;
+    }
+
+    private boolean unrepresentedCaller(Reference reference, Set<Function> callers) {
+        if (!reference.getReferenceType().isCall()) return false;
+        Function caller = containingFunction(reference.getFromAddress());
+        return caller == null || !callers.contains(caller);
+    }
+
+    private int unrepresentedIncomingCalls(Function function, Set<Function> callers)
+            throws Exception {
+        int[] omitted = { 0 };
+        visitReferences(function, "incoming", reference -> {
+            if (unrepresentedCaller(reference, callers)) omitted[0]++;
+        });
+        return omitted[0];
+    }
+
+    private List<String> noReturnCallLimitations(
+            Function function, Iterable<Instruction> instructions)
+            throws Exception {
+        List<String> limitations = new ArrayList<>();
+        Instruction beforePrevious = null;
+        Instruction previous = null;
+        for (Instruction instruction : instructions) {
+            monitor.checkCancelled();
+            String limitation = terminalCallLimitation(instruction);
+            if (limitation != null) limitations.add(limitation);
+            if (beforePrevious != null && previous != null) {
+                String seh = borlandSehHandlerLimitation(
+                    function, beforePrevious, previous, instruction);
+                if (seh != null) limitations.add(seh);
+            }
+            beforePrevious = previous;
+            previous = instruction;
+        }
+        return limitations;
+    }
+
+    private CallBoundaryObservation callBoundaryObservation(
+            Function function, Iterable<Instruction> instructions, Set<Function> returnedCallees,
+            boolean includeUnresolvedSites, List<Reference> observedReferences)
+            throws Exception {
+        List<String> limitations = new ArrayList<>();
+        CallBoundaryReferences calls = new CallBoundaryReferences(returnedCallees, includeUnresolvedSites);
+        Instruction beforePrevious = null;
+        Instruction previous = null;
+        if (observedReferences == null) visitReferences(function, "outgoing", calls::observe);
+        else for (Reference reference : observedReferences) {
+            monitor.checkCancelled();
+            calls.observe(reference);
+        }
+        for (Instruction instruction : instructions) {
+            monitor.checkCancelled();
+            String limitation = terminalCallLimitation(instruction);
+            if (limitation != null) limitations.add(limitation);
+            if (beforePrevious != null && previous != null) {
+                String seh = borlandSehHandlerLimitation(
+                    function, beforePrevious, previous, instruction);
+                if (seh != null) limitations.add(seh);
+            }
+            beforePrevious = previous;
+            previous = instruction;
+            if (!instruction.getFlowType().isCall()) continue;
+            boolean destination = false;
+            for (Reference reference : instruction.getReferencesFrom()) {
+                if (!reference.getReferenceType().isCall()) continue;
+                destination = true;
+                break;
+            }
+            if (!destination) {
+                calls.unrepresented++;
+                calls.unresolved(instruction.getAddress(),
+                    "Instruction decoder identifies a call but ReferenceManager supplies no call destination");
+            }
+        }
+        return new CallBoundaryObservation(List.copyOf(limitations),
+            returnedCallees == null ? null : calls.unrepresented, calls.unresolvedCalls());
+    }
+
+    private String borlandSehHandlerLimitation(
+            Function function, Instruction handlerPush, Instruction framePush,
+            Instruction frameLink) {
+        if (!immediatelyPrecedes(handlerPush, framePush) ||
+            !immediatelyPrecedes(framePush, frameLink) ||
+            !handlerPush.getMnemonicString().equalsIgnoreCase("PUSH") ||
+            handlerPush.getNumOperands() != 1 ||
+            !framePush.getMnemonicString().equalsIgnoreCase("PUSH") ||
+            framePush.getNumOperands() != 1 ||
+            !frameLink.getMnemonicString().equalsIgnoreCase("MOV") ||
+            frameLink.getNumOperands() != 2 ||
+            !sameFsMemoryOperand(framePush, frameLink) ||
+            !hasRegisterOperand(frameLink, 1, "ESP"))
+            return null;
+        Object[] handlerOperand = handlerPush.getOpObjects(0);
+        if (handlerOperand.length != 1 || !(handlerOperand[0] instanceof Scalar scalar) ||
+            scalar.bitLength() != 32)
+            return null;
+        Address handler = currentProgram.getAddressFactory().getDefaultAddressSpace()
+            .getAddress(scalar.getUnsignedValue());
+        if (function.getBody().contains(handler)) return null;
+        return "Ghidra Listing shows a Borland/Delphi-style SEH frame registration at " +
+            canonicalAddress(frameLink.getAddress()) + " (push " + canonicalAddress(handler) +
+            " followed by fs-segment stack chaining); handler " + canonicalAddress(handler) +
+            " lies outside this procedure's body, so callees, strings, and cross-references may omit the handler region.";
+    }
+
+    private static boolean immediatelyPrecedes(Instruction first, Instruction second) {
+        Address fallThrough = first.getFallThrough();
+        return fallThrough != null && fallThrough.equals(second.getAddress());
+    }
+
+    private static boolean sameFsMemoryOperand(Instruction first, Instruction second) {
+        String firstOperand = normalizedFsMemoryOperand(first);
+        String secondOperand = normalizedFsMemoryOperand(second);
+        return firstOperand != null && firstOperand.equalsIgnoreCase(secondOperand);
+    }
+
+    private static String normalizedFsMemoryOperand(Instruction instruction) {
+        String representation = instruction.getDefaultOperandRepresentation(0);
+        representation = representation.replaceAll("(?i)\\b(?:byte|word|dword|qword)\\s+ptr\\s+", "")
+            .replaceAll("\\s+", "");
+        return representation.regionMatches(true, 0, "fs:", 0, 3) &&
+            representation.indexOf('[') >= 0 ? representation : null;
+    }
+
+    private static boolean hasRegisterOperand(
+            Instruction instruction, int operand, String name) {
+        for (Object object : instruction.getOpObjects(operand)) {
+            if (object instanceof Register register && register.getName().equalsIgnoreCase(name))
+                return true;
+        }
+        return false;
+    }
+
+    private final class CallBoundaryReferences {
+        private final Set<Function> returnedCallees;
+        private final TreeMap<Address, String> unresolved;
+        private int unrepresented;
+
+        CallBoundaryReferences(Set<Function> returnedCallees, boolean includeUnresolvedSites) {
+            this.returnedCallees = returnedCallees;
+            unresolved = includeUnresolvedSites ? new TreeMap<>() : null;
+        }
+
+        void observe(Reference reference) {
+            if (!reference.getReferenceType().isCall()) return;
+            // Reference identity follows the same containing-function owner as referenceEdge.
+            Function target = containingFunction(reference.getToAddress());
+            if (returnedCallees != null && (target == null || !returnedCallees.contains(target)))
+                unrepresented++;
+            if (target == null) unresolved(reference.getFromAddress(),
+                "A call destination has no known containing Ghidra procedure");
+        }
+
+        void unresolved(Address address, String reason) {
+            if (unresolved != null) unresolved.put(address, reason);
+        }
+
+        JsonArray unresolvedCalls() {
+            if (unresolved == null) return null;
+            JsonArray result = new JsonArray();
+            for (var item : unresolved.entrySet()) {
+                JsonObject site = new JsonObject();
+                site.addProperty("address", canonicalAddress(item.getKey()));
+                site.addProperty("reason", item.getValue());
+                result.add(site);
+            }
+            return result;
+        }
+    }
+
+    private String terminalCallLimitation(Instruction instruction) {
+        if (!instruction.getFlowType().isCall() || !instruction.getFlowType().isTerminal())
+            return null;
+        Address[] destinations = instruction.getFlows();
+        StringBuilder limitation = new StringBuilder();
+        limitation.append("Ghidra Listing reports a terminal call at ")
+            .append(canonicalAddress(instruction.getAddress()));
+        if (destinations.length == 0) {
+            limitation.append(" with no resolved callee; its no-return basis is unknown.");
+        }
+        else {
+            limitation.append(" to ");
+            for (int index = 0; index < destinations.length; index++) {
+                if (index > 0) limitation.append(", ");
+                Address destination = destinations[index];
+                limitation.append(canonicalAddress(destination));
+                Function target = currentProgram.getFunctionManager().getFunctionAt(destination);
+                if (target == null) {
+                    limitation.append(" (callee identity unknown)");
+                }
+                else {
+                    limitation.append(" ").append(procedureName(target));
+                    limitation.append(" (external=").append(target.isExternal());
+                    limitation.append(", thunk=").append(target.isThunk());
+                    limitation.append(", hasNoReturn=").append(target.hasNoReturn()).append(")");
+                }
+            }
+            limitation.append("; fallthrough is excluded by Ghidra's flow model.");
+            Function target = destinations.length == 1
+                ? currentProgram.getFunctionManager().getFunctionAt(destinations[0])
+                : null;
+            if (target != null && target.hasNoReturn()) {
+                limitation.append(" This records Ghidra's FunctionManager flag, not an independent verification that the callee cannot return.");
+            }
+            else {
+                limitation.append(" The reason for the terminal flow is not established by this observation.");
+            }
+        }
+        return limitation.toString();
+    }
+
     private static String renderAssembly(List<Instruction> instructions) {
         return String.join("\n", renderAssemblyLines(instructions));
     }
@@ -2530,40 +3646,64 @@ public final class ReaGhidraBridge extends HeadlessScript {
     }
 
     private List<Reference> collectReferences(
-            List<Instruction> instructions,
+            Function function,
             String direction) throws Exception {
         TreeMap<String, Reference> observed = new TreeMap<>();
-        for (Instruction instruction : instructions) {
-            monitor.checkCancelled();
-            if (direction.equals("outgoing")) {
-                for (Reference reference : currentProgram.getReferenceManager()
-                        .getReferencesFrom(instruction.getAddress())) {
-                    addReference(observed, reference);
-                }
-            }
-            else {
-                ReferenceIterator iterator = currentProgram.getReferenceManager()
-                    .getReferencesTo(instruction.getAddress());
-                while (iterator.hasNext()) {
-                    addReference(observed, iterator.next());
-                }
-            }
-        }
+        visitReferences(function, direction, reference -> addReference(observed, reference));
         List<Reference> result = new ArrayList<>(observed.values());
         result.sort(REFERENCE_ORDER);
         return result;
     }
 
-    private static void addReference(TreeMap<String, Reference> observed, Reference reference) {
-        if (reference.isEntryPointReference()) {
-            return;
+    @FunctionalInterface
+    private interface ReferenceVisitor {
+        void accept(Reference reference) throws Exception;
+    }
+
+    private void visitReferences(Function function, String direction, ReferenceVisitor visitor)
+            throws Exception {
+        // References can target instruction interiors or originate in embedded
+        // data. Use actual body ownership, including an external's exact entry.
+        AddressSet scope = functionObservationScope(function);
+        boolean outgoing = direction.equals("outgoing");
+        AddressIterator addresses = outgoing
+            ? currentProgram.getReferenceManager().getReferenceSourceIterator(scope, true)
+            : currentProgram.getReferenceManager().getReferenceDestinationIterator(scope, true);
+        while (addresses.hasNext()) {
+            monitor.checkCancelled();
+            Address address = addresses.next();
+            if (outgoing) {
+                for (Reference reference : currentProgram.getReferenceManager()
+                        .getReferencesFrom(address)) {
+                    monitor.checkCancelled();
+                    if (!reference.isEntryPointReference()) visitor.accept(reference);
+                }
+            }
+            else {
+                ReferenceIterator iterator = currentProgram.getReferenceManager()
+                    .getReferencesTo(address);
+                while (iterator.hasNext()) {
+                    monitor.checkCancelled();
+                    Reference reference = iterator.next();
+                    if (!reference.isEntryPointReference()) visitor.accept(reference);
+                }
+            }
         }
+    }
+
+    private static void addReference(TreeMap<String, Reference> observed, Reference reference) {
         String key = canonicalAddress(reference.getFromAddress()) + "\u0000" +
             canonicalAddress(reference.getToAddress()) + "\u0000" +
             reference.getReferenceType().getName() + "\u0000" +
             reference.getOperandIndex() + "\u0000" +
             reference.isPrimary();
         observed.putIfAbsent(key, reference);
+    }
+
+    private static AddressSet functionObservationScope(Function function) {
+        AddressSet scope = new AddressSet(function.getBody());
+        scope.add(function.getEntryPoint());
+        return scope;
     }
 
     private JsonArray referenceEdges(List<Reference> references) {
@@ -2719,23 +3859,28 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return result;
     }
 
-    private static JsonArray comments(List<Instruction> instructions) {
+    private JsonArray comments(Function function) throws Exception {
+        Listing listing = currentProgram.getListing();
+        AddressSet scope = functionObservationScope(function);
+        AddressIterator addresses = listing.getCommentAddressIterator(scope, true);
         TreeMap<String, JsonObject> observed = new TreeMap<>();
-        for (Instruction instruction : instructions) {
+        while (addresses.hasNext()) {
+            monitor.checkCancelled();
+            Address address = addresses.next();
             for (CommentType type : CommentType.values()) {
-                String text = instruction.getComment(type);
+                String text = listing.getComment(type, address);
                 if (text == null || text.isEmpty()) {
                     continue;
                 }
                 String kind = type == CommentType.EOL ? "inline" : "comment";
                 JsonObject item = new JsonObject();
-                item.addProperty("address", canonicalAddress(instruction.getAddress()));
+                item.addProperty("address", canonicalAddress(address));
                 item.addProperty("kind", kind);
                 item.addProperty("text", text);
-                String key = canonicalAddress(instruction.getAddress()) + "\u0000" +
+                String key = canonicalAddress(address) + "\u0000" +
                     kind + "\u0000" + type.name() + "\u0000" + text;
                 observed.put(key, item);
-                    }
+            }
         }
         JsonArray result = new JsonArray();
         observed.values().forEach(result::add);
@@ -2788,6 +3933,376 @@ public final class ReaGhidraBridge extends HeadlessScript {
         JsonArray result = new JsonArray();
         observed.values().forEach(result::add);
         return result;
+    }
+
+    private boolean swiftProgram() {
+        for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
+            String name = block.getName();
+            if (name.startsWith("__swift5_") || name.startsWith("swift5_")) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Swift passes a String as two words: small literals carry their bytes in the words and
+     * immortal large literals carry their count and a biased pointer to the bytes. Ghidra keeps
+     * neither as a data reference, so decode constant pairs where Swift consumes them: argument
+     * and return registers at calls, tail calls and returns, and both registers of one STP.
+     * The canonical empty string is a small literal with a zero count.
+     */
+    private SwiftStringLiteralDecode swiftStringLiterals(Function function) throws Exception {
+        return swiftStringLiterals(function, new SwiftLiteralBudget());
+    }
+
+    // An explicit budget makes capacity omissions deterministic in producer tests.
+    private SwiftStringLiteralDecode swiftStringLiterals(
+        Function function,
+        SwiftLiteralBudget budget
+    ) throws Exception {
+        Register[] registers = new Register[31];
+        for (int index = 0; index < registers.length; index++) {
+            registers[index] = currentProgram.getRegister("x" + index);
+        }
+        TreeMap<String, JsonObject> observed = new TreeMap<>();
+        TreeMap<String, JsonObject> omitted = new TreeMap<>();
+        Map<String, Boolean> selectedValues = new HashMap<>();
+        SymbolicPropogator propagator = new SymbolicPropogator(currentProgram, false);
+        propagator.flowConstants(function.getEntryPoint(), function.getBody(), new ContextEvaluatorAdapter() {
+            @Override
+            public boolean evaluateContextBefore(VarnodeContext context, Instruction instruction) {
+                // Returning true ends only the current flow, so every queued flow checks the shared stop.
+                if (budget.stopped()) return true;
+                FlowType flow = instruction.getFlowType();
+                Address[] flowTargets = instruction.getFlows();
+                boolean unresolvedJump = flow.isJump() && !flow.isConditional() && flowTargets.length == 0;
+                for (Register[] pair : swiftStringPairs(function, instruction, registers)) {
+                    Long word = registerConstant(context, pair[0]);
+                    Long object = registerConstant(context, pair[1]);
+                    if (word == null || object == null) continue;
+                    SwiftLiteralLayout layout = swiftLiteralLayout(word, object);
+                    if (layout == null) continue;
+                    // A selected word can combine with a path-dependent ordinary move. Cache the
+                    // provenance question per site/register, charging retained cache state to the
+                    // same dossier budget before allocating it.
+                    boolean selected = false;
+                    boolean provenanceOverCapacity = false;
+                    for (Register register : pair) {
+                        String provenanceKey = canonicalAddress(instruction.getAddress()) + "\u0000" +
+                            register.getBaseRegister().getName();
+                        Boolean value = selectedValues.get(provenanceKey);
+                        if (value == null) {
+                            if (!budget.takeState()) {
+                                provenanceOverCapacity = true;
+                                break;
+                            }
+                            value = selectedValue(function, instruction, register);
+                            selectedValues.put(provenanceKey, value);
+                        }
+                        if (value) {
+                            selected = true;
+                            break;
+                        }
+                    }
+                    if (selected) continue;
+                    // Forks can reach one site with different constants, so the words are part of the key.
+                    String key = canonicalAddress(instruction.getAddress()) + "\u0000" + pair[0].getName() +
+                        "\u0000" + pair[1].getName() + "\u0000" + Long.toUnsignedString(word, 16) +
+                        "\u0000" + Long.toUnsignedString(object, 16);
+                    if (observed.containsKey(key) || omitted.containsKey(key)) continue;
+                    // Every record draws on the budget; the first one that does not fit is kept as an
+                    // omission and decoding stops, so later sites are never examined.
+                    String value = layout.smallValue();
+                    boolean overCapacity = provenanceOverCapacity || !budget.take(layout.byteLength());
+                    if (!overCapacity && value == null) {
+                        try {
+                            value = swiftLargeLiteralText(layout);
+                        } catch (OutOfMemoryError exhausted) {
+                            overCapacity = true;
+                        }
+                    }
+                    if (value == null && !overCapacity) continue;
+                    JsonObject item = overCapacity
+                        ? swiftStringOmission(layout, word, object)
+                        : swiftStringItem(value, layout, word, object);
+                    if (unresolvedJump && !overCapacity)
+                        item = swiftStringOmission(layout, word, object, "unresolved_jump");
+                    item.addProperty("source_address", canonicalAddress(instruction.getAddress()));
+                    JsonArray pairRegisters = new JsonArray();
+                    pairRegisters.add(pair[0].getName());
+                    pairRegisters.add(pair[1].getName());
+                    item.add("registers", pairRegisters);
+                    (overCapacity || unresolvedJump ? omitted : observed).put(key, item);
+                    if (overCapacity) {
+                        budget.stop();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }, false, monitor);
+        JsonArray literals = new JsonArray();
+        observed.values().forEach(literals::add);
+        JsonArray omissions = new JsonArray();
+        omitted.values().forEach(omissions::add);
+        return new SwiftStringLiteralDecode(literals, omissions);
+    }
+
+    private static List<Register[]> swiftStringPairs(
+        Function function,
+        Instruction instruction,
+        Register[] registers
+    ) {
+        List<Register[]> pairs = new ArrayList<>();
+        if (instruction.getMnemonicString().equals("stp")) {
+            Register first = instruction.getRegister(0);
+            Register second = instruction.getRegister(1);
+            if (first != null && second != null && first.getBitLength() == 64 && second.getBitLength() == 64) {
+                pairs.add(new Register[] {first, second});
+            }
+            return pairs;
+        }
+        FlowType flow = instruction.getFlowType();
+        boolean returns = false;
+        for (PcodeOp operation : instruction.getPcode()) {
+            if (operation.getOpcode() == PcodeOp.RETURN) returns = true;
+        }
+        // A jump is a proven tail call only when it has resolved targets and all leave the
+        // body. For unresolved targetless jumps, candidate literals remain unknown omissions.
+        Address[] targets = instruction.getFlows();
+        boolean tailCall = flow.isJump() && !flow.isConditional() && targets.length > 0 &&
+            Arrays.stream(targets).allMatch(target -> !function.getBody().contains(target));
+        boolean unresolvedJump = flow.isJump() && !flow.isConditional() && targets.length == 0;
+        if (!flow.isCall() && !returns && !tailCall && !unresolvedJump) return pairs;
+        // A String occupies two consecutive registers among x0-x7, or x0 and x1 when returned.
+        int lastFirstRegister = returns ? 0 : 6;
+        for (int index = 0; index <= lastFirstRegister; index++) {
+            pairs.add(new Register[] {registers[index], registers[index + 1]});
+        }
+        return pairs;
+    }
+
+    private static Long registerConstant(VarnodeContext context, Register register) {
+        Varnode value = context.getRegisterVarnodeValue(register);
+        return value != null && context.isConstant(value) ? value.getOffset() : null;
+    }
+
+    // Search every predecessor path for the reaching definitions, following register copies,
+    // since a select copied into an argument register or defined before a branch forks just as
+    // independently as one written there directly.
+    private boolean selectedValue(Function function, Instruction use, Register register) {
+        ArrayDeque<Instruction> instructions = new ArrayDeque<>();
+        ArrayDeque<Register> targets = new ArrayDeque<>();
+        Set<String> visited = new HashSet<>();
+        for (Instruction predecessor : predecessors(function, use)) {
+            instructions.push(predecessor);
+            targets.push(register.getBaseRegister());
+        }
+        while (!instructions.isEmpty()) {
+            Instruction instruction = instructions.pop();
+            Register target = targets.pop();
+            if (!visited.add(canonicalAddress(instruction.getAddress()) + "\u0000" + target.getName())) continue;
+            boolean defines = false;
+            for (Object result : instruction.getResultObjects()) {
+                if (result instanceof Register written && written.getBaseRegister().equals(target)) defines = true;
+            }
+            Register next = target;
+            if (defines) {
+                PcodeOp[] operations = instruction.getPcode();
+                for (PcodeOp operation : operations) {
+                    if (operation.getOpcode() == PcodeOp.CBRANCH && operation.getInput(0).isConstant()) return true;
+                }
+                Register source = copiedRegister(operations);
+                if (source == null) continue;
+                next = source.getBaseRegister();
+            }
+            for (Instruction predecessor : predecessors(function, instruction)) {
+                instructions.push(predecessor);
+                targets.push(next);
+            }
+        }
+        return false;
+    }
+
+    private List<Instruction> predecessors(Function function, Instruction instruction) {
+        List<Instruction> result = new ArrayList<>();
+        Address from = instruction.getFallFrom();
+        if (from != null) {
+            Instruction previous = currentProgram.getListing().getInstructionAt(from);
+            if (previous != null) result.add(previous);
+        }
+        for (Reference reference : currentProgram.getReferenceManager().getReferencesTo(instruction.getAddress())) {
+            if (!reference.getReferenceType().isFlow() || reference.getReferenceType().isCall()) continue;
+            if (!function.getBody().contains(reference.getFromAddress())) continue;
+            Instruction source = currentProgram.getListing().getInstructionAt(reference.getFromAddress());
+            if (source != null) result.add(source);
+        }
+        return result;
+    }
+
+    private Register copiedRegister(PcodeOp[] operations) {
+        if (operations.length != 1) return null;
+        int opcode = operations[0].getOpcode();
+        Varnode input = operations[0].getInput(0);
+        if ((opcode != PcodeOp.COPY && opcode != PcodeOp.INT_ZEXT) || input == null || !input.isRegister()) return null;
+        return currentProgram.getRegister(input);
+    }
+
+    /** Validate the ABI layout of a pair; a small literal is decoded here, a large one only located. */
+    private SwiftLiteralLayout swiftLiteralLayout(long word, long object) {
+        int discriminator = (int) (object >>> 60);
+        if (discriminator == 0xE || discriminator == 0xA) {
+            int count = (int) ((object >>> 56) & 0xF);
+            byte[] bytes = new byte[15];
+            for (int index = 0; index < 8; index++) bytes[index] = (byte) (word >>> (8 * index));
+            for (int index = 0; index < 7; index++) bytes[8 + index] = (byte) (object >>> (8 * index));
+            for (int index = count; index < bytes.length; index++) {
+                if (bytes[index] != 0) return null;
+            }
+            // Count zero is the canonical empty string (object 0xE000000000000000, word 0).
+            String value = swiftStringText(bytes, count, discriminator == 0xE);
+            return value == null ? null : new SwiftLiteralLayout("small", null, count, true, value);
+        }
+        int flags = (int) (word >>> 60);
+        long count = word & 0xFFFFFFFFFFFFL;
+        // Immortal literals: ASCII and NFC or neither, tail allocated, with a pointer biased by 32.
+        if ((object >>> 56) != 0x80 || (flags != 0xD && flags != 0x1) || ((word >>> 48) & 0xFFF) != 0) {
+            return null;
+        }
+        try {
+            Address address = currentProgram.getAddressFactory().getDefaultAddressSpace()
+                .getAddress((object & 0x00FFFFFFFFFFFFFFL) + 0x20);
+            MemoryBlock block = currentProgram.getMemory().getBlock(address);
+            // The bytes and their terminator must lie in one initialized, non-executable block,
+            // and Java arrays bound one read.
+            if (block == null || !block.isInitialized() || block.isExecute() ||
+                count >= block.getEnd().subtract(address) + 1 || count >= Integer.MAX_VALUE) {
+                return null;
+            }
+            return new SwiftLiteralLayout("large", address, count, flags == 0xD, null);
+        } catch (Exception unaddressable) {
+            return null;
+        }
+    }
+
+    private String swiftLargeLiteralText(SwiftLiteralLayout layout) {
+        int count = (int) layout.byteLength();
+        byte[] bytes = new byte[count + 1];
+        try {
+            if (currentProgram.getMemory().getBytes(layout.address(), bytes) != bytes.length) return null;
+        } catch (Exception unreadable) {
+            return null;
+        }
+        return bytes[count] == 0 ? swiftStringText(bytes, count, layout.ascii()) : null;
+    }
+
+    /**
+     * Every literal record of one dossier draws on half of the heap that was free when decoding
+     * began. Text is charged at the worst case per UTF-8 byte: two bytes of UTF-16 text, then up
+     * to six escaped JSON characters ("\\u0000") held as UTF-16 in Gson's growing writer buffer
+     * (up to twice its length), again in the returned String, and once more as UTF-8 on the
+     * socket. Each record also pays a fixed cost for its map key, JSON members, addresses, words
+     * and their serialized form, so many empty or small literals are bounded too. Retained
+     * provenance-cache entries draw on that same fixed-state allowance.
+     */
+    private static final class SwiftLiteralBudget {
+        private static final long BYTES_PER_LITERAL_BYTE = 2 + 6 * 2 * 2 + 6 * 2 + 6;
+        private static final long BYTES_PER_RECORD = 4096;
+        private long remaining;
+        private boolean stopped;
+
+        SwiftLiteralBudget() {
+            Runtime runtime = Runtime.getRuntime();
+            remaining = Math.max(0, (runtime.maxMemory() - runtime.totalMemory() + runtime.freeMemory()) / 2);
+        }
+
+        SwiftLiteralBudget(long remaining) {
+            if (remaining < 0) throw new IllegalArgumentException("Swift literal budget must be nonnegative");
+            this.remaining = remaining;
+        }
+
+        boolean takeState() {
+            if (remaining < BYTES_PER_RECORD) return false;
+            remaining -= BYTES_PER_RECORD;
+            return true;
+        }
+
+        boolean take(long bytes) {
+            if (remaining < BYTES_PER_RECORD ||
+                bytes > (remaining - BYTES_PER_RECORD) / BYTES_PER_LITERAL_BYTE) {
+                return false;
+            }
+            remaining -= BYTES_PER_RECORD + bytes * BYTES_PER_LITERAL_BYTE;
+            return true;
+        }
+
+        void stop() {
+            stopped = true;
+        }
+
+        boolean stopped() {
+            return stopped;
+        }
+    }
+
+    // Swift String values may contain any scalar, including controls; JSON escapes them.
+    private static String swiftStringText(byte[] bytes, int length, boolean ascii) {
+        if (length < 0 || length > bytes.length) return null;
+        for (int index = 0; index < length; index++) {
+            if (ascii && bytes[index] < 0) return null;
+        }
+        try {
+            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes, 0, length)).toString();
+        } catch (CharacterCodingException invalid) {
+            return null;
+        }
+    }
+
+    private static JsonObject swiftStringOmission(SwiftLiteralLayout layout, long word, long object) {
+        return swiftStringOmission(layout, word, object, "capacity");
+    }
+
+    private static JsonObject swiftStringOmission(
+        SwiftLiteralLayout layout,
+        long word,
+        long object,
+        String reason
+    ) {
+        JsonObject item = new JsonObject();
+        item.addProperty("representation", layout.representation());
+        if (layout.address() == null) {
+            item.add("address", JsonNull.INSTANCE);
+        } else {
+            item.addProperty("address", canonicalAddress(layout.address()));
+        }
+        item.addProperty("byte_length", layout.byteLength());
+        item.addProperty("reason", reason);
+        item.add("words", swiftStringWords(word, object));
+        return item;
+    }
+
+    private static JsonObject swiftStringItem(
+        String value,
+        SwiftLiteralLayout layout,
+        long word,
+        long object
+    ) {
+        JsonObject item = new JsonObject();
+        item.addProperty("value", value);
+        item.addProperty("representation", layout.representation());
+        if (layout.address() == null) {
+            item.add("address", JsonNull.INSTANCE);
+        } else {
+            item.addProperty("address", canonicalAddress(layout.address()));
+        }
+        item.add("words", swiftStringWords(word, object));
+        return item;
+    }
+
+    private static JsonArray swiftStringWords(long word, long object) {
+        JsonArray words = new JsonArray();
+        words.add("0x" + Long.toUnsignedString(word, 16));
+        words.add("0x" + Long.toUnsignedString(object, 16));
+        return words;
     }
 
     private static String exclusiveAddress(Address inclusive) {
@@ -2944,10 +4459,46 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return parseReaAddress(requireString(params, name));
     }
 
+    private static boolean isExplicitReaAddress(String value) {
+        if (value.regionMatches(true, 0, "0x", 0, 2) &&
+            isHexadecimal(value, 2, value.length()))
+            return true;
+        int separator = value.toLowerCase(Locale.ROOT).lastIndexOf(":0x");
+        if (separator <= 0 || !isHexadecimal(value, separator + 3, value.length()))
+            return false;
+        // Classify the encoded space iteratively. A repeated regex alternation
+        // can exhaust Java's stack on a long ordinary symbol name.
+        for (int index = 0; index < separator; index++) {
+            char item = value.charAt(index);
+            if ((item >= 'A' && item <= 'Z') ||
+                (item >= 'a' && item <= 'z') ||
+                (item >= '0' && item <= '9') ||
+                item == '.' || item == '_' || item == '~' || item == '-')
+                continue;
+            if (item != '%' || index + 2 >= separator ||
+                !isHexadecimal(value, index + 1, index + 3))
+                return false;
+            index += 2;
+        }
+        return true;
+    }
+
+    private static boolean isHexadecimal(String value, int start, int end) {
+        if (start >= end) return false;
+        for (int index = start; index < end; index++) {
+            char item = value.charAt(index);
+            if (!((item >= '0' && item <= '9') ||
+                  (item >= 'a' && item <= 'f') ||
+                  (item >= 'A' && item <= 'F')))
+                return false;
+        }
+        return true;
+    }
+
     private Address parseReaAddress(String value) {
         Address address = tryParseAddress(value);
         if (address == null) {
-            throw new RequestFailure("invalid_request", "Unknown or invalid Ghidra address");
+            throw new RequestFailure("invalid_request", "Unknown or invalid Ghidra address: " + value);
         }
         return address;
     }
@@ -2956,22 +4507,31 @@ public final class ReaGhidraBridge extends HeadlessScript {
         try {
             String spaceName = null;
             String offset = value;
-            int separator = value.lastIndexOf(":0x");
+            int separator = value.toLowerCase(Locale.ROOT).lastIndexOf(":0x");
             if (separator >= 0) {
                 spaceName = decodeAddressSpace(value.substring(0, separator));
                 offset = value.substring(separator + 3);
             }
-            else if (value.startsWith("0x")) {
+            else if (value.startsWith("0x") || value.startsWith("0X")) {
                 offset = value.substring(2);
             }
-            if (!offset.matches("[0-9A-Fa-f]+")) {
+            if (!isHexadecimal(offset, 0, offset.length())) {
                 return null;
             }
             AddressSpace space = spaceName == null
                 ? currentProgram.getAddressFactory().getDefaultAddressSpace()
                 : currentProgram.getAddressFactory().getAddressSpace(spaceName);
-            return space == null ? null : space.getAddress(offset);
+            if (space == null) return null;
+            Address address = space.getAddress(offset);
+            BigInteger requestedOffset = new BigInteger(offset, 16);
+            BigInteger parsedOffset = new BigInteger(Long.toUnsignedString(address.getOffset()));
+            if (!requestedOffset.equals(parsedOffset))
+                throw new RequestFailure("invalid_request",
+                    "Ghidra address offset cannot be represented without truncation in space " +
+                    space.getName() + ": requested " + value + ", parsed " + canonicalAddress(address));
+            return address;
         }
+        catch (RequestFailure failure) { throw failure; }
         catch (Exception exception) {
             return null;
         }
@@ -3055,9 +4615,29 @@ public final class ReaGhidraBridge extends HeadlessScript {
             );
         }
         catch (PatternSyntaxException exception) {
-            throw new RequestFailure("invalid_request", "Invalid regex pattern");
+            // Java wraps compiler stack exhaustion in PatternSyntaxException
+            // without retaining its cause. This producer reason is not bad syntax.
+            if (exception.getDescription().equals("Stack overflow during pattern compilation"))
+                throw regexStackExhausted(expression, "compiling");
+            throw new RequestFailure("invalid_request", "Invalid regex pattern " + expression + ": " + exception.getDescription() + " at index " + exception.getIndex());
         }
-        return value -> pattern.matcher(value).find();
+        catch (StackOverflowError exhausted) {
+            throw regexStackExhausted(expression, "compiling");
+        }
+        return value -> {
+            try {
+                return pattern.matcher(value).find();
+            }
+            catch (StackOverflowError exhausted) {
+                throw regexStackExhausted(expression, "matching");
+            }
+        };
+    }
+
+    private static RequestFailure regexStackExhausted(String expression, String stage) {
+        return new RequestFailure("regex_stack_exhausted",
+            "Ghidra's Java regex engine exhausted its stack while " + stage +
+            " pattern " + expression + ". Use literal mode or simplify the regex; the session remains usable.");
     }
 
     private static SessionDescriptor readDescriptor(Path path) throws IOException {
@@ -3114,7 +4694,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
     private void requireDocument(JsonObject params) {
         String document = optionalString(params, "document");
         if (document != null && !document.equals(currentProgram.getName())) {
-            throw new RequestFailure("not_found", "Unknown Ghidra Program identity");
+            throw new RequestFailure("not_found", "Unknown Ghidra Program identity: " + document + "; active program: " + currentProgram.getName());
         }
     }
 
@@ -3226,7 +4806,16 @@ public final class ReaGhidraBridge extends HeadlessScript {
 
     private static void writeResponse(BufferedWriter writer, JsonObject response) throws IOException {
         String encoded = GSON.toJson(response);
-        writer.write(encoded);
+        // Gson leaves UTF-16 surrogates literal. Escape them in JSON so even
+        // diagnostics quoting ill-formed caller text remain lossless UTF-8.
+        int start = 0;
+        for (int index = 0; index < encoded.length(); index++) {
+            if (!Character.isSurrogate(encoded.charAt(index))) continue;
+            writer.write(encoded, start, index - start);
+            writer.write("\\u" + Integer.toHexString(encoded.charAt(index)));
+            start = index + 1;
+        }
+        writer.write(encoded, start, encoded.length() - start);
         writer.newLine();
         writer.flush();
     }
@@ -3252,7 +4841,18 @@ public final class ReaGhidraBridge extends HeadlessScript {
             .thenComparing(Reference::isPrimary);
 
     private record InventoryItem(Address address, String value, JsonObject facts) {}
+    private record AddressNameRequest(String inputAddress, Address address, String name) {}
     private record FunctionEntry(Function function, InventoryItem item) {}
+    private record FunctionAnalysisObservation(JsonObject dossier, List<String> limitations, JsonObject relationshipCoverage) {}
+    private record CallBoundaryObservation(List<String> limitations, Integer unrepresentedCalleeCalls, JsonArray unresolvedCalls) {}
+    private record SwiftStringLiteralDecode(JsonArray literals, JsonArray omissions) {}
+    private record SwiftLiteralLayout(
+        String representation,
+        Address address,
+        long byteLength,
+        boolean ascii,
+        String smallValue
+    ) {}
     private record InstructionScan(List<Instruction> instructions, boolean truncated) {}
     private record SessionDescriptor(
         String transport,
